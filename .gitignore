@@ -1,0 +1,25 @@
+# Rust
+target/
+Cargo.lock
+
+# Old single-file src/ (superseded by core/ and cli/)
+src/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Tauri
+tauri-app/src-tauri/target/
+tauri-app/src-tauri/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,16 @@
+[package]
+name    = "rust-air-cli"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "rust-air"
+path = "src/main.rs"
+
+[dependencies]
+rust-air-core = { path = "../core" }
+tokio    = { workspace = true }
+anyhow   = { workspace = true }
+clap     = { version = "4", features = ["derive"] }
+base64   = "0.22"
+rand     = "0.8"

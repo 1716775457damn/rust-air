@@ -1,0 +1,197 @@
+name: Release App
+
+# 触发条件：推送 v* 格式的 tag（如 v1.0.0）或手动触发
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 1: 三平台并行构建 Tauri 桌面应用
+  # tauri-action 负责：编译 Rust + 打包前端 + 上传安装包到 GitHub Release
+  # ────────────────────────────────────────────────────────────────────────────
+  build-tauri:
+    permissions:
+      contents: write   # 必须：允许创建 Release 并上传文件
+
+    strategy:
+      fail-fast: false  # 一个平台失败不影响其他平台继续构建
+      matrix:
+        include:
+          # Windows: 生成 .msi 安装包 + .exe 可执行文件
+          - platform: windows-latest
+            rust-targets: ''
+            tauri-args: ''
+
+          # macOS Apple Silicon (M 系列芯片)
+          - platform: macos-latest
+            rust-targets: 'aarch64-apple-darwin'
+            tauri-args: '--target aarch64-apple-darwin'
+
+          # macOS Intel (兼容旧 Mac)
+          - platform: macos-13
+            rust-targets: 'x86_64-apple-darwin'
+            tauri-args: '--target x86_64-apple-darwin'
+
+          # Linux: 生成 .deb 包 + .AppImage 免安装文件
+          - platform: ubuntu-22.04
+            rust-targets: ''
+            tauri-args: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      # ── 1. 拉取代码 ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Rust 工具链（含跨平台 target）────────────────────────────────────
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      # Rust 编译缓存，大幅缩短后续构建时间
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './tauri-app/src-tauri -> target'
+          cache-on-failure: true
+
+      # ── 3. Linux 系统依赖 ────────────────────────────────────────────────────
+      # WebKit / GTK / AppIndicator 是 Tauri 在 Linux 上的必要依赖
+      # libavahi-compat-libdnssd-dev 是 mdns-sd crate 在 Linux 上的必要依赖
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libavahi-compat-libdnssd-dev
+
+      # ── 4. Node.js + 前端依赖 ────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: tauri-app/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: tauri-app
+        run: npm ci
+
+      # ── 5. 构建 & 发布（核心步骤）────────────────────────────────────────────
+      # tauri-action 会自动：
+      #   - 运行 npm run build 编译前端
+      #   - 运行 cargo tauri build 编译 Rust + 打包
+      #   - 创建/更新 GitHub Release 并上传安装包
+      - name: Build and publish Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ── macOS 代码签名（可选，在仓库 Settings → Secrets 中配置）──────────
+          # 不配置也能构建，只是 macOS 会提示"未验证的开发者"
+          APPLE_CERTIFICATE:          ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY:     ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID:                   ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD:             ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID:              ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: tauri-app          # tauri.conf.json 所在目录的上级
+          tagName: ${{ github.ref_name }} # 直接使用推送的 tag，如 v1.0.0
+          releaseName: 'rust-air ${{ github.ref_name }}'
+          releaseBody: |
+            ## rust-air ${{ github.ref_name }} — LAN 极速文件传输
+
+            ### 📦 下载安装包
+
+            | 操作系统 | 文件 | 说明 |
+            |---------|------|------|
+            | Windows | `.msi` | 推荐，带安装向导 |
+            | Windows | `.exe` | 免安装便携版 |
+            | macOS (M系列) | `.dmg` | Apple Silicon |
+            | macOS (Intel) | `.dmg` | x86_64 |
+            | Linux | `.deb` | Debian/Ubuntu |
+            | Linux | `.AppImage` | 免安装，所有发行版通用 |
+
+            ### 🔒 安全特性
+            - E2EE：ChaCha20-Poly1305 端到端加密
+            - SHA-256 文件完整性校验
+            - mDNS-SD 局域网自动发现，无需手动输入 IP
+
+            ### 📋 更新内容
+            详见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.tauri-args }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2: 三平台并行构建纯 CLI 二进制（无 GUI 依赖，体积更小）
+  # 构建完成后附加到同一个 GitHub Release
+  # ────────────────────────────────────────────────────────────────────────────
+  build-cli:
+    # 等 Tauri job 先创建好 Release，CLI job 再往里追加文件
+    needs: build-tauri
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: rust-air.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: rust-air
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: rust-air
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # mDNS 在 Linux 上需要 avahi 开发库
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavahi-compat-libdnssd-dev
+
+      - name: Build CLI binary
+        run: cargo build -p rust-air-cli --release --target ${{ matrix.target }}
+
+      # 重命名二进制，加上平台后缀，避免 Release 中文件名冲突
+      - name: Rename binary with platform suffix
+        shell: bash
+        run: |
+          SRC="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          EXT="${{ matrix.binary == 'rust-air.exe' && '.exe' || '' }}"
+          DST="rust-air-cli-${{ matrix.target }}${EXT}"
+          cp "$SRC" "$DST"
+          echo "BINARY_PATH=$DST" >> $GITHUB_ENV
+
+      # 将 CLI 二进制附加到已有的 GitHub Release（由 build-tauri job 创建）
+      - name: Upload CLI binary to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ env.BINARY_PATH }}
