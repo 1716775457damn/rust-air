@@ -7,8 +7,8 @@ Cargo.lock
 *.jks
 keystore_b64.txt
 
-# Old single-file src/ (superseded by core/ and cli/)
-src/
+# Old single-file src/ at workspace root (superseded by core/ and cli/)
+/src/
 
 # Node
 node_modules/
