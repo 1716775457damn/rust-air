@@ -104,7 +104,12 @@ pub async fn resolve_sender(instance_name: &str) -> Result<(String, u16)> {
             }
             match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(ServiceEvent::ServiceResolved(info)) => {
-                    if info.get_fullname().starts_with(&target) {
+                    // Exact match: fullname is "<instance>.<service>" so split at first dot
+                    let instance_part = info.get_fullname()
+                        .split('.')
+                        .next()
+                        .unwrap_or("");
+                    if instance_part == target {
                         let ip = info
                             .get_addresses()
                             .iter()

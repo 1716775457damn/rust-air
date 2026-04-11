@@ -250,6 +250,18 @@ async fn recv_header(
     rx.read_exact(&mut name_b).await?;
     let name = String::from_utf8(name_b)?;
 
+    // Security: reject path traversal attempts (e.g. "../../../etc/passwd")
+    let safe_name = Path::new(&name)
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid filename: '{name}'"))?
+        .to_string_lossy()
+        .to_string();
+    anyhow::ensure!(
+        !safe_name.contains(['/', '\\', '\0']),
+        "filename contains illegal characters: '{safe_name}'"
+    );
+    let name = safe_name;
+
     let mut size_b = [0u8; 8];
     rx.read_exact(&mut size_b).await?;
     let total_size = u64::from_be_bytes(size_b);
@@ -288,9 +300,19 @@ async fn stream_encrypted<R: AsyncRead + Unpin>(
 
 // ── Checksum helpers ──────────────────────────────────────────────────────────
 
+/// Stream-hash a file in 64 KB chunks — O(1) memory regardless of file size.
 pub async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
-    let data = tokio::fs::read(path).await?;
-    Ok(sha256_bytes(&data))
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await?;
+    let mut reader = tokio::io::BufReader::with_capacity(CHUNK, file);
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 { break; }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().into())
 }
 
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {

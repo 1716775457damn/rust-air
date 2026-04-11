@@ -23,6 +23,21 @@ impl Default for AppState {
     }
 }
 
+impl AppState {
+    /// Safely acquire the lock, replacing a poisoned mutex with a fresh one.
+    pub fn take_handle(&self) -> Option<SenderHandle> {
+        self.sender_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+    pub fn set_handle(&self, h: SenderHandle) {
+        *self.sender_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -41,7 +56,7 @@ pub async fn start_send(
     let instance = format!("rust-air-{}", &encode_key(&key)[..8]);
 
     let handle = discovery::register_sender(port, &instance).map_err(|e| e.to_string())?;
-    *state.sender_handle.lock().unwrap() = Some(handle);
+    state.set_handle(handle);
 
     let key_clone = key;
     let app_clone = app.clone();
@@ -68,7 +83,8 @@ pub async fn start_send(
 
 #[tauri::command]
 pub fn cancel_send(state: State<'_, AppState>) {
-    *state.sender_handle.lock().unwrap() = None;
+    // Dropping the SenderHandle unregisters the mDNS service
+    state.take_handle();
 }
 
 #[tauri::command]

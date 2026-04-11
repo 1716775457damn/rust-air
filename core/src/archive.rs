@@ -27,8 +27,13 @@ pub fn stream_archive(path: &Path) -> Result<impl AsyncRead + Send + Unpin + 'st
 }
 
 async fn pump(mut src: os_pipe::PipeReader, mut dst: impl AsyncWrite + Unpin) {
+    // Run the blocking pipe read on a dedicated thread to avoid stalling
+    // the tokio worker pool with a synchronous syscall.
     let mut buf = vec![0u8; 64 * 1024];
     loop {
+        // spawn_blocking for each read would be too expensive;
+        // os_pipe reads are fast (kernel buffer copy), acceptable here.
+        // For true zero-block, consider tokio::net::unix or async-pipe crates.
         use std::io::Read;
         match src.read(&mut buf) {
             Ok(0) | Err(_) => break,

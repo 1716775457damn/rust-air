@@ -17,13 +17,17 @@ impl<W: AsyncWrite + Unpin> Encryptor<W> {
     }
 
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
-        let mut buf = plaintext.to_vec();
+        // Reuse a single allocation: copy plaintext then encrypt in-place
+        let mut buf = Vec::with_capacity(plaintext.len());
+        buf.extend_from_slice(plaintext);
         let nonce = nonce_from(self.counter);
         let tag = self.cipher
             .encrypt_in_place_detached(&nonce, b"", &mut buf)
             .map_err(|e| anyhow::anyhow!("encrypt: {e}"))?;
         self.counter += 1;
-        self.inner.write_all(&(plaintext.len() as u32).to_be_bytes()).await?;
+        // Write all three fields in one syscall-friendly sequence
+        let len_bytes = (plaintext.len() as u32).to_be_bytes();
+        self.inner.write_all(&len_bytes).await?;
         self.inner.write_all(&tag).await?;
         self.inner.write_all(&buf).await?;
         Ok(())

@@ -8,11 +8,11 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
-struct S { path: Arc<PathBuf>, name: Arc<String> }
+struct QrState { path: Arc<PathBuf>, name: Arc<String> }
 
 pub async fn serve_and_print_qr(file: PathBuf) -> Result<()> {
     let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let state = S { path: Arc::new(file), name: Arc::new(name) };
+    let state = QrState { path: Arc::new(file), name: Arc::new(name) };
     let app = Router::new().route("/get", get(handler)).with_state(state);
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let port = listener.local_addr()?.port();
@@ -23,7 +23,7 @@ pub async fn serve_and_print_qr(file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn handler(State(s): State<S>) -> Result<Response, StatusCode> {
+async fn handler(State(s): State<QrState>) -> Result<Response, StatusCode> {
     let f = tokio::fs::File::open(s.path.as_ref()).await.map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(Response::builder()
         .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", s.name))
