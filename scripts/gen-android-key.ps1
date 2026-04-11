@@ -33,19 +33,28 @@ if (-not $Org)   { $Org   = $AppName }
 # ── 1. Locate keytool ────────────────────────────────────────────────────────
 
 function Find-Keytool {
+    # 1. Bundled jdk-keytool/ next to this script (works wherever the folder is copied)
+    $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
+    $bundled   = Join-Path $scriptDir "jdk-keytool\bin\keytool.exe"
+    if (Test-Path $bundled) { return $bundled }
+
+    # 2. System PATH
     $kt = Get-Command keytool -ErrorAction SilentlyContinue
     if ($kt) { return $kt.Source }
 
+    # 3. Common JDK install locations
     $candidates = @(
-        "d:\jdk-21.0.2\bin\keytool.exe",
         "C:\Program Files\Java\*\bin\keytool.exe",
         "C:\Program Files\Eclipse Adoptium\*\bin\keytool.exe",
+        "C:\Program Files\Microsoft\*\bin\keytool.exe",
         "$env:LOCALAPPDATA\Programs\Eclipse Adoptium\*\bin\keytool.exe"
     )
     foreach ($pattern in $candidates) {
         $found = Get-Item $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($found) { return $found.FullName }
     }
+
+    # 4. JAVA_HOME env var
     if ($env:JAVA_HOME) {
         $kt = Join-Path $env:JAVA_HOME "bin\keytool.exe"
         if (Test-Path $kt) { return $kt }
