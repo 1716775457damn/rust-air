@@ -130,6 +130,7 @@ pub fn full_sync(
     }
 
     if delete_removed {
+        // Collect keys to remove before mutating the map.
         let removed: Vec<String> = store.state.files.keys()
             .filter(|k| !seen.contains(*k))
             .cloned()
@@ -357,16 +358,14 @@ impl ExcludeSet {
         }
     }
     fn matches(&self, rel: &str) -> bool {
-        for seg in rel.split('/') {
-            if self.exact.contains(seg) { return true; }
-            for ext in &self.exts {
-                if seg.len() > ext.len() + 1
-                    && seg.as_bytes()[seg.len() - ext.len() - 1] == b'.'
-                    && seg.ends_with(ext.as_str())
-                { return true; }
-            }
-        }
-        false
+        rel.split('/').any(|seg| {
+            self.exact.contains(seg)
+                || self.exts.iter().any(|ext| {
+                    seg.len() > ext.len() + 1
+                        && seg.as_bytes()[seg.len() - ext.len() - 1] == b'.'
+                        && seg.ends_with(ext.as_str())
+                })
+        })
     }
 }
 

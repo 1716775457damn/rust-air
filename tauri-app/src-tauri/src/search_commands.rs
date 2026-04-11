@@ -3,9 +3,21 @@ use ignore::WalkBuilder;
 use memmap2::Mmap;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, path::Path, sync::{atomic::{AtomicBool, Ordering}, Arc}, thread};
+use std::{
+    fs::File,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+};
 use tauri::{AppHandle, Emitter, State};
-use std::sync::Mutex;
+
+const MAX_RESULTS: usize = 2000;
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+const MAX_LINE_LEN: usize = 512;
+const BINARY_CHECK_LEN: usize = 1024;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -27,35 +39,44 @@ pub struct FileResult {
 #[serde(tag = "kind")]
 pub enum SearchEvent {
     Result(FileResult),
-    Done { ms: u128, total: usize },
+    Done  { ms: u128, total: usize },
     Error { msg: String },
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct SearchState {
-    pub cancel: Mutex<Option<Arc<AtomicBool>>>,
+    cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl SearchState {
-    pub fn new() -> Self { Self { cancel: Mutex::new(None) } }
+    pub fn new() -> Self { Self::default() }
+
+    fn set_cancel(&self, flag: Arc<AtomicBool>) {
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag);
+    }
+
+    fn take_cancel(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub fn start_search(
-    pattern: String,
-    path: String,
-    ignore_case: bool,
+    pattern:      String,
+    path:         String,
+    ignore_case:  bool,
     fixed_string: bool,
-    mode: String,          // "filename" | "text"
-    app: AppHandle,
-    state: State<'_, SearchState>,
+    mode:         String, // "filename" | "text"
+    app:          AppHandle,
+    state:        State<'_, SearchState>,
 ) -> Result<(), String> {
-    // Cancel any running search
-    if let Some(c) = state.cancel.lock().unwrap().take() {
-        c.store(true, Ordering::Relaxed);
+    // Cancel any in-flight search before starting a new one
+    if let Some(prev) = state.take_cancel() {
+        prev.store(true, Ordering::Relaxed);
     }
 
     if pattern.is_empty() { return Ok(()); }
@@ -71,7 +92,7 @@ pub fn start_search(
         .map_err(|e| format!("正则错误: {e}"))?;
 
     let cancelled = Arc::new(AtomicBool::new(false));
-    *state.cancel.lock().unwrap() = Some(cancelled.clone());
+    state.set_cancel(cancelled.clone());
 
     let is_text = mode == "text";
     let threads = num_cpus::get();
@@ -87,22 +108,26 @@ pub fn start_search(
             .threads(threads)
             .build_parallel();
 
-        // Use a channel to collect results from parallel walker
         let (tx, rx) = std::sync::mpsc::channel::<FileResult>();
         let cancelled2 = cancelled.clone();
 
         walker.run(|| {
-            let tx = tx.clone();
-            let re = re.clone();
+            let tx        = tx.clone();
+            let re        = re.clone();
             let cancelled = cancelled2.clone();
             Box::new(move |entry| {
-                if cancelled.load(Ordering::Relaxed) { return ignore::WalkState::Quit; }
-                let entry = match entry { Ok(e) => e, Err(_) => return ignore::WalkState::Continue };
+                if cancelled.load(Ordering::Relaxed) {
+                    return ignore::WalkState::Quit;
+                }
+                let entry = match entry {
+                    Ok(e)  => e,
+                    Err(_) => return ignore::WalkState::Continue,
+                };
                 let result = if is_text {
                     if !entry.file_type().map_or(false, |ft| ft.is_file()) {
                         return ignore::WalkState::Continue;
                     }
-                    search_file(entry.path(), &re, 10 * 1024 * 1024).ok().flatten()
+                    search_file(entry.path(), &re).ok().flatten()
                 } else {
                     search_filename(entry.path(), &re)
                 };
@@ -112,14 +137,13 @@ pub fn start_search(
                 ignore::WalkState::Continue
             })
         });
-        drop(tx); // signal end
+        drop(tx); // close sender so rx.recv() returns Err when done
 
-        // Forward results to frontend
         while let Ok(r) = rx.recv() {
             if cancelled.load(Ordering::Relaxed) { break; }
             total += 1;
             let _ = app.emit("search-result", SearchEvent::Result(r));
-            if total >= 2000 { break; }
+            if total >= MAX_RESULTS { break; }
         }
 
         if !cancelled.load(Ordering::Relaxed) {
@@ -135,19 +159,20 @@ pub fn start_search(
 
 #[tauri::command]
 pub fn cancel_search(state: State<'_, SearchState>) {
-    if let Some(c) = state.cancel.lock().unwrap().take() {
+    if let Some(c) = state.take_cancel() {
         c.store(true, Ordering::Relaxed);
     }
 }
 
-// ── Search logic (from rust-seek) ─────────────────────────────────────────────
+// ── Search helpers ────────────────────────────────────────────────────────────
 
 fn search_filename(path: &Path, re: &regex::Regex) -> Option<FileResult> {
     let name = path.file_name()?.to_string_lossy();
     let ranges: Vec<(usize, usize)> = re.find_iter(name.as_ref())
-        .map(|m| (m.start(), m.end())).collect();
+        .map(|m| (m.start(), m.end()))
+        .collect();
     if ranges.is_empty() { return None; }
-    let display = path.to_string_lossy().replace('\\', "/");
+    let display = normalize_path(path);
     Some(FileResult {
         icon: file_icon(&display).to_string(),
         path: display,
@@ -155,61 +180,86 @@ fn search_filename(path: &Path, re: &regex::Regex) -> Option<FileResult> {
     })
 }
 
-fn search_file(path: &Path, re: &regex::Regex, max_size: u64) -> anyhow::Result<Option<FileResult>> {
-    let meta = std::fs::metadata(path)?;
-    let len = meta.len();
-    if len == 0 || len > max_size { return Ok(None); }
+fn search_file(path: &Path, re: &regex::Regex) -> anyhow::Result<Option<FileResult>> {
+    let len = std::fs::metadata(path)?.len();
+    if len == 0 || len > MAX_FILE_SIZE { return Ok(None); }
 
+    // Use mmap for large files, direct read for small ones
     let content = if len < 4096 {
         let bytes = std::fs::read(path)?;
         if is_binary(&bytes) { return Ok(None); }
-        decode_str(&bytes)
+        decode_bytes(&bytes)
     } else {
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = unsafe { Mmap::map(&File::open(path)?)? };
         if is_binary(&mmap) { return Ok(None); }
-        decode_str(&mmap)
+        decode_bytes(&mmap)
     };
 
     let matches: Vec<MatchLine> = content.lines().enumerate()
         .filter_map(|(i, line)| {
-            let ranges: Vec<_> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
+            let ranges: Vec<_> = re.find_iter(line)
+                .map(|m| (m.start(), m.end()))
+                .collect();
             if ranges.is_empty() { return None; }
-            let line = if line.len() > 512 { line[..512].to_string() + "…" } else { line.to_string() };
+            // Truncate long lines at a char boundary
+            let line = truncate_line(line);
             Some(MatchLine { line_num: i + 1, line, ranges })
         })
         .collect();
 
     if matches.is_empty() { return Ok(None); }
-    let display = path.to_string_lossy().replace('\\', "/");
+    let display = normalize_path(path);
     Ok(Some(FileResult { icon: file_icon(&display).to_string(), path: display, matches }))
 }
 
-fn is_binary(data: &[u8]) -> bool {
-    data[..data.len().min(1024)].contains(&0)
+/// Normalise path separators to forward-slash for cross-platform display.
+#[inline]
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
-fn decode_str(bytes: &[u8]) -> String {
+/// Truncate a line at `MAX_LINE_LEN` chars, respecting char boundaries.
+fn truncate_line(line: &str) -> String {
+    if line.len() <= MAX_LINE_LEN {
+        return line.to_string();
+    }
+    let end = line.char_indices()
+        .nth(MAX_LINE_LEN)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    format!("{}…", &line[..end])
+}
+
+/// Heuristic binary detection: look for null bytes in the first chunk.
+#[inline]
+fn is_binary(data: &[u8]) -> bool {
+    data[..data.len().min(BINARY_CHECK_LEN)].contains(&0)
+}
+
+/// Decode bytes as UTF-8; fall back to GBK for Windows legacy files.
+fn decode_bytes(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => { let (cow, _, _) = GBK.decode(bytes); cow.into_owned() }
+        Ok(s)  => s.to_string(),
+        Err(_) => GBK.decode(bytes).0.into_owned(),
     }
 }
 
 fn file_icon(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
-        "exe" | "msi"                         => "⚙",
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "exe" | "msi"                                    => "⚙",
         "rs" | "py" | "js" | "ts" | "go"
-        | "c" | "cpp" | "java" | "cs"         => "📝",
+        | "c" | "cpp" | "java" | "cs" | "rb" | "swift"  => "📝",
         "toml" | "json" | "yaml" | "yml"
-        | "xml" | "ini" | "cfg"               => "🔧",
-        "md" | "txt" | "log"                  => "📄",
+        | "xml" | "ini" | "cfg" | "env"                  => "🔧",
+        "md" | "txt" | "log"                             => "📄",
         "png" | "jpg" | "jpeg" | "gif"
-        | "svg" | "ico" | "bmp"               => "🖼",
-        "mp4" | "mkv" | "avi"                 => "🎬",
-        "mp3" | "wav" | "flac"                => "🎵",
-        "zip" | "rar" | "7z" | "tar" | "gz"  => "📦",
-        "pdf"                                 => "📕",
-        _                                     => "📄",
+        | "svg" | "ico" | "bmp" | "webp"                 => "🖼",
+        "mp4" | "mkv" | "avi" | "mov"                    => "🎬",
+        "mp3" | "wav" | "flac" | "ogg"                   => "🎵",
+        "zip" | "rar" | "7z" | "tar" | "gz" | "xz"      => "📦",
+        "pdf"                                            => "📕",
+        "db" | "sqlite" | "sql"                          => "🗄",
+        _                                                => "📄",
     }
 }

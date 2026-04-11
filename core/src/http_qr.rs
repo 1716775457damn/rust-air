@@ -73,7 +73,7 @@ fn print_qr(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Determine the local LAN IP by connecting a UDP socket (no packets sent).
+/// Determine the local LAN IP by connecting a UDP socket (no packets are sent).
 fn local_ip() -> Result<String> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0")?;
     s.connect("8.8.8.8:80")?;

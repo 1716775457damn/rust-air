@@ -29,17 +29,15 @@ impl<W: AsyncWrite + Unpin> Encryptor<W> {
 
     /// Encrypt `plaintext` and write `[len][tag][ciphertext]` to the inner writer.
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
-        // Single allocation: copy then encrypt in-place (avoids a second Vec).
-        let mut buf = Vec::with_capacity(plaintext.len());
-        buf.extend_from_slice(plaintext);
-
+        // Copy into buf then encrypt in-place — single allocation, no second Vec.
+        let mut buf = plaintext.to_vec();
         let nonce = frame_nonce(self.counter);
         let tag = self.cipher
             .encrypt_in_place_detached(&nonce, b"", &mut buf)
             .map_err(|e| anyhow::anyhow!("encrypt frame {}: {e}", self.counter))?;
         self.counter += 1;
 
-        // Three sequential writes; the OS/tokio will coalesce them in the socket buffer.
+        // Three sequential writes; tokio/OS coalesces them in the socket send buffer.
         self.inner.write_all(&(plaintext.len() as u32).to_be_bytes()).await?;
         self.inner.write_all(tag.as_slice()).await?;
         self.inner.write_all(&buf).await?;
@@ -98,6 +96,7 @@ impl<R: AsyncRead + Unpin> Decryptor<R> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build a 12-byte nonce from an 8-byte frame counter (little-endian) + 4 zero bytes.
+/// Counter monotonically increases per session — nonces are never reused under the same key.
 #[inline]
 fn frame_nonce(counter: u64) -> Nonce {
     let mut n = [0u8; 12];

@@ -47,43 +47,36 @@ impl AppState {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 /// Start advertising a file/folder for sending.
-/// Returns the session info (instance name + key) for the frontend to display.
 #[tauri::command]
 pub async fn start_send(
     path: String,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<SendSession, String> {
-    inner_start_send(path, state, app).await.map_err(|e| e.to_string())
-}
-
-async fn inner_start_send(
-    path: String,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> anyhow::Result<SendSession> {
     let path = PathBuf::from(&path);
-    anyhow::ensure!(path.exists(), "path not found: {}", path.display());
+    if !path.exists() {
+        return Err(format!("path not found: {}", path.display()));
+    }
 
     let key      = random_key();
-    let listener = TcpListener::bind("0.0.0.0:0").await?;
-    let port     = listener.local_addr()?.port();
+    let listener = TcpListener::bind("0.0.0.0:0").await
+        .map_err(|e| e.to_string())?;
+    let port     = listener.local_addr().map_err(|e| e.to_string())?.port();
     let instance = format!("rust-air-{}", &encode_key(&key)[..8]);
 
-    let handle = discovery::register_sender(port, &instance)?;
+    let handle = discovery::register_sender(port, &instance)
+        .map_err(|e| e.to_string())?;
     state.set_handle(handle);
 
-    // Spawn background task: wait for one connection, then transfer.
     let app_clone = app.clone();
     tokio::spawn(async move {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 app_clone.emit("transfer-peer-connected", peer.to_string()).ok();
-                let app2 = app_clone.clone();
+                let app2   = app_clone.clone();
                 let result = transfer::send_path(stream, &path, &key, move |ev| {
                     app2.emit("transfer-progress", &ev).ok();
-                })
-                .await;
+                }).await;
                 match result {
                     Ok(_)  => { app_clone.emit("transfer-done", "").ok(); }
                     Err(e) => { app_clone.emit("transfer-error", e.to_string()).ok(); }

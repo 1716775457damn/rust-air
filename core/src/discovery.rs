@@ -19,15 +19,18 @@ pub fn register_sender(port: u16, instance_name: &str) -> Result<SenderHandle> {
     let daemon = ServiceDaemon::new()?;
     let hostname = gethostname();
 
-    // TXT properties: status and protocol version.
-    let props = [("status", "idle"), ("v", "2")];
+    let props: std::collections::HashMap<String, String> =
+        [("status", "idle"), ("v", "2")]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     let svc = ServiceInfo::new(
         MDNS_SERVICE,
         instance_name,
         &hostname,
-        "",   // let mdns-sd resolve the local IP automatically
+        "",
         port,
-        Some(props.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<std::collections::HashMap<_, _>>()),
+        Some(props),
     )?;
     daemon.register(svc)?;
 

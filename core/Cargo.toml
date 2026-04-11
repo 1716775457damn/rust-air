@@ -30,9 +30,10 @@ mdns-sd = "0.19"
 indicatif = "0.17"
 
 # Clipboard
+# arboard kept only for clipboard read/write in CLI send-clip command
 arboard = "3"
 
-# Clipboard history
+# Shared utilities (used by sync_vault)
 serde_json = "1"
 chrono     = { version = "0.4", features = ["serde"] }
 dirs       = "5"

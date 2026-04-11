@@ -68,7 +68,11 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            libavahi-compat-libdnssd-dev
+            libavahi-compat-libdnssd-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
 
       # Install deps manually so tauri-action finds the CLI
       - name: Install frontend dependencies
@@ -153,7 +157,12 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libavahi-compat-libdnssd-dev
+          sudo apt-get install -y \
+            libavahi-compat-libdnssd-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
 
       - name: Build CLI
         run: cargo build -p rust-air-cli --release --target ${{ matrix.target }}
