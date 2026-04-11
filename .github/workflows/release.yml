@@ -6,8 +6,12 @@ on:
       - 'v*'
   workflow_dispatch:
 
+env:
+  # Opt into Node.js 24 now to silence deprecation warnings
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  # ── Job 1: Tauri desktop app (4 platforms in parallel) ──────────────────────
+  # ── Tauri desktop builds ─────────────────────────────────────────────────────
   build-tauri:
     permissions:
       contents: write
@@ -16,25 +20,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows → .msi + .exe
           - platform: windows-latest
             rust-targets: ''
             tauri-args: ''
 
-          # macOS Apple Silicon (M-series) → .dmg aarch64
-          # macos-latest is now ARM; build natively, no cross-compile needed
           - platform: macos-latest
             rust-targets: ''
             tauri-args: ''
 
-          # macOS Intel → .dmg x86_64
-          # macos-13 is retired; use macos-13 alias or cross-compile from ARM runner
-          # Cross-compile x86_64 from the ARM runner (faster, no retired runner)
           - platform: macos-latest
             rust-targets: 'x86_64-apple-darwin'
             tauri-args: '--target x86_64-apple-darwin'
 
-          # Linux → .deb + .AppImage
           - platform: ubuntu-22.04
             rust-targets: ''
             tauri-args: ''
@@ -42,11 +39,9 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # Node 24 (replaces deprecated Node 20)
-      - name: Setup Node.js
+      - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -58,13 +53,12 @@ jobs:
         with:
           targets: ${{ matrix.rust-targets }}
 
-      - name: Cache Rust build
+      - name: Cache Rust
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './tauri-app/src-tauri -> target'
           cache-on-failure: true
 
-      # Linux: WebKit + GTK + mDNS (avahi) deps
       - name: Install Linux system dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -76,14 +70,18 @@ jobs:
             patchelf \
             libavahi-compat-libdnssd-dev
 
-      # Install frontend deps BEFORE tauri-action runs
-      # (fixes exit code 127 — tauri CLI not found)
+      # Install deps manually so tauri-action finds the CLI
       - name: Install frontend dependencies
         working-directory: tauri-app
         run: npm ci
 
+      # Build frontend separately to catch errors early and skip vue-tsc in CI
+      - name: Build frontend
+        working-directory: tauri-app
+        run: npx vite build
+
       - name: Build and publish Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE:          ${{ secrets.APPLE_CERTIFICATE }}
@@ -114,14 +112,13 @@ jobs:
             - E2EE：ChaCha20-Poly1305 端到端加密
             - SHA-256 文件完整性校验
             - mDNS-SD 局域网自动发现，无需手动输入 IP
-
-            ### 📋 更新内容
-            详见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
           releaseDraft: false
           prerelease: false
+          # Tell tauri-action the frontend is already built
+          distPath: '../dist'
           args: ${{ matrix.tauri-args }}
 
-  # ── Job 2: CLI binaries attached to the same Release ────────────────────────
+  # ── CLI binaries ─────────────────────────────────────────────────────────────
   build-cli:
     needs: build-tauri
     permissions:
@@ -160,10 +157,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libavahi-compat-libdnssd-dev
 
-      - name: Build CLI binary
+      - name: Build CLI
         run: cargo build -p rust-air-cli --release --target ${{ matrix.target }}
 
-      - name: Rename binary with platform suffix
+      - name: Rename binary
         shell: bash
         run: |
           SRC="target/${{ matrix.target }}/release/${{ matrix.binary }}"
@@ -172,7 +169,7 @@ jobs:
           cp "$SRC" "$DST"
           echo "BINARY_PATH=$DST" >> $GITHUB_ENV
 
-      - name: Upload CLI binary to Release
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
