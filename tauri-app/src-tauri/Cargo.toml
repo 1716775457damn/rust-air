@@ -23,3 +23,5 @@ anyhow             = "1"
 base64             = "0.22"
 rand               = "0.8"
 rust-air-core      = { path = "../../core" }
+image              = { version = "0.25", features = ["png"] }
+arboard            = "3"
