@@ -1,6 +1,5 @@
 name: Release App
 
-# 触发条件：推送 v* 格式的 tag（如 v1.0.0）或手动触发
 on:
   push:
     tags:
@@ -8,34 +7,34 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────────
-  # Job 1: 三平台并行构建 Tauri 桌面应用
-  # tauri-action 负责：编译 Rust + 打包前端 + 上传安装包到 GitHub Release
-  # ────────────────────────────────────────────────────────────────────────────
+  # ── Job 1: Tauri desktop app (4 platforms in parallel) ──────────────────────
   build-tauri:
     permissions:
-      contents: write   # 必须：允许创建 Release 并上传文件
+      contents: write
 
     strategy:
-      fail-fast: false  # 一个平台失败不影响其他平台继续构建
+      fail-fast: false
       matrix:
         include:
-          # Windows: 生成 .msi 安装包 + .exe 可执行文件
+          # Windows → .msi + .exe
           - platform: windows-latest
             rust-targets: ''
             tauri-args: ''
 
-          # macOS Apple Silicon (M 系列芯片)
+          # macOS Apple Silicon (M-series) → .dmg aarch64
+          # macos-latest is now ARM; build natively, no cross-compile needed
           - platform: macos-latest
-            rust-targets: 'aarch64-apple-darwin'
-            tauri-args: '--target aarch64-apple-darwin'
+            rust-targets: ''
+            tauri-args: ''
 
-          # macOS Intel (兼容旧 Mac)
-          - platform: macos-13
+          # macOS Intel → .dmg x86_64
+          # macos-13 is retired; use macos-13 alias or cross-compile from ARM runner
+          # Cross-compile x86_64 from the ARM runner (faster, no retired runner)
+          - platform: macos-latest
             rust-targets: 'x86_64-apple-darwin'
             tauri-args: '--target x86_64-apple-darwin'
 
-          # Linux: 生成 .deb 包 + .AppImage 免安装文件
+          # Linux → .deb + .AppImage
           - platform: ubuntu-22.04
             rust-targets: ''
             tauri-args: ''
@@ -43,26 +42,29 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      # ── 1. 拉取代码 ──────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Rust 工具链（含跨平台 target）────────────────────────────────────
+      # Node 24 (replaces deprecated Node 20)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: tauri-app/package-lock.json
+
       - name: Setup Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-targets }}
 
-      # Rust 编译缓存，大幅缩短后续构建时间
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './tauri-app/src-tauri -> target'
           cache-on-failure: true
 
-      # ── 3. Linux 系统依赖 ────────────────────────────────────────────────────
-      # WebKit / GTK / AppIndicator 是 Tauri 在 Linux 上的必要依赖
-      # libavahi-compat-libdnssd-dev 是 mdns-sd crate 在 Linux 上的必要依赖
+      # Linux: WebKit + GTK + mDNS (avahi) deps
       - name: Install Linux system dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -74,29 +76,16 @@ jobs:
             patchelf \
             libavahi-compat-libdnssd-dev
 
-      # ── 4. Node.js + 前端依赖 ────────────────────────────────────────────────
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: tauri-app/package-lock.json
-
+      # Install frontend deps BEFORE tauri-action runs
+      # (fixes exit code 127 — tauri CLI not found)
       - name: Install frontend dependencies
         working-directory: tauri-app
         run: npm ci
 
-      # ── 5. 构建 & 发布（核心步骤）────────────────────────────────────────────
-      # tauri-action 会自动：
-      #   - 运行 npm run build 编译前端
-      #   - 运行 cargo tauri build 编译 Rust + 打包
-      #   - 创建/更新 GitHub Release 并上传安装包
       - name: Build and publish Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # ── macOS 代码签名（可选，在仓库 Settings → Secrets 中配置）──────────
-          # 不配置也能构建，只是 macOS 会提示"未验证的开发者"
           APPLE_CERTIFICATE:          ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY:     ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -104,8 +93,8 @@ jobs:
           APPLE_PASSWORD:             ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID:              ${{ secrets.APPLE_TEAM_ID }}
         with:
-          projectPath: tauri-app          # tauri.conf.json 所在目录的上级
-          tagName: ${{ github.ref_name }} # 直接使用推送的 tag，如 v1.0.0
+          projectPath: tauri-app
+          tagName: ${{ github.ref_name }}
           releaseName: 'rust-air ${{ github.ref_name }}'
           releaseBody: |
             ## rust-air ${{ github.ref_name }} — LAN 极速文件传输
@@ -132,12 +121,8 @@ jobs:
           prerelease: false
           args: ${{ matrix.tauri-args }}
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Job 2: 三平台并行构建纯 CLI 二进制（无 GUI 依赖，体积更小）
-  # 构建完成后附加到同一个 GitHub Release
-  # ────────────────────────────────────────────────────────────────────────────
+  # ── Job 2: CLI binaries attached to the same Release ────────────────────────
   build-cli:
-    # 等 Tauri job 先创建好 Release，CLI job 再往里追加文件
     needs: build-tauri
     permissions:
       contents: write
@@ -169,7 +154,6 @@ jobs:
         with:
           cache-on-failure: true
 
-      # mDNS 在 Linux 上需要 avahi 开发库
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: |
@@ -179,7 +163,6 @@ jobs:
       - name: Build CLI binary
         run: cargo build -p rust-air-cli --release --target ${{ matrix.target }}
 
-      # 重命名二进制，加上平台后缀，避免 Release 中文件名冲突
       - name: Rename binary with platform suffix
         shell: bash
         run: |
@@ -189,7 +172,6 @@ jobs:
           cp "$SRC" "$DST"
           echo "BINARY_PATH=$DST" >> $GITHUB_ENV
 
-      # 将 CLI 二进制附加到已有的 GitHub Release（由 build-tauri job 创建）
       - name: Upload CLI binary to Release
         uses: softprops/action-gh-release@v2
         with:
