@@ -40,6 +40,20 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // On Windows, if launched by double-click (no args), show help and wait
+    #[cfg(target_os = "windows")]
+    if std::env::args().len() == 1 {
+        eprintln!("rust-air — LAN file transfer\n");
+        eprintln!("Usage examples:");
+        eprintln!("  rust-air send photo.jpg");
+        eprintln!("  rust-air receive rust-air-XXXXXXXX:KEY");
+        eprintln!("  rust-air scan\n");
+        eprintln!("Press Enter to exit...");
+        let mut s = String::new();
+        let _ = std::io::stdin().read_line(&mut s);
+        return Ok(());
+    }
+
     match Cli::parse().cmd {
         Cmd::Send { path, qr }    => cmd_send(path, qr).await,
         Cmd::SendClip              => cmd_send_clip().await,

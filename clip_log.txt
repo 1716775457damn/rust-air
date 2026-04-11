@@ -1,0 +1,5 @@
+[clip] monitor started
+[clip] Clipboard::new() ok after 0 tries
+[clip] new text: "[3/8] Building CXX object esp-idf/main/C"
+[clip] new text: "idf.py -p COM4 build flash monitor"
+[clip] new text: "PS E:\\GitHub\\rust-esp32\\tarot-esp32> idf"

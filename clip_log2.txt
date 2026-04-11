@@ -1,0 +1,4 @@
+[clip] monitor started
+[clip] Clipboard::new() ok after 0 tries
+[clip] new text: "PS E:\\GitHub\\rust-esp32\\tarot-esp32> idf"
+[clip] new text: "localhost 拒绝连接。"

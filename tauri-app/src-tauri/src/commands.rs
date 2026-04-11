@@ -158,33 +158,17 @@ pub fn write_clipboard(text: String) -> Result<(), String> {
     clipboard::write(&text).map_err(|e| e.to_string())
 }
 
-/// Return all non-loopback IPv4 addresses on this machine.
-/// Each entry is "InterfaceName  IP" e.g. "以太网  192.168.1.5"
+/// Return the single primary LAN IPv4 address.
 #[tauri::command]
 pub fn get_local_ips() -> Vec<String> {
-    let mut result = Vec::new();
-    // Best-effort: connect a UDP socket to determine the primary outbound IP
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
         if sock.connect("8.8.8.8:80").is_ok() {
             if let Ok(addr) = sock.local_addr() {
-                result.push(format!("本机 (主要)  {}", addr.ip()));
+                return vec![addr.ip().to_string()];
             }
         }
     }
-    // Enumerate all interfaces for a complete picture
-    if let Ok(ifaces) = local_ip_address::list_afinet_netifas() {
-        for (name, ip) in ifaces {
-            if ip.is_loopback() { continue; }
-            if ip.is_ipv4() {
-                let entry = format!("{}  {}", name, ip);
-                // Avoid duplicating the primary IP already added above
-                if !result.iter().any(|r: &String| r.contains(&ip.to_string())) {
-                    result.push(entry);
-                }
-            }
-        }
-    }
-    result
+    Vec::new()
 }
 
 // ── Response types ────────────────────────────────────────────────────────────

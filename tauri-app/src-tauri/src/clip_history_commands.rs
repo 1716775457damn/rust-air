@@ -1,47 +1,31 @@
-//! Tauri IPC commands for clipboard history.
-//!
-//! The `HistoryState` is managed by Tauri and shared across all commands.
-//! The background monitor thread sends new entries via an mpsc channel;
-//! `tick_history` drains the channel and should be called periodically
-//! (triggered by the frontend via a setInterval).
-
-use rust_air_core::{ClipContent, ClipEntry, HistoryStore, start_monitor};
+use rust_air_core::{ClipContent, ClipEntry, HistoryStore};
 use serde::{Deserialize, Serialize};
-use std::sync::{mpsc, Mutex};
-use tauri::State;
-
-// ── State ─────────────────────────────────────────────────────────────────────
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, State};
 
 pub struct HistoryState {
-    store:   Mutex<HistoryStore>,
-    rx:      Mutex<mpsc::Receiver<ClipContent>>,
-    paused:  Mutex<bool>,
+    pub store:  Mutex<HistoryStore>,
+    pub paused: Mutex<bool>,
 }
 
 impl HistoryState {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
-        start_monitor(tx);
         Self {
             store:  Mutex::new(HistoryStore::load()),
-            rx:     Mutex::new(rx),
             paused: Mutex::new(false),
         }
     }
 }
 
-// ── Serialisable view sent to frontend ───────────────────────────────────────
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ClipEntryView {
     pub id:         u64,
-    pub kind:       String,   // "text" | "image"
+    pub kind:       String,
     pub preview:    String,
     pub stats:      String,
     pub time_str:   String,
     pub pinned:     bool,
     pub char_count: usize,
-    /// Only present for image entries (base64-encoded PNG)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_b64:  Option<String>,
 }
@@ -51,8 +35,14 @@ impl From<&ClipEntry> for ClipEntryView {
         let (kind, image_b64) = match &e.content {
             ClipContent::Text { .. } => ("text".to_string(), None),
             ClipContent::Image { width, height, rgba } => {
-                // Encode image as base64 PNG for display in the frontend
-                let b64 = encode_rgba_to_b64_png(*width, *height, rgba);
+                use base64::{engine::general_purpose::STANDARD, Engine};
+                let mut buf = Vec::new();
+                let b64 = if let Some(img) = image::RgbaImage::from_raw(*width, *height, rgba.to_vec()) {
+                    let mut c = std::io::Cursor::new(&mut buf);
+                    if image::DynamicImage::ImageRgba8(img).write_to(&mut c, image::ImageFormat::Png).is_ok() {
+                        STANDARD.encode(&buf)
+                    } else { String::new() }
+                } else { String::new() };
                 ("image".to_string(), Some(b64))
             }
         };
@@ -64,94 +54,127 @@ impl From<&ClipEntry> for ClipEntryView {
     }
 }
 
-fn encode_rgba_to_b64_png(width: u32, height: u32, rgba: &[u8]) -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    // Encode as raw PNG via the `image` crate if available, else return empty
-    let mut buf = Vec::new();
-    if let Some(img) = image::RgbaImage::from_raw(width, height, rgba.to_vec()) {
-        let dyn_img = image::DynamicImage::ImageRgba8(img);
-        let mut cursor = std::io::Cursor::new(&mut buf);
-        if dyn_img.write_to(&mut cursor, image::ImageFormat::Png).is_ok() {
-            return STANDARD.encode(&buf);
+/// Start a background thread that polls clipboard and emits "clip-update" events directly.
+/// No channel, no invoke — push-based.
+pub fn start_clip_monitor(app: AppHandle, state: std::sync::Arc<HistoryState>) {
+    std::thread::spawn(move || {
+        // Wait for clipboard to be available
+        let mut cb = None;
+        for _ in 0..40 {
+            if let Ok(c) = arboard::Clipboard::new() { cb = Some(c); break; }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
-    }
-    String::new()
-}
+        let mut cb = match cb { Some(c) => c, None => return };
 
-// ── Commands ──────────────────────────────────────────────────────────────────
+        let mut last_text = String::new();
+        let mut last_img_hash = 0u64;
 
-/// Drain the monitor channel and push new entries into the store.
-/// Frontend should call this every ~500 ms via setInterval.
-/// Returns the updated entry list (filtered by optional query).
-#[tauri::command]
-pub fn tick_history(
-    query: String,
-    state: State<'_, HistoryState>,
-) -> Vec<ClipEntryView> {
-    let paused = *state.paused.lock().unwrap_or_else(|e| e.into_inner());
-    // Drain channel and push into store — acquire locks separately to avoid deadlock
-    {
-        let rx = state.rx.lock().unwrap_or_else(|e| e.into_inner());
-        let pending: Vec<ClipContent> = rx.try_iter().collect();
-        drop(rx); // release rx lock before acquiring store lock
-        if !pending.is_empty() {
-            let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-            for content in pending {
+        // Delay initial emit so frontend listen() has time to register
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        // Emit initial load from disk immediately
+        {
+            let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+            let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
+            let _ = app.emit("clip-update", &entries);
+        }
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            let paused = *state.paused.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Refresh clipboard handle each tick
+            if let Ok(fresh) = arboard::Clipboard::new() { cb = fresh; }
+
+            let new_content: Option<ClipContent> = if let Ok(text) = cb.get_text() {
+                let text = text.trim().to_string();
+                if !text.is_empty() && text != last_text {
+                    last_text = text.clone();
+                    last_img_hash = 0;
+                    Some(ClipContent::Text { text })
+                } else { None }
+            } else if let Ok(img) = cb.get_image() {
+                let hash = fnv1a(&img.bytes);
+                if hash != last_img_hash {
+                    last_img_hash = hash;
+                    last_text.clear();
+                    Some(ClipContent::Image {
+                        width: img.width as u32, height: img.height as u32,
+                        rgba: img.bytes.into_owned(),
+                    })
+                } else { None }
+            } else { None };
+
+            if let Some(content) = new_content {
+                let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
                 if !paused { store.push(content); }
+                store.flush_if_needed();
+                let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
+                let _ = app.emit("clip-update", &entries);
             }
-            store.flush_if_needed();
-        } else {
-            state.store.lock().unwrap_or_else(|e| e.into_inner()).flush_if_needed();
         }
-    }
-    get_entries_filtered(&state, &query)
+    });
 }
 
-/// Return all entries matching `query` (empty = all).
-#[tauri::command]
-pub fn get_history(
-    query: String,
-    state: State<'_, HistoryState>,
-) -> Vec<ClipEntryView> {
-    get_entries_filtered(&state, &query)
+fn fnv1a(data: &[u8]) -> u64 {
+    let step = (data.len() / 512).max(1);
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data.iter().step_by(step) { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
 }
 
-/// Copy an entry's content back to the system clipboard and bump it to the top.
+// ── Commands (still needed for mutations) ────────────────────────────────────
+
 #[tauri::command]
-pub fn copy_history_entry(id: u64, state: State<'_, HistoryState>) -> Result<(), String> {
+pub fn get_history(state: State<'_, HistoryState>) -> Vec<ClipEntryView> {
+    state.store.lock().unwrap_or_else(|e| e.into_inner())
+        .entries.iter().map(ClipEntryView::from).collect()
+}
+
+#[tauri::command]
+pub fn copy_history_entry(id: u64, app: AppHandle, state: State<'_, HistoryState>) -> Result<(), String> {
     let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let entry = store.entries.iter().find(|e| e.id == id).cloned()
         .ok_or_else(|| format!("entry {id} not found"))?;
-    // Write to clipboard
     let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     match &entry.content {
         ClipContent::Text { text } => cb.set_text(text.clone()).map_err(|e| e.to_string())?,
         ClipContent::Image { width, height, rgba } => {
             cb.set_image(arboard::ImageData {
-                width:  *width  as usize,
-                height: *height as usize,
-                bytes:  std::borrow::Cow::Borrowed(rgba),
+                width: *width as usize, height: *height as usize,
+                bytes: std::borrow::Cow::Borrowed(rgba),
             }).map_err(|e| e.to_string())?;
         }
     }
-    // Bump to top
     store.push(entry.content);
+    let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
+    let _ = app.emit("clip-update", &entries);
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_history_entry(id: u64, state: State<'_, HistoryState>) {
-    state.store.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+pub fn delete_history_entry(id: u64, app: AppHandle, state: State<'_, HistoryState>) {
+    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    store.remove(id);
+    let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
+    let _ = app.emit("clip-update", &entries);
 }
 
 #[tauri::command]
-pub fn toggle_pin_entry(id: u64, state: State<'_, HistoryState>) {
-    state.store.lock().unwrap_or_else(|e| e.into_inner()).toggle_pin(id);
+pub fn toggle_pin_entry(id: u64, app: AppHandle, state: State<'_, HistoryState>) {
+    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    store.toggle_pin(id);
+    let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
+    let _ = app.emit("clip-update", &entries);
 }
 
 #[tauri::command]
-pub fn clear_history(state: State<'_, HistoryState>) {
-    state.store.lock().unwrap_or_else(|e| e.into_inner()).clear_unpinned();
+pub fn clear_history(app: AppHandle, state: State<'_, HistoryState>) {
+    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    store.clear_unpinned();
+    let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
+    let _ = app.emit("clip-update", &entries);
 }
 
 #[tauri::command]
@@ -160,29 +183,18 @@ pub fn set_history_paused(paused: bool, state: State<'_, HistoryState>) {
 }
 
 #[tauri::command]
-pub fn get_history_paused(state: State<'_, HistoryState>) -> bool {
-    *state.paused.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Flush history to disk immediately (call on app exit).
-#[tauri::command]
 pub fn flush_history(state: State<'_, HistoryState>) {
     state.store.lock().unwrap_or_else(|e| e.into_inner()).flush_now();
 }
 
-// ── Helper ────────────────────────────────────────────────────────────────────
+// keep for backward compat — now a no-op since monitor is push-based
+#[tauri::command]
+pub fn tick_history(state: State<'_, HistoryState>) -> Vec<ClipEntryView> {
+    state.store.lock().unwrap_or_else(|e| e.into_inner())
+        .entries.iter().map(ClipEntryView::from).collect()
+}
 
-fn get_entries_filtered(state: &HistoryState, query: &str) -> Vec<ClipEntryView> {
-    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-    let q = query.trim().to_lowercase();
-    store.entries.iter()
-        .filter(|e| {
-            if q.is_empty() { return true; }
-            match &e.content {
-                ClipContent::Text { .. } => e.text_lc.contains(&q),
-                ClipContent::Image { .. } => false,
-            }
-        })
-        .map(ClipEntryView::from)
-        .collect()
+#[tauri::command]
+pub fn get_history_paused(state: State<'_, HistoryState>) -> bool {
+    *state.paused.lock().unwrap_or_else(|e| e.into_inner())
 }

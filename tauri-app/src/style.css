@@ -1,1 +1,11 @@
 @import "tailwindcss";
+
+/* Smooth scrollbar */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+
+/* Prevent text selection on UI chrome */
+body { -webkit-user-select: none; user-select: none; }
+textarea, input, code, .font-mono { -webkit-user-select: text; user-select: text; }

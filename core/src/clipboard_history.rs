@@ -108,9 +108,13 @@ pub struct HistoryStore {
 impl HistoryStore {
     pub fn load() -> Self {
         let path = data_path();
-        let mut entries: Vec<ClipEntry> = std::fs::read_to_string(&path)
+        let mut entries: Vec<ClipEntry> = std::fs::read(&path)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|bytes| {
+                // Ensure UTF-8; silently discard corrupt/legacy files
+                let s = String::from_utf8(bytes).ok()?;
+                serde_json::from_str(&s).ok()
+            })
             .unwrap_or_default();
         // Drop any image entries that survived (shouldn't happen, but be safe)
         entries.retain(|e| matches!(&e.content, ClipContent::Text { .. }));
@@ -211,36 +215,46 @@ impl HistoryStore {
 
 // ── Background monitor ────────────────────────────────────────────────────────
 
-/// Spawn a background thread that polls the clipboard every 200 ms and sends
+/// Spawn a background thread that polls the clipboard every 500 ms and sends
 /// new content over `tx`. Returns immediately.
 pub fn start_monitor(tx: std::sync::mpsc::Sender<ClipContent>) {
     std::thread::spawn(move || {
-        let mut cb = match arboard::Clipboard::new() {
-            Ok(c)  => c,
-            Err(_) => return,
-        };
-        let mut last_text     = String::new();
-        let mut last_img_hash = 0u64;
-
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            if let Ok(text) = cb.get_text() {
-                let text = text.trim().to_string();
-                if !text.is_empty() && text != last_text {
-                    last_text = text.clone();
-                    if tx.send(ClipContent::Text { text }).is_err() { return; }
-                }
+        let mut cb = None;
+        for _ in 0..20 {
+            match arboard::Clipboard::new() {
+                Ok(c)  => { cb = Some(c); break; }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
             }
-
+        }
+        let mut cb = match cb {
+            Some(c) => c,
+            None    => return,
+        };
+        let mut last_text = String::new();
+        let mut last_img_hash = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(fresh) = arboard::Clipboard::new() { cb = fresh; }
+            match cb.get_text() {
+                Ok(text) => {
+                    let text = text.trim().to_string();
+                    if !text.is_empty() && text != last_text {
+                        last_text = text.clone();
+                        last_img_hash = 0;
+                        if tx.send(ClipContent::Text { text }).is_err() { return; }
+                    }
+                    continue;
+                }
+                Err(_) => {}
+            }
             if let Ok(img) = cb.get_image() {
                 let hash = fnv1a(&img.bytes);
                 if hash != last_img_hash {
                     last_img_hash = hash;
+                    last_text.clear();
                     if tx.send(ClipContent::Image {
-                        width:  img.width  as u32,
-                        height: img.height as u32,
-                        rgba:   img.bytes.into_owned(),
+                        width: img.width as u32, height: img.height as u32,
+                        rgba: img.bytes.into_owned(),
                     }).is_err() { return; }
                 }
             }

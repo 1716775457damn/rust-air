@@ -1,6 +1,6 @@
 mod commands;
-mod clip_history_commands;
 mod sync_commands;
+mod search_commands;
 
 use tauri_plugin_dialog;
 use tauri_plugin_opener;
@@ -11,8 +11,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::default())
-        .manage(clip_history_commands::HistoryState::new())
         .manage(sync_commands::SyncState::new())
+        .manage(search_commands::SearchState::new())
         .invoke_handler(tauri::generate_handler![
             // File transfer
             commands::start_send,
@@ -22,16 +22,6 @@ pub fn run() {
             commands::read_clipboard,
             commands::write_clipboard,
             commands::get_local_ips,
-            // Clipboard history
-            clip_history_commands::tick_history,
-            clip_history_commands::get_history,
-            clip_history_commands::copy_history_entry,
-            clip_history_commands::delete_history_entry,
-            clip_history_commands::toggle_pin_entry,
-            clip_history_commands::clear_history,
-            clip_history_commands::set_history_paused,
-            clip_history_commands::get_history_paused,
-            clip_history_commands::flush_history,
             // Sync vault
             sync_commands::get_sync_config,
             sync_commands::save_sync_config,
@@ -41,6 +31,9 @@ pub fn run() {
             sync_commands::sync_done,
             sync_commands::start_watch,
             sync_commands::stop_watch,
+            // File search
+            search_commands::start_search,
+            search_commands::cancel_search,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
