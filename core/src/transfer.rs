@@ -1,31 +1,31 @@
-/// Core transfer engine v2.
-///
-/// Protocol header (plaintext, before encryption):
-///   [4B MAGIC][1B kind][2B name_len][name][8B total_size][32B sha256_of_full_file]
-///
-/// Resume handshake:
-///   RX ← [8B already_have]
-///
-/// Data: AEAD-encrypted chunks (see crypto.rs), then 4-byte zero sentinel.
-///
-/// On completion the receiver verifies SHA-256 of the assembled file.
+//! Core transfer engine v2.
+//!
+//! Protocol header (plaintext):
+//!   [4B MAGIC][1B kind][2B name_len][name][8B total_size][32B sha256]
+//!
+//! Resume handshake:
+//!   RX ← [8B already_have]   (0 = fresh transfer)
+//!
+//! Data stream: AEAD-encrypted chunks, terminated by a 4-byte zero sentinel.
+//! On completion the receiver verifies SHA-256 of the assembled file.
 
 use crate::{
     archive,
     crypto::{Decryptor, Encryptor},
-    proto::{Kind, TransferEvent, CHUNK, MAGIC},
+    proto::{Kind, TransferEvent, CHUNK, MAGIC, MAX_NAME_LEN},
 };
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-// ── Send ─────────────────────────────────────────────────────────────────────
+// ── Send ──────────────────────────────────────────────────────────────────────
 
 pub async fn send_path(
     stream: TcpStream,
@@ -33,22 +33,23 @@ pub async fn send_path(
     key: &[u8; 32],
     on_progress: impl Fn(TransferEvent) + Send + 'static,
 ) -> Result<()> {
-    let meta = std::fs::metadata(path)?;
+    let meta = tokio::fs::metadata(path).await?;
     let is_dir = meta.is_dir();
     let kind = if is_dir { Kind::Archive } else { Kind::File };
-    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let total_size: u64 = if is_dir { 0 } else { meta.len() };
 
-    // SHA-256: for files compute upfront; for archives use zeroes (unknown until streamed)
-    let checksum: [u8; 32] = if is_dir {
-        [0u8; 32]
-    } else {
-        sha256_file(path).await?
-    };
+    // Archives: checksum unknown until fully streamed → send zeroes.
+    let checksum: [u8; 32] = if is_dir { [0u8; 32] } else { sha256_file(path).await? };
 
     let (mut rx, mut tx) = stream.into_split();
     send_header(&mut tx, kind, &name, total_size, &checksum).await?;
 
+    // Read resume offset from receiver.
     let mut resume_buf = [0u8; 8];
     rx.read_exact(&mut resume_buf).await?;
     let resume_offset = u64::from_be_bytes(resume_buf);
@@ -78,13 +79,12 @@ pub async fn send_path(
 
 pub async fn send_clipboard(stream: TcpStream, text: String, key: &[u8; 32]) -> Result<()> {
     let bytes = text.into_bytes();
-    let total = bytes.len() as u64;
     let checksum = sha256_bytes(&bytes);
     let (mut rx, mut tx) = stream.into_split();
 
-    send_header(&mut tx, Kind::Clipboard, "clipboard", total, &checksum).await?;
-    let mut _skip = [0u8; 8];
-    rx.read_exact(&mut _skip).await?;
+    send_header(&mut tx, Kind::Clipboard, "clipboard", bytes.len() as u64, &checksum).await?;
+    // Consume the resume reply (clipboard never resumes).
+    rx.read_exact(&mut [0u8; 8]).await?;
 
     let mut enc = Encryptor::new(key, tx);
     enc.write_chunk(&bytes).await?;
@@ -119,49 +119,35 @@ pub async fn receive_to_disk(
 
     match kind {
         Kind::File => {
-            let mut f = if already_have > 0 {
-                tokio::fs::OpenOptions::new().append(true).open(&part_path).await?
-            } else {
-                tokio::fs::OpenOptions::new()
-                    .create(true).write(true).truncate(true)
-                    .open(&part_path).await?
-            };
+            let mut f = open_part_file(&part_path, already_have).await?;
             pb.set_position(already_have);
 
             let mut dec = Decryptor::new(key, rx);
             let mut done = already_have;
             let start = Instant::now();
+
             while let Some(chunk) = dec.read_chunk().await? {
                 f.write_all(&chunk).await?;
                 done += chunk.len() as u64;
                 pb.set_position(done);
-                on_progress(TransferEvent {
-                    bytes_done: done,
-                    total_bytes: total_size,
-                    bytes_per_sec: (done as f64 / start.elapsed().as_secs_f64()) as u64,
-                    done: false,
-                    error: None,
-                });
+                emit_progress(&on_progress, done, total_size, &start, false);
             }
             f.flush().await?;
             drop(f);
 
-            // SHA-256 verification
+            // Integrity check — skip only if sender sent all-zero checksum (archive).
             if expected_sha != [0u8; 32] {
                 let actual = sha256_file(&part_path).await?;
                 if actual != expected_sha {
                     tokio::fs::remove_file(&part_path).await?;
-                    anyhow::bail!("SHA-256 mismatch — file corrupted");
+                    anyhow::bail!("SHA-256 mismatch — file corrupted, partial file removed");
                 }
             }
 
             let final_path = dest.join(&name);
             tokio::fs::rename(&part_path, &final_path).await?;
             pb.finish_with_message("Done ✅");
-            on_progress(TransferEvent {
-                bytes_done: done, total_bytes: total_size,
-                bytes_per_sec: 0, done: true, error: None,
-            });
+            emit_progress(&on_progress, done, total_size, &start, true);
             Ok(final_path)
         }
 
@@ -176,24 +162,19 @@ pub async fn receive_to_disk(
             let mut sync_w: os_pipe::PipeWriter = pipe_writer;
             let mut done: u64 = 0;
             let start = Instant::now();
+
             while let Some(chunk) = dec.read_chunk().await? {
                 use std::io::Write;
                 sync_w.write_all(&chunk)?;
                 done += chunk.len() as u64;
                 pb.inc(chunk.len() as u64);
-                on_progress(TransferEvent {
-                    bytes_done: done, total_bytes: total_size,
-                    bytes_per_sec: (done as f64 / start.elapsed().as_secs_f64()) as u64,
-                    done: false, error: None,
-                });
+                emit_progress(&on_progress, done, total_size, &start, false);
             }
-            drop(sync_w);
+            drop(sync_w); // signal EOF to unpack thread
             unpack.await??;
+
             pb.finish_with_message("Done ✅");
-            on_progress(TransferEvent {
-                bytes_done: done, total_bytes: 0,
-                bytes_per_sec: 0, done: true, error: None,
-            });
+            emit_progress(&on_progress, done, 0, &start, true);
             Ok(dest.to_path_buf())
         }
 
@@ -206,8 +187,8 @@ pub async fn receive_to_disk(
             if expected_sha != [0u8; 32] && sha256_bytes(&buf) != expected_sha {
                 anyhow::bail!("clipboard SHA-256 mismatch");
             }
-            let text = String::from_utf8_lossy(&buf).to_string();
-            crate::clipboard::write(&text)?;
+            // Lossy conversion: non-UTF-8 bytes become U+FFFD.
+            crate::clipboard::write(&String::from_utf8_lossy(&buf))?;
             pb.finish_with_message("Done ✅");
             Ok(dest.to_path_buf())
         }
@@ -224,6 +205,7 @@ async fn send_header(
     checksum: &[u8; 32],
 ) -> Result<()> {
     let nb = name.as_bytes();
+    anyhow::ensure!(nb.len() <= MAX_NAME_LEN, "filename too long ({} bytes)", nb.len());
     tx.write_all(MAGIC).await?;
     tx.write_all(&[kind as u8]).await?;
     tx.write_all(&(nb.len() as u16).to_be_bytes()).await?;
@@ -238,7 +220,7 @@ async fn recv_header(
 ) -> Result<(Kind, String, u64, [u8; 32])> {
     let mut magic = [0u8; 4];
     rx.read_exact(&mut magic).await?;
-    anyhow::ensure!(&magic == MAGIC, "protocol magic mismatch (wrong version?)");
+    anyhow::ensure!(&magic == MAGIC, "protocol magic mismatch — check versions");
 
     let mut kind_b = [0u8; 1];
     rx.read_exact(&mut kind_b).await?;
@@ -246,21 +228,24 @@ async fn recv_header(
 
     let mut len_b = [0u8; 2];
     rx.read_exact(&mut len_b).await?;
-    let mut name_b = vec![0u8; u16::from_be_bytes(len_b) as usize];
-    rx.read_exact(&mut name_b).await?;
-    let name = String::from_utf8(name_b)?;
+    let name_len = u16::from_be_bytes(len_b) as usize;
+    // Guard against memory exhaustion from a malformed/malicious header.
+    anyhow::ensure!(name_len <= MAX_NAME_LEN, "filename length {name_len} exceeds limit");
 
-    // Security: reject path traversal attempts (e.g. "../../../etc/passwd")
-    let safe_name = Path::new(&name)
+    let mut name_b = vec![0u8; name_len];
+    rx.read_exact(&mut name_b).await?;
+    let raw_name = String::from_utf8(name_b)?;
+
+    // Security: strip any directory components to prevent path traversal.
+    let name = Path::new(&raw_name)
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("invalid filename: '{name}'"))?
+        .ok_or_else(|| anyhow::anyhow!("invalid filename: '{raw_name}'"))?
         .to_string_lossy()
-        .to_string();
+        .into_owned();
     anyhow::ensure!(
-        !safe_name.contains(['/', '\\', '\0']),
-        "filename contains illegal characters: '{safe_name}'"
+        !name.contains(['\0', '/', '\\']),
+        "filename contains illegal characters: '{name}'"
     );
-    let name = safe_name;
 
     let mut size_b = [0u8; 8];
     rx.read_exact(&mut size_b).await?;
@@ -289,20 +274,15 @@ async fn stream_encrypted<R: AsyncRead + Unpin>(
         enc.write_chunk(&buf[..n]).await?;
         done += n as u64;
         pb.set_position(done);
-        on_progress(TransferEvent {
-            bytes_done: done, total_bytes: total,
-            bytes_per_sec: (done as f64 / start.elapsed().as_secs_f64().max(0.001)) as u64,
-            done: false, error: None,
-        });
+        emit_progress(&on_progress, done, total, &start, false);
     }
     Ok(())
 }
 
-// ── Checksum helpers ──────────────────────────────────────────────────────────
+// ── Checksum ──────────────────────────────────────────────────────────────────
 
-/// Stream-hash a file in 64 KB chunks — O(1) memory regardless of file size.
+/// Stream-hash a file in CHUNK-sized reads — O(1) memory regardless of file size.
 pub async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
-    use tokio::io::AsyncReadExt;
     let file = tokio::fs::File::open(path).await?;
     let mut reader = tokio::io::BufReader::with_capacity(CHUNK, file);
     let mut h = Sha256::new();
@@ -316,9 +296,42 @@ pub async fn sha256_file(path: &Path) -> Result<[u8; 32]> {
 }
 
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(data);
-    h.finalize().into()
+    Sha256::digest(data).into()
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Open (or create/append) the `.part` file for a resumable receive.
+async fn open_part_file(path: &Path, already_have: u64) -> Result<tokio::fs::File> {
+    if already_have > 0 {
+        Ok(tokio::fs::OpenOptions::new().append(true).open(path).await?)
+    } else {
+        Ok(tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .await?)
+    }
+}
+
+/// Emit a `TransferEvent`, computing bytes/sec from elapsed time.
+#[inline]
+fn emit_progress(
+    cb: &Arc<impl Fn(TransferEvent)>,
+    bytes_done: u64,
+    total_bytes: u64,
+    start: &Instant,
+    done: bool,
+) {
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    cb(TransferEvent {
+        bytes_done,
+        total_bytes,
+        bytes_per_sec: (bytes_done as f64 / elapsed) as u64,
+        done,
+        error: None,
+    });
 }
 
 // ── Progress bar ──────────────────────────────────────────────────────────────

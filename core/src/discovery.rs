@@ -1,35 +1,40 @@
-/// mDNS-SD peer discovery.
-///
-/// Sender registers a service: _rustair._tcp.local. with TXT record port=<n>
-/// Receiver browses for _rustair._tcp.local. and resolves the first match.
-///
-/// DeviceStatus is encoded in TXT: status=idle | status=busy
+//! mDNS-SD peer discovery.
+//!
+//! Sender registers `_rustair._tcp.local.` with TXT `status=idle|busy` and `v=2`.
+//! Receiver browses the same service type and resolves by exact instance name.
 
 use crate::proto::{DeviceInfo, DeviceStatus, MDNS_SERVICE};
 use anyhow::Result;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::collections::HashMap;
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::mpsc;
 
+const RESOLVE_TIMEOUT_SECS: u64 = 15;
+const BROWSE_POLL_MS: u64 = 500;
+
+// ── Sender registration ───────────────────────────────────────────────────────
+
 /// Register this node as a rust-air sender on the LAN.
-/// Returns a handle; dropping it unregisters the service.
+/// The returned handle keeps the mDNS advertisement alive; dropping it unregisters.
 pub fn register_sender(port: u16, instance_name: &str) -> Result<SenderHandle> {
     let daemon = ServiceDaemon::new()?;
-    let mut props = HashMap::new();
-    props.insert("status".to_string(), "idle".to_string());
-    props.insert("v".to_string(), "2".to_string());
-
     let hostname = gethostname();
+
+    // TXT properties: status and protocol version.
+    let props = [("status", "idle"), ("v", "2")];
     let svc = ServiceInfo::new(
         MDNS_SERVICE,
         instance_name,
         &hostname,
-        "",   // let mdns-sd resolve local IP
+        "",   // let mdns-sd resolve the local IP automatically
         port,
-        Some(props),
+        Some(props.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<std::collections::HashMap<_, _>>()),
     )?;
     daemon.register(svc)?;
-    Ok(SenderHandle { daemon, fullname: format!("{instance_name}.{MDNS_SERVICE}") })
+
+    Ok(SenderHandle {
+        daemon,
+        fullname: format!("{instance_name}.{MDNS_SERVICE}"),
+    })
 }
 
 pub struct SenderHandle {
@@ -44,8 +49,10 @@ impl Drop for SenderHandle {
     }
 }
 
-/// Browse the LAN and stream discovered devices over a channel.
-/// Runs until the receiver is dropped.
+// ── Device browsing ───────────────────────────────────────────────────────────
+
+/// Browse the LAN continuously, streaming `DeviceInfo` events over `tx`.
+/// Runs until the channel receiver is dropped.
 pub async fn browse_devices(tx: mpsc::Sender<DeviceInfo>) -> Result<()> {
     let daemon = ServiceDaemon::new()?;
     let receiver = daemon.browse(MDNS_SERVICE)?;
@@ -59,22 +66,20 @@ pub async fn browse_devices(tx: mpsc::Sender<DeviceInfo>) -> Result<()> {
                         .map(|s| if s == "busy" { DeviceStatus::Busy } else { DeviceStatus::Idle })
                         .unwrap_or(DeviceStatus::Idle);
 
-                    let addr = info
-                        .get_addresses()
-                        .iter()
-                        .next()
+                    let addr = best_addr(&info)
                         .map(|a| format!("{a}:{}", info.get_port()))
                         .unwrap_or_default();
 
-                    let device = DeviceInfo {
-                        name:   info.get_fullname().to_string(),
+                    if tx.blocking_send(DeviceInfo {
+                        name: info.get_fullname().to_string(),
                         addr,
                         status,
-                    };
-                    if tx.blocking_send(device).is_err() { break; }
+                    }).is_err() {
+                        break;
+                    }
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
-                    // Signal removal with empty addr so UI can remove the card
+                    // Empty addr signals removal to the UI.
                     let _ = tx.blocking_send(DeviceInfo {
                         name:   fullname,
                         addr:   String::new(),
@@ -90,42 +95,49 @@ pub async fn browse_devices(tx: mpsc::Sender<DeviceInfo>) -> Result<()> {
     Ok(())
 }
 
-/// One-shot: find the first sender advertising `instance_name` and return its address.
+// ── One-shot resolve ──────────────────────────────────────────────────────────
+
+/// Resolve `instance_name` to `(ip, port)` via mDNS, timing out after 15 s.
 pub async fn resolve_sender(instance_name: &str) -> Result<(String, u16)> {
     let daemon = ServiceDaemon::new()?;
     let receiver = daemon.browse(MDNS_SERVICE)?;
     let target = instance_name.to_string();
+    let timeout = std::time::Duration::from_secs(RESOLVE_TIMEOUT_SECS);
+    let poll   = std::time::Duration::from_millis(BROWSE_POLL_MS);
 
-    let result = tokio::task::spawn_blocking(move || -> Result<(String, u16)> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    tokio::task::spawn_blocking(move || -> Result<(String, u16)> {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
-            if std::time::Instant::now() > deadline {
-                anyhow::bail!("mDNS: sender '{target}' not found within 15 s");
-            }
-            match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok(ServiceEvent::ServiceResolved(info)) => {
-                    // Exact match: fullname is "<instance>.<service>" so split at first dot
-                    let instance_part = info.get_fullname()
-                        .split('.')
-                        .next()
-                        .unwrap_or("");
-                    if instance_part == target {
-                        let ip = info
-                            .get_addresses()
-                            .iter()
-                            .next()
-                            .map(|a| a.to_string())
-                            .ok_or_else(|| anyhow::anyhow!("no address in mDNS record"))?;
-                        let _ = daemon.shutdown();
-                        return Ok((ip, info.get_port()));
-                    }
+            anyhow::ensure!(
+                std::time::Instant::now() <= deadline,
+                "mDNS: '{target}' not found within {RESOLVE_TIMEOUT_SECS} s"
+            );
+            if let Ok(ServiceEvent::ServiceResolved(info)) = receiver.recv_timeout(poll) {
+                // Exact instance match: fullname = "<instance>.<service>"
+                let instance_part = info.get_fullname().split('.').next().unwrap_or("");
+                if instance_part == target {
+                    let ip = best_addr(&info)
+                        .ok_or_else(|| anyhow::anyhow!("no usable address in mDNS record"))?;
+                    let _ = daemon.shutdown();
+                    return Ok((ip, info.get_port()));
                 }
-                _ => {}
             }
         }
     })
-    .await??;
-    Ok(result)
+    .await?
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Prefer IPv4 over IPv6 when multiple addresses are advertised.
+/// Returns the address as a string (e.g. "192.168.1.5").
+fn best_addr(info: &ResolvedService) -> Option<String> {
+    let addrs = info.get_addresses();
+    // ScopedIp wraps IpAddr; prefer IPv4 for maximum compatibility.
+    addrs.iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.iter().next())
+        .map(|a| a.to_string())
 }
 
 fn gethostname() -> String {

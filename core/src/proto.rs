@@ -11,12 +11,15 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const MAGIC: &[u8; 4] = b"RAR2"; // bumped to v2
+pub const MAGIC: &[u8; 4] = b"RAR2";
 pub const MDNS_SERVICE: &str = "_rustair._tcp.local.";
+/// AEAD frame size: 64 KiB plaintext per chunk.
 pub const CHUNK: usize = 64 * 1024;
+/// Maximum allowed filename length (prevents memory exhaustion on malformed headers).
+pub const MAX_NAME_LEN: usize = 512;
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     File      = 0x01,
     Archive   = 0x02,
@@ -35,26 +38,28 @@ impl TryFrom<u8> for Kind {
     }
 }
 
-/// Discovered peer on the LAN — exposed to Tauri frontend via IPC.
+/// Discovered peer on the LAN — serialised for Tauri IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub name:   String,
-    pub addr:   String, // "ip:port"
+    /// "ip:port"
+    pub addr:   String,
     pub status: DeviceStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceStatus {
     Idle,
     Busy,
 }
 
-/// Real-time transfer progress event pushed to the frontend.
+/// Real-time transfer progress pushed to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferEvent {
-    pub bytes_done:  u64,
-    pub total_bytes: u64,  // 0 = unknown (archive)
+    pub bytes_done:    u64,
+    /// 0 = unknown (streaming archive)
+    pub total_bytes:   u64,
     pub bytes_per_sec: u64,
-    pub done:        bool,
-    pub error:       Option<String>,
+    pub done:          bool,
+    pub error:         Option<String>,
 }

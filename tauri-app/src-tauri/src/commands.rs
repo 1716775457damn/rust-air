@@ -1,3 +1,9 @@
+//! Tauri IPC command handlers.
+//!
+//! All `#[tauri::command]` functions return `Result<T, String>` as required by
+//! Tauri's serialisation layer. Internal logic uses `anyhow::Result` and is
+//! converted at the boundary with `.map_err(|e| e.to_string())`.
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use rust_air_core::{
@@ -11,10 +17,10 @@ use std::{path::PathBuf, sync::Mutex};
 use tauri::{AppHandle, Emitter, State};
 use tokio::net::{TcpListener, TcpStream};
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── App state ─────────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    pub sender_handle: Mutex<Option<SenderHandle>>,
+    sender_handle: Mutex<Option<SenderHandle>>,
 }
 
 impl Default for AppState {
@@ -24,48 +30,57 @@ impl Default for AppState {
 }
 
 impl AppState {
-    /// Safely acquire the lock, replacing a poisoned mutex with a fresh one.
+    /// Take the current handle (unregisters mDNS on drop), poison-safe.
     pub fn take_handle(&self) -> Option<SenderHandle> {
         self.sender_handle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
     }
+
+    /// Store a new handle, poison-safe.
     pub fn set_handle(&self, h: SenderHandle) {
-        *self.sender_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(h);
+        *self.sender_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
+/// Start advertising a file/folder for sending.
+/// Returns the session info (instance name + key) for the frontend to display.
 #[tauri::command]
 pub async fn start_send(
     path: String,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<SendSession, String> {
+    inner_start_send(path, state, app).await.map_err(|e| e.to_string())
+}
+
+async fn inner_start_send(
+    path: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> anyhow::Result<SendSession> {
     let path = PathBuf::from(&path);
-    if !path.exists() {
-        return Err(format!("path not found: {}", path.display()));
-    }
-    let key = random_key();
-    let listener = TcpListener::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    anyhow::ensure!(path.exists(), "path not found: {}", path.display());
+
+    let key      = random_key();
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let port     = listener.local_addr()?.port();
     let instance = format!("rust-air-{}", &encode_key(&key)[..8]);
 
-    let handle = discovery::register_sender(port, &instance).map_err(|e| e.to_string())?;
+    let handle = discovery::register_sender(port, &instance)?;
     state.set_handle(handle);
 
-    let key_clone = key;
+    // Spawn background task: wait for one connection, then transfer.
     let app_clone = app.clone();
     tokio::spawn(async move {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 app_clone.emit("transfer-peer-connected", peer.to_string()).ok();
                 let app2 = app_clone.clone();
-                let result = transfer::send_path(stream, &path, &key_clone, move |ev| {
+                let result = transfer::send_path(stream, &path, &key, move |ev| {
                     app2.emit("transfer-progress", &ev).ok();
                 })
                 .await;
@@ -81,12 +96,13 @@ pub async fn start_send(
     Ok(SendSession { instance_name: instance, key_b64: encode_key(&key) })
 }
 
+/// Cancel the current send session and unregister mDNS.
 #[tauri::command]
 pub fn cancel_send(state: State<'_, AppState>) {
-    // Dropping the SenderHandle unregisters the mDNS service
-    state.take_handle();
+    state.take_handle(); // Drop unregisters the mDNS service.
 }
 
+/// Resolve a sender by instance name and receive a file/folder.
 #[tauri::command]
 pub async fn start_receive(
     instance_name: String,
@@ -94,12 +110,7 @@ pub async fn start_receive(
     out_dir: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    let key_bytes = URL_SAFE_NO_PAD.decode(&key_b64).map_err(|e| e.to_string())?;
-    if key_bytes.len() != 32 {
-        return Err("key must be 32 bytes".into());
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&key_bytes);
+    let key = decode_key(&key_b64).map_err(|e| e.to_string())?;
     let out = PathBuf::from(out_dir);
 
     tokio::spawn(async move {
@@ -124,6 +135,7 @@ pub async fn start_receive(
     Ok(())
 }
 
+/// Start continuous LAN device scanning; results arrive as "device-found" events.
 #[tauri::command]
 pub async fn scan_devices(app: AppHandle) -> Result<(), String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DeviceInfo>(32);
@@ -151,7 +163,7 @@ pub fn write_clipboard(text: String) -> Result<(), String> {
 #[derive(Serialize, Deserialize)]
 pub struct SendSession {
     pub instance_name: String,
-    pub key_b64: String,
+    pub key_b64:       String,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -164,4 +176,13 @@ fn random_key() -> [u8; 32] {
 
 fn encode_key(key: &[u8; 32]) -> String {
     URL_SAFE_NO_PAD.encode(key)
+}
+
+/// Decode a base64url key and validate its length.
+fn decode_key(b64: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = URL_SAFE_NO_PAD.decode(b64)?;
+    anyhow::ensure!(bytes.len() == 32, "key must be exactly 32 bytes, got {}", bytes.len());
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
 }
