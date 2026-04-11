@@ -27,3 +27,4 @@ image              = { version = "0.25", features = ["png"] }
 arboard            = "3"
 notify             = "6"
 hex                = "0.4"
+local-ip-address   = "0.6"

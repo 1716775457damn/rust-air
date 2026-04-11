@@ -54,6 +54,10 @@ const syncStatus  = ref<SyncStatus>({ last_sync: null, total_files: 0, total_byt
 const syncLog     = ref<string[]>([]);
 const syncExcludeInput = ref("");
 
+// Local IP addresses
+const localIps    = ref<string[]>([]);
+const ipCopied    = ref("");  // briefly shows "已复制" feedback
+
 // Unlisten handles
 const unlisten = ref<UnlistenFn[]>([]);
 
@@ -107,6 +111,9 @@ onMounted(async () => {
   syncStatus.value  = await invoke<SyncStatus>("get_sync_status");
   const defaultEx   = await invoke<string[]>("get_default_excludes");
   if (syncConfig.value.excludes.length === 0) syncConfig.value.excludes = defaultEx;
+
+  // Load local IPs
+  localIps.value = await invoke<string[]>("get_local_ips");
 
   unlisten.value.push(
     await listen<SyncEventPayload>("sync-event", (e) => {
@@ -236,6 +243,15 @@ function addExclude() {
 
 function removeExclude(i: number) { syncConfig.value.excludes.splice(i, 1); }
 
+async function copyIp(ip: string) {
+  // Extract just the IP part (after the two spaces)
+  const parts = ip.split("  ");
+  const addr  = parts[parts.length - 1].trim();
+  await navigator.clipboard.writeText(addr);
+  ipCopied.value = addr;
+  setTimeout(() => { ipCopied.value = ""; }, 1500);
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtBytes(n: number) {
@@ -253,6 +269,25 @@ function fmtBytes(n: number) {
     <header class="flex items-center gap-3 px-5 py-3 border-b border-gray-800">
       <span class="text-xl">✈️</span>
       <h1 class="text-base font-semibold tracking-tight">rust-air</h1>
+
+      <!-- Local IP badges — click to copy -->
+      <div class="flex items-center gap-1.5 ml-2">
+        <button
+          v-for="entry in localIps" :key="entry"
+          @click="copyIp(entry)"
+          :title="'点击复制: ' + entry.split('  ').pop()"
+          :class="['flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-mono transition-colors',
+            ipCopied && entry.includes(ipCopied)
+              ? 'bg-green-700 text-green-100'
+              : 'bg-gray-800 text-cyan-400 hover:bg-gray-700 hover:text-cyan-300']">
+          <span class="text-gray-500 text-xs">{{ entry.split('  ')[0] }}</span>
+          <span>{{ entry.split('  ').pop() }}</span>
+          <span v-if="ipCopied && entry.includes(ipCopied)" class="text-green-300">✓</span>
+        </button>
+        <button @click="invoke('get_local_ips').then((r: any) => localIps.value = r)"
+          class="text-gray-600 hover:text-gray-400 text-xs px-1" title="刷新 IP">↻</button>
+      </div>
+
       <div class="ml-auto flex gap-1">
         <button v-for="t in (['send','receive','devices','history','sync'] as Tab[])" :key="t"
           @click="tab = t"

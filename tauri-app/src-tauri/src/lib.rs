@@ -21,6 +21,7 @@ pub fn run() {
             commands::scan_devices,
             commands::read_clipboard,
             commands::write_clipboard,
+            commands::get_local_ips,
             // Clipboard history
             clip_history_commands::tick_history,
             clip_history_commands::get_history,
