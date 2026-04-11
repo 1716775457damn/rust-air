@@ -77,7 +77,7 @@ jobs:
       # Install deps manually so tauri-action finds the CLI
       - name: Install frontend dependencies
         working-directory: tauri-app
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Build frontend
         working-directory: tauri-app
