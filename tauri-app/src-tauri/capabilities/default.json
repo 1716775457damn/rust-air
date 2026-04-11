@@ -1,5 +1,5 @@
 {
-  "$schema": "../gen/schemas/desktop-schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "identifier": "default",
   "description": "Default capabilities for rust-air",
   "windows": ["main"],

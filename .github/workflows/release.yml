@@ -114,8 +114,6 @@ jobs:
             - mDNS-SD 局域网自动发现，无需手动输入 IP
           releaseDraft: false
           prerelease: false
-          # Tell tauri-action the frontend is already built
-          distPath: '../dist'
           args: ${{ matrix.tauri-args }}
 
   # ── CLI binaries ─────────────────────────────────────────────────────────────
