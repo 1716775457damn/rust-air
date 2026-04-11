@@ -14,7 +14,7 @@ interface ClipEntryView {
   time_str: string; pinned: boolean; char_count: number; image_b64?: string;
 }
 
-type Tab   = "send" | "receive" | "devices" | "history";
+type Tab   = "send" | "receive" | "devices" | "history" | "sync";
 type Phase = "idle" | "waiting" | "transferring" | "done" | "error";
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -44,6 +44,15 @@ const historyEntries = ref<ClipEntryView[]>([]);
 const historyQuery   = ref("");
 const historyPaused  = ref(false);
 let   tickTimer: ReturnType<typeof setInterval> | null = null;
+
+// Sync vault
+interface SyncConfig { src: string; dst: string; delete_removed: boolean; excludes: string[]; auto_watch: boolean }
+interface SyncStatus { last_sync: string | null; total_files: number; total_bytes: string; is_running: boolean; is_watching: boolean }
+interface SyncEventPayload { kind: string; rel?: string; bytes?: number; err?: string; scanned?: number; total?: number; total_files?: number; total_bytes?: number }
+const syncConfig  = ref<SyncConfig>({ src: "", dst: "", delete_removed: false, excludes: [], auto_watch: false });
+const syncStatus  = ref<SyncStatus>({ last_sync: null, total_files: 0, total_bytes: "0 B", is_running: false, is_watching: false });
+const syncLog     = ref<string[]>([]);
+const syncExcludeInput = ref("");
 
 // Unlisten handles
 const unlisten = ref<UnlistenFn[]>([]);
@@ -92,6 +101,30 @@ onMounted(async () => {
   // Start clipboard history polling
   await tickHistory();
   tickTimer = setInterval(tickHistory, 500);
+
+  // Load sync config and status
+  syncConfig.value  = await invoke<SyncConfig>("get_sync_config");
+  syncStatus.value  = await invoke<SyncStatus>("get_sync_status");
+  const defaultEx   = await invoke<string[]>("get_default_excludes");
+  if (syncConfig.value.excludes.length === 0) syncConfig.value.excludes = defaultEx;
+
+  unlisten.value.push(
+    await listen<SyncEventPayload>("sync-event", (e) => {
+      const ev = e.payload;
+      if (ev.kind === "Copied")   syncLog.value.unshift(`✅ ${ev.rel}  (${ev.bytes} B)`);
+      else if (ev.kind === "Deleted") syncLog.value.unshift(`🗑 ${ev.rel}`);
+      else if (ev.kind === "Error")   syncLog.value.unshift(`❌ ${ev.rel}: ${ev.err}`);
+      else if (ev.kind === "Progress") syncLog.value[0] = `⏳ 扫描中… ${ev.scanned} 个文件`;
+      else if (ev.kind === "Done") {
+        syncLog.value.unshift(`🎉 同步完成  共 ${ev.total_files} 个文件`);
+        invoke("sync_done").then(() => invoke<SyncStatus>("get_sync_status").then(s => syncStatus.value = s));
+      }
+      if (syncLog.value.length > 200) syncLog.value.length = 200;
+    }),
+    await listen("sync-done", async () => {
+      syncStatus.value = await invoke<SyncStatus>("get_sync_status");
+    }),
+  );
 });
 
 onUnmounted(async () => {
@@ -172,6 +205,37 @@ async function togglePause() {
   await invoke("set_history_paused", { paused: historyPaused.value });
 }
 
+// ── Sync vault actions ───────────────────────────────────────────────────────
+
+async function pickSyncSrc() { const r = await open({ multiple: false, directory: true }); if (r) syncConfig.value.src = r as string; }
+async function pickSyncDst() { const r = await open({ multiple: false, directory: true }); if (r) syncConfig.value.dst = r as string; }
+
+async function saveAndSync() {
+  await invoke("save_sync_config", { config: syncConfig.value });
+  syncLog.value = [];
+  syncStatus.value.is_running = true;
+  await invoke("start_sync").catch((e: any) => { syncLog.value.unshift(`❌ ${e}`); syncStatus.value.is_running = false; });
+}
+
+async function toggleWatch() {
+  if (syncStatus.value.is_watching) {
+    await invoke("stop_watch");
+    syncStatus.value.is_watching = false;
+  } else {
+    await invoke("save_sync_config", { config: syncConfig.value });
+    await invoke("start_watch").catch((e: any) => syncLog.value.unshift(`❌ ${e}`));
+    syncStatus.value.is_watching = true;
+  }
+}
+
+function addExclude() {
+  const v = syncExcludeInput.value.trim();
+  if (v && !syncConfig.value.excludes.includes(v)) syncConfig.value.excludes.push(v);
+  syncExcludeInput.value = "";
+}
+
+function removeExclude(i: number) { syncConfig.value.excludes.splice(i, 1); }
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtBytes(n: number) {
@@ -190,11 +254,11 @@ function fmtBytes(n: number) {
       <span class="text-xl">✈️</span>
       <h1 class="text-base font-semibold tracking-tight">rust-air</h1>
       <div class="ml-auto flex gap-1">
-        <button v-for="t in (['send','receive','devices','history'] as Tab[])" :key="t"
+        <button v-for="t in (['send','receive','devices','history','sync'] as Tab[])" :key="t"
           @click="tab = t"
           :class="['px-3 py-1 rounded-md text-xs transition-colors',
             tab === t ? 'bg-cyan-600 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800']">
-          {{ t === 'send' ? '📤 发送' : t === 'receive' ? '📥 接收' : t === 'devices' ? '🔍 设备' : '📋 剪贴板' }}
+          {{ t === 'send' ? '📤 发送' : t === 'receive' ? '📥 接收' : t === 'devices' ? '🔍 设备' : t === 'history' ? '📋 剪贴板' : '🔄 同步' }}
         </button>
       </div>
     </header>
@@ -364,6 +428,84 @@ function fmtBytes(n: number) {
             <!-- Empty state -->
             <div v-if="historyEntries.length === 0" class="text-center text-gray-600 py-16">
               {{ historyQuery ? '未找到匹配项' : '复制任意内容即可记录' }}
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- ── SYNC TAB ── -->
+      <template v-else-if="tab === 'sync'">
+        <div class="flex-1 flex flex-col gap-4 min-h-0 max-w-xl mx-auto w-full">
+
+          <!-- Status bar -->
+          <div class="flex items-center gap-3 bg-gray-900 rounded-xl px-4 py-2 text-xs flex-shrink-0">
+            <span :class="syncStatus.is_running ? 'text-yellow-400 animate-pulse' : 'text-green-400'">
+              {{ syncStatus.is_running ? '⏳ 同步中…' : '✅ 空闲' }}
+            </span>
+            <span class="text-gray-600">|上次: {{ syncStatus.last_sync ?? '从未同步' }}</span>
+            <span class="text-gray-600">|共 {{ syncStatus.total_files }} 个文件 / {{ syncStatus.total_bytes }}</span>
+            <span v-if="syncStatus.is_watching" class="ml-auto text-cyan-400">👁 监听中</span>
+          </div>
+
+          <!-- Config -->
+          <div class="space-y-3 flex-shrink-0">
+            <div class="flex gap-2 items-center">
+              <span class="text-xs text-gray-500 w-8">源</span>
+              <input v-model="syncConfig.src" placeholder="源目录路径"
+                class="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500 transition-colors" />
+              <button @click="pickSyncSrc" class="px-2 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs transition-colors">📂</button>
+            </div>
+            <div class="flex gap-2 items-center">
+              <span class="text-xs text-gray-500 w-8">目标</span>
+              <input v-model="syncConfig.dst" placeholder="目标目录路径"
+                class="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500 transition-colors" />
+              <button @click="pickSyncDst" class="px-2 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs transition-colors">📂</button>
+            </div>
+            <div class="flex items-center gap-3">
+              <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                <input type="checkbox" v-model="syncConfig.delete_removed" class="accent-cyan-500" />
+                删除已移除的文件
+              </label>
+            </div>
+            <!-- Excludes -->
+            <div class="space-y-1">
+              <p class="text-xs text-gray-500">排除规则</p>
+              <div class="flex gap-2">
+                <input v-model="syncExcludeInput" @keyup.enter="addExclude" placeholder="*.tmp 或 node_modules"
+                  class="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1 text-xs focus:outline-none focus:border-cyan-500 transition-colors" />
+                <button @click="addExclude" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded text-xs transition-colors">+</button>
+              </div>
+              <div class="flex flex-wrap gap-1 mt-1">
+                <span v-for="(ex, i) in syncConfig.excludes" :key="i"
+                  class="flex items-center gap-1 bg-gray-800 text-gray-400 text-xs px-2 py-0.5 rounded-full">
+                  {{ ex }}
+                  <button @click="removeExclude(i)" class="text-gray-600 hover:text-red-400">×</button>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Action buttons -->
+          <div class="flex gap-2 flex-shrink-0">
+            <button @click="saveAndSync"
+              :disabled="syncStatus.is_running"
+              :class="['flex-1 py-2 rounded-lg text-sm font-medium transition-colors',
+                syncStatus.is_running ? 'bg-gray-800 text-gray-600 cursor-not-allowed' : 'bg-cyan-600 hover:bg-cyan-500 text-white']">
+              {{ syncStatus.is_running ? '同步中…' : '🔄 立即同步' }}
+            </button>
+            <button @click="toggleWatch"
+              :class="['px-4 py-2 rounded-lg text-sm transition-colors',
+                syncStatus.is_watching ? 'bg-yellow-700 hover:bg-yellow-600 text-white' : 'bg-gray-800 hover:bg-gray-700 text-gray-300']">
+              {{ syncStatus.is_watching ? '⏹ 停止监听' : '👁 实时监听' }}
+            </button>
+          </div>
+
+          <!-- Log -->
+          <div class="flex-1 overflow-y-auto bg-gray-900 rounded-xl p-3 font-mono text-xs space-y-0.5 min-h-0">
+            <div v-if="syncLog.length === 0" class="text-gray-600 text-center py-4">日志将在此显示</div>
+            <div v-for="(line, i) in syncLog" :key="i"
+              :class="['leading-5', line.startsWith('❌') ? 'text-red-400' : line.startsWith('🗑') ? 'text-yellow-500' : 'text-gray-400']">
+              {{ line }}
             </div>
           </div>
         </div>

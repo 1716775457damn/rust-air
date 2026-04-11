@@ -25,3 +25,5 @@ rand               = "0.8"
 rust-air-core      = { path = "../../core" }
 image              = { version = "0.25", features = ["png"] }
 arboard            = "3"
+notify             = "6"
+hex                = "0.4"

@@ -89,15 +89,20 @@ pub fn tick_history(
     state: State<'_, HistoryState>,
 ) -> Vec<ClipEntryView> {
     let paused = *state.paused.lock().unwrap_or_else(|e| e.into_inner());
+    // Drain channel and push into store — acquire locks separately to avoid deadlock
     {
-        let rx    = state.rx.lock().unwrap_or_else(|e| e.into_inner());
-        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-        while let Ok(content) = rx.try_recv() {
-            if !paused {
-                store.push(content);
+        let rx = state.rx.lock().unwrap_or_else(|e| e.into_inner());
+        let pending: Vec<ClipContent> = rx.try_iter().collect();
+        drop(rx); // release rx lock before acquiring store lock
+        if !pending.is_empty() {
+            let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+            for content in pending {
+                if !paused { store.push(content); }
             }
+            store.flush_if_needed();
+        } else {
+            state.store.lock().unwrap_or_else(|e| e.into_inner()).flush_if_needed();
         }
-        store.flush_if_needed();
     }
     get_entries_filtered(&state, &query)
 }

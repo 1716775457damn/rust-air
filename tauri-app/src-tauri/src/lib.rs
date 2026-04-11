@@ -1,5 +1,6 @@
 mod commands;
 mod clip_history_commands;
+mod sync_commands;
 
 use tauri_plugin_dialog;
 use tauri_plugin_opener;
@@ -11,6 +12,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::default())
         .manage(clip_history_commands::HistoryState::new())
+        .manage(sync_commands::SyncState::new())
         .invoke_handler(tauri::generate_handler![
             // File transfer
             commands::start_send,
@@ -29,12 +31,16 @@ pub fn run() {
             clip_history_commands::set_history_paused,
             clip_history_commands::get_history_paused,
             clip_history_commands::flush_history,
+            // Sync vault
+            sync_commands::get_sync_config,
+            sync_commands::save_sync_config,
+            sync_commands::get_sync_status,
+            sync_commands::get_default_excludes,
+            sync_commands::start_sync,
+            sync_commands::sync_done,
+            sync_commands::start_watch,
+            sync_commands::stop_watch,
         ])
-        .on_window_event(|_window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                // flush_history is called by the frontend before close
-            }
-        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
