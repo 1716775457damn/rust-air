@@ -2,6 +2,11 @@
 target/
 Cargo.lock
 
+# Android signing — NEVER commit these
+*.keystore
+*.jks
+keystore_b64.txt
+
 # Old single-file src/ (superseded by core/ and cli/)
 src/
 
