@@ -28,3 +28,10 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# temp logs
+*.log.txt
+clip_log*.txt
+dev_log.txt
+log.txt
+core/examples/
