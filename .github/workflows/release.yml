@@ -37,10 +37,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: tauri-app/pnpm-lock.yaml
 
       - name: Setup Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -68,14 +75,13 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev
 
-      # Install deps manually so tauri-action finds the CLI
       - name: Install frontend dependencies
         working-directory: tauri-app
-        run: npm ci --cache .npm-cache
+        run: pnpm install
 
       - name: Build frontend
         working-directory: tauri-app
-        run: npm run build
+        run: pnpm run build
 
       - name: Build and publish Tauri app
         uses: tauri-apps/tauri-action@v0
