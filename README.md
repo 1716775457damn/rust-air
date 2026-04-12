@@ -49,8 +49,7 @@ Receiving [███████████████████████
 
 | 平台 | 文件 | 说明 |
 |------|------|------|
-| Windows | `rust-air_x64-setup.exe` | 推荐，带安装向导 |
-| Windows | `rust-air_x64_en-US.msi` | MSI 安装包 |
+| Windows | `rust-air_x64_en-US.msi` | 推荐，带安装向导 |
 | Windows CLI | `rust-air-cli-x86_64-pc-windows-msvc.exe` | 免安装命令行版 |
 | macOS (M 系列) | `rust-air_aarch64.dmg` | Apple Silicon |
 | macOS (Intel) | `rust-air_x64.dmg` | x86_64 |
@@ -94,11 +93,15 @@ rust-air send-clip
 
 ### GUI 模式
 
-直接打开安装好的 **rust-air** 桌面应用：
+直接打开安装好的 **rust-air** 桌面应用，界面顶部始终显示本机局域网 IP，方便其他设备连接：
 
-1. **发送**：拖拽文件/文件夹到发送区，或点击选择，界面显示分享码
-2. **接收**：切换到接收标签，粘贴分享码，选择保存目录
-3. **设备**：点击扫描，局域网内的发送方会自动出现在列表中
+| 标签 | 功能 |
+|------|------|
+| 📤 发送 | 拖拽文件/文件夹，或点击选择，显示分享码等待接收方 |
+| 📥 接收 | 粘贴发送方的分享码，选择保存目录 |
+| 🔍 设备 | 扫描局域网内所有在线的 rust-air 发送方 |
+| 📂 搜索 | 按文件名或文件内容搜索本机文件，支持正则 |
+| 🔄 同步 | 增量同步两个目录，支持实时监听 |
 
 ---
 
@@ -115,9 +118,21 @@ rust-air send-clip
 - **断点续传**：网络中断后重新运行命令，自动从断点字节处继续，无需重传已完成部分
 - **64KB AEAD 分块**：加密与传输并行，最大化吞吐量
 
-### 🔍 自动发现
+### 🔍 文件搜索
+- **文件名搜索**：在指定目录下按文件名正则匹配，实时流式返回结果
+- **文本内容搜索**：搜索文件内容，支持 UTF-8 / GBK 双编码，自动跳过二进制文件
+- **结果过滤**：搜索完成后可在结果中二次过滤
+- **最大 2000 条**：自动截断防止界面卡顿
+
+### 🔄 文件同步
+- **增量同步**：基于 SHA-256 哈希，只复制变更文件
+- **原子写入**：先写 `.svtmp` 临时文件再重命名，防止写入中断导致文件损坏
+- **实时监听**：`notify` 文件系统事件 + 300ms 防抖，自动同步变更
+- **排除规则**：支持精确名称和 `*.ext` 通配符
+
+### 🌐 自动发现
 - **mDNS-SD**：基于标准 DNS-SD 协议，局域网内设备自动广播与发现，无需手动输入 IP 地址
-- **设备状态**：实时显示局域网内发送方的在线/忙碌状态
+- **本机 IP 显示**：GUI 顶部始终显示主要局域网 IP，点击一键复制
 
 ### 📱 跨设备
 - **手机扫码下载**：`--qr` 参数在终端打印 ASCII 二维码，手机扫码直接在浏览器下载
@@ -138,21 +153,23 @@ rust-air/
 │       ├── transfer.rs      # 发送/接收引擎，SHA-256 校验，断点续传
 │       ├── discovery.rs     # mDNS-SD 设备广播与发现
 │       ├── http_qr.rs       # axum HTTP server + 终端二维码
-│       └── clipboard.rs     # arboard 跨平台剪贴板读写
+│       ├── clipboard.rs     # arboard 跨平台剪贴板读写
+│       └── sync_vault.rs    # 增量文件同步引擎
 │
 ├── cli/                     # rust-air CLI 二进制
 │   └── src/main.rs          # send / receive / scan / send-clip
 │
 ├── tauri-app/               # Tauri v2 桌面 GUI
 │   ├── src/                 # Vue 3 + Tailwind CSS 前端
-│   │   └── App.vue          # 拖拽发送、环形进度条、设备列表
+│   │   └── App.vue          # 发送、接收、设备、文件搜索、同步
 │   └── src-tauri/           # Tauri Rust 后端
 │       └── src/
-│           ├── commands.rs  # 6 个 #[tauri::command] IPC 接口
-│           └── lib.rs       # Tauri Builder 初始化
+│           ├── commands.rs       # 文件传输 IPC 命令
+│           ├── search_commands.rs # 文件搜索命令（移植自 rust-seek）
+│           └── sync_commands.rs  # 文件同步命令
 │
 └── .github/workflows/
-    └── release.yml          # CI/CD：三平台矩阵构建 + 自动发布
+    └── release.yml          # CI/CD：四平台矩阵构建 + 自动发布
 ```
 
 ### 传输协议
@@ -175,7 +192,7 @@ TCP 连接建立后：
 
 - 算法：ChaCha20-Poly1305（AEAD）
 - 密钥：每次传输随机生成 32 字节，base64url 编码后内嵌在分享码中
-- Nonce：8 字节帧计数器 + 4 字节零填充，单调递增，永不重用
+- Nonce：8 字节帧计数器（小端序）+ 4 字节零填充，单调递增，永不重用
 - 分块：每 64KB 独立加密，支持流式处理
 
 ---
@@ -185,8 +202,15 @@ TCP 连接建立后：
 ### 环境要求
 
 - Rust 1.75+（`rustup update stable`）
-- Node.js 20+（GUI 构建需要）
-- Linux 额外依赖：`libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libavahi-compat-libdnssd-dev`
+- Node.js 22+ 和 pnpm 9+（GUI 构建需要）
+- Linux 额外依赖：
+
+```bash
+sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+  librsvg2-dev libavahi-compat-libdnssd-dev \
+  libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+```
 
 ### 构建 CLI
 
@@ -206,13 +230,15 @@ cargo build -p rust-air-cli --release
 
 ```bash
 cd tauri-app
-npm install
+pnpm install
 
 # 开发模式（热重载）
-npm run tauri dev
+pnpm run dev          # 启动前端
+pnpm tauri dev        # 启动完整应用
 
 # 生产构建（生成安装包）
-npm run tauri build
+pnpm run build
+pnpm tauri build
 ```
 
 ### 运行测试
@@ -232,14 +258,14 @@ echo "hello world" > test.txt
 
 ## 🤖 CI/CD 自动发布
 
-推送 `v*` 格式的 tag 即可触发三平台并行构建：
+推送 `v*` 格式的 tag 即可触发四平台并行构建：
 
 ```bash
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-GitHub Actions 会自动启动 4 台虚拟机（Windows / macOS ARM / macOS Intel / Linux），约 15 分钟后在 [Releases](https://github.com/1716775457damn/rust-air/releases) 页面生成所有平台的安装包。
+GitHub Actions 会自动启动 4 台虚拟机（Windows / macOS ARM / macOS Intel / Linux），约 10 分钟后在 [Releases](https://github.com/1716775457damn/rust-air/releases) 页面生成所有平台的安装包和 CLI 二进制。
 
 ---
 
@@ -254,8 +280,11 @@ GitHub Actions 会自动启动 4 台虚拟机（Windows / macOS ARM / macOS Inte
 | 进度条 | indicatif |
 | 剪贴板 | arboard |
 | HTTP / QR | axum + qrcode |
+| 文件搜索 | regex + ignore + memmap2 + encoding_rs |
+| 文件同步 | notify + walkdir + sha2 |
 | 桌面 GUI | Tauri v2 |
-| 前端 | Vue 3 + Tailwind CSS |
+| 前端 | Vue 3 + Tailwind CSS v4 |
+| 包管理 | pnpm |
 | CLI 解析 | clap |
 
 ---
