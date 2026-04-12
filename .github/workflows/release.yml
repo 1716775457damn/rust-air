@@ -95,6 +95,7 @@ jobs:
           APPLE_TEAM_ID:              ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: tauri-app
+          tauriScript: pnpm tauri
           tagName: ${{ github.ref_name }}
           releaseName: 'rust-air ${{ github.ref_name }}'
           releaseBody: |
