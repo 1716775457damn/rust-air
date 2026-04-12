@@ -6,10 +6,6 @@ on:
       - 'v*'
   workflow_dispatch:
 
-env:
-  # Opt into Node.js 24 now to silence deprecation warnings
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   # ── Tauri desktop builds ─────────────────────────────────────────────────────
   build-tauri:
@@ -44,7 +40,7 @@ jobs:
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: tauri-app/package-lock.json
 
@@ -77,7 +73,7 @@ jobs:
       # Install deps manually so tauri-action finds the CLI
       - name: Install frontend dependencies
         working-directory: tauri-app
-        run: npm install --no-audit --no-fund
+        run: npm ci
 
       - name: Build frontend
         working-directory: tauri-app
