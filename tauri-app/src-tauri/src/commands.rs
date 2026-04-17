@@ -1,134 +1,140 @@
-//! Tauri IPC command handlers.
-//!
-//! All `#[tauri::command]` functions return `Result<T, String>` as required by
-//! Tauri's serialisation layer. Internal logic uses `anyhow::Result` and is
-//! converted at the boundary with `.map_err(|e| e.to_string())`.
+//! Tauri IPC command handlers — v3 (scan-and-click, no pre-shared key).
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::RngCore;
 use rust_air_core::{
     clipboard,
-    discovery::{self, SenderHandle},
+    discovery::{self, ServiceHandle},
     proto::DeviceInfo,
     transfer,
 };
-use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Mutex};
 use tauri::{AppHandle, Emitter, State};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{net::{TcpListener, TcpStream}, sync::oneshot};
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    sender_handle: Mutex<Option<SenderHandle>>,
+    /// mDNS self-registration handle (kept alive for the app lifetime).
+    svc_handle:  Mutex<Option<ServiceHandle>>,
+    /// Cancel token for the current outgoing send task.
+    send_cancel: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        Self { sender_handle: Mutex::new(None) }
+        Self {
+            svc_handle:  Mutex::new(None),
+            send_cancel: Mutex::new(None),
+        }
     }
 }
 
 impl AppState {
-    /// Take the current handle (unregisters mDNS on drop), poison-safe.
-    pub fn take_handle(&self) -> Option<SenderHandle> {
-        self.sender_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+    pub fn set_svc(&self, h: ServiceHandle) {
+        *self.svc_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
-
-    /// Store a new handle, poison-safe.
-    pub fn set_handle(&self, h: SenderHandle) {
-        *self.sender_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    fn set_send_cancel(&self, tx: oneshot::Sender<()>) {
+        *self.send_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+    fn abort_send(&self) {
+        if let Some(tx) = self.send_cancel.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = tx.send(());
+        }
     }
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────────
+// ── Startup ───────────────────────────────────────────────────────────────────
 
-/// Start advertising a file/folder for sending.
+/// Called once on app start: bind a listener, register on mDNS, start accepting.
+/// Incoming transfers are handled automatically; progress emitted as recv-* events.
 #[tauri::command]
-pub async fn start_send(
-    path: String,
+pub async fn start_listener(
     state: State<'_, AppState>,
     app: AppHandle,
-) -> Result<SendSession, String> {
+) -> Result<u16, String> {
+    let listener = TcpListener::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?;
+    let port     = listener.local_addr().map_err(|e| e.to_string())?.port();
+
+    let device_name = device_name();
+    let handle = discovery::register_self(port, &device_name).map_err(|e| e.to_string())?;
+    state.set_svc(handle);
+
+    // Accept loop — runs for the lifetime of the app.
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    let app2 = app.clone();
+                    tokio::spawn(async move {
+                        app2.emit("recv-peer-connected", peer.to_string()).ok();
+                        let out = default_download_dir();
+                        let app3 = app2.clone();
+                        match transfer::receive_to_disk(stream, &out, move |ev| {
+                            app3.emit("recv-progress", &ev).ok();
+                        }).await {
+                            Ok(p)  => { app2.emit("recv-done", p.to_string_lossy().to_string()).ok(); }
+                            Err(e) => { app2.emit("recv-error", e.to_string()).ok(); }
+                        }
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(port)
+}
+
+// ── Send ──────────────────────────────────────────────────────────────────────
+
+/// Send a file/folder to a peer by its "ip:port" address string.
+#[tauri::command]
+pub async fn send_to(
+    path: String,
+    addr: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    state.abort_send();
+
     let path = PathBuf::from(&path);
     if !path.exists() {
         return Err(format!("path not found: {}", path.display()));
     }
 
-    let key      = random_key();
-    let listener = TcpListener::bind("0.0.0.0:0").await
-        .map_err(|e| e.to_string())?;
-    let port     = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let instance = format!("rust-air-{}", &encode_key(&key)[..8]);
-
-    let handle = discovery::register_sender(port, &instance)
-        .map_err(|e| e.to_string())?;
-    state.set_handle(handle);
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    state.set_send_cancel(cancel_tx);
 
     let app_clone = app.clone();
     tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                app_clone.emit("transfer-peer-connected", peer.to_string()).ok();
-                let app2   = app_clone.clone();
-                let result = transfer::send_path(stream, &path, &key, move |ev| {
-                    app2.emit("transfer-progress", &ev).ok();
-                }).await;
+        tokio::select! {
+            _ = cancel_rx => {}
+            result = do_send(path, addr, app_clone.clone()) => {
                 match result {
-                    Ok(_)  => { app_clone.emit("transfer-done", "").ok(); }
-                    Err(e) => { app_clone.emit("transfer-error", e.to_string()).ok(); }
+                    Ok(_)  => { app_clone.emit("send-done", "").ok(); }
+                    Err(e) => { app_clone.emit("send-error", e.to_string()).ok(); }
                 }
             }
-            Err(e) => { app_clone.emit("transfer-error", e.to_string()).ok(); }
-        }
-    });
-
-    Ok(SendSession { instance_name: instance, key_b64: encode_key(&key) })
-}
-
-/// Cancel the current send session and unregister mDNS.
-#[tauri::command]
-pub fn cancel_send(state: State<'_, AppState>) {
-    state.take_handle(); // Drop unregisters the mDNS service.
-}
-
-/// Resolve a sender by instance name and receive a file/folder.
-#[tauri::command]
-pub async fn start_receive(
-    instance_name: String,
-    key_b64: String,
-    out_dir: String,
-    app: AppHandle,
-) -> Result<(), String> {
-    let key = decode_key(&key_b64).map_err(|e| e.to_string())?;
-    let out = PathBuf::from(out_dir);
-
-    tokio::spawn(async move {
-        let result: anyhow::Result<()> = async {
-            let (ip, port) = discovery::resolve_sender(&instance_name).await?;
-            app.emit("transfer-peer-connected", format!("{ip}:{port}")).ok();
-            let stream = TcpStream::connect((ip.as_str(), port)).await?;
-            tokio::fs::create_dir_all(&out).await?;
-            let app2 = app.clone();
-            let saved = transfer::receive_to_disk(stream, &key, &out, move |ev| {
-                app2.emit("transfer-progress", &ev).ok();
-            })
-            .await?;
-            app.emit("transfer-done", saved.to_string_lossy().to_string()).ok();
-            Ok(())
-        }
-        .await;
-        if let Err(e) = result {
-            app.emit("transfer-error", e.to_string()).ok();
         }
     });
     Ok(())
 }
 
-/// Start continuous LAN device scanning; results arrive as "device-found" events.
+async fn do_send(path: PathBuf, addr: String, app: AppHandle) -> anyhow::Result<()> {
+    let stream = TcpStream::connect(&addr).await?;
+    app.emit("send-peer-connected", &addr).ok();
+    let app2 = app.clone();
+    transfer::send_path(stream, &path, move |ev| {
+        app2.emit("send-progress", &ev).ok();
+    }).await
+}
+
+#[tauri::command]
+pub fn cancel_send(state: State<'_, AppState>) {
+    state.abort_send();
+}
+
+// ── Scan ──────────────────────────────────────────────────────────────────────
+
 #[tauri::command]
 pub async fn scan_devices(app: AppHandle) -> Result<(), String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DeviceInfo>(32);
@@ -141,6 +147,8 @@ pub async fn scan_devices(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ── Clipboard ─────────────────────────────────────────────────────────────────
+
 #[tauri::command]
 pub fn read_clipboard() -> Result<String, String> {
     clipboard::read().map_err(|e| e.to_string())
@@ -151,7 +159,8 @@ pub fn write_clipboard(text: String) -> Result<(), String> {
     clipboard::write(&text).map_err(|e| e.to_string())
 }
 
-/// Return the single primary LAN IPv4 address.
+// ── IP ────────────────────────────────────────────────────────────────────────
+
 #[tauri::command]
 pub fn get_local_ips() -> Vec<String> {
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -166,29 +175,16 @@ pub fn get_local_ips() -> Vec<String> {
 
 // ── Response types ────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
-pub struct SendSession {
-    pub instance_name: String,
-    pub key_b64:       String,
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn random_key() -> [u8; 32] {
-    let mut k = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut k);
-    k
+fn device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "rust-air".to_string())
 }
 
-fn encode_key(key: &[u8; 32]) -> String {
-    URL_SAFE_NO_PAD.encode(key)
-}
-
-/// Decode a base64url key and validate its length.
-fn decode_key(b64: &str) -> anyhow::Result<[u8; 32]> {
-    let bytes = URL_SAFE_NO_PAD.decode(b64)?;
-    anyhow::ensure!(bytes.len() == 32, "key must be exactly 32 bytes, got {}", bytes.len());
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
+fn default_download_dir() -> PathBuf {
+    dirs::download_dir()
+        .or_else(|| dirs::home_dir())
+        .unwrap_or_else(|| PathBuf::from("."))
 }

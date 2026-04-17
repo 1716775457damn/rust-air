@@ -1,21 +1,19 @@
-/// Wire protocol v2.
+/// Wire protocol v3 — key-in-header, no pre-shared secret needed.
 ///
-/// Frame layout after TCP connect:
-///   TX: [4B MAGIC][1B kind][2B name_len][name bytes][8B total_size][32B sha256]
-///   RX: [8B already_have]
-///   TX: AEAD-encrypted data chunks (see crypto.rs)
-///       each chunk: [4B plaintext_len][16B tag][ciphertext]
-///       sentinel:   [4B = 0x00000000]
+/// After TCP connect the SENDER writes:
+///   [4B MAGIC "RAR3"][32B one-time key][1B kind]
+///   [2B name_len][name bytes][8B total_size][32B sha256]
 ///
-/// Code format: "<port>-<base64url(32-byte key)>"
+/// RECEIVER replies:
+///   [8B already_have]   (0 = fresh)
+///
+/// Then AEAD-encrypted data chunks follow (see crypto.rs).
 
 use serde::{Deserialize, Serialize};
 
-pub const MAGIC: &[u8; 4] = b"RAR2";
+pub const MAGIC: &[u8; 4] = b"RAR3";
 pub const MDNS_SERVICE: &str = "_rustair._tcp.local.";
-/// AEAD frame size: 64 KiB plaintext per chunk.
 pub const CHUNK: usize = 64 * 1024;
-/// Maximum allowed filename length (prevents memory exhaustion on malformed headers).
 pub const MAX_NAME_LEN: usize = 512;
 
 #[repr(u8)]
@@ -38,7 +36,6 @@ impl TryFrom<u8> for Kind {
     }
 }
 
-/// Discovered peer on the LAN — serialised for Tauri IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub name:   String,
@@ -53,11 +50,9 @@ pub enum DeviceStatus {
     Busy,
 }
 
-/// Real-time transfer progress pushed to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferEvent {
     pub bytes_done:    u64,
-    /// 0 = unknown (streaming archive)
     pub total_bytes:   u64,
     pub bytes_per_sec: u64,
     pub done:          bool,

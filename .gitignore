@@ -1,6 +1,5 @@
 # Rust
 target/
-Cargo.lock
 
 # Android signing — NEVER commit these
 *.keystore
@@ -35,3 +34,15 @@ clip_log*.txt
 dev_log.txt
 log.txt
 core/examples/
+
+# test artifacts
+test_file.txt
+test_transfer.txt
+recv_out/
+recv_log.txt
+job_log.txt
+jobs.json
+runs.json
+
+# gstack (global install)
+.amazonq/rules/gstack.md

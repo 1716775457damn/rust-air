@@ -23,6 +23,7 @@ anyhow             = "1"
 base64             = "0.22"
 rand               = "0.8"
 rust-air-core      = { path = "../../core" }
+dirs               = "5"
 local-ip-address   = "0.6"
 regex              = "1"
 ignore             = "0.4"

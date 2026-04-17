@@ -7,8 +7,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface Device { name: string; addr: string; status: "Idle" | "Busy" }
-interface TransferEvent { bytes_done: number; total_bytes: number; bytes_per_sec: number; done: boolean; error?: string }
-interface SendSession { instance_name: string; key_b64: string }
+interface TransferEvent { bytes_done: number; total_bytes: number; bytes_per_sec: number; done: boolean }
 interface MatchLine { line_num: number; line: string; ranges: [number,number][] }
 interface FileResult { path: string; icon: string; matches: MatchLine[] }
 interface SearchEvent { kind: string; path?: string; icon?: string; matches?: MatchLine[]; ms?: number; total?: number; msg?: string }
@@ -17,22 +16,32 @@ interface SyncStatus { last_sync: string | null; total_files: number; total_byte
 interface SyncEventPayload { kind: string; rel?: string; bytes?: number; err?: string; scanned?: number; total?: number; total_files?: number; total_bytes?: number }
 
 type Tab   = "send" | "receive" | "devices" | "search" | "sync";
-type Phase = "idle" | "waiting" | "transferring" | "done" | "error";
+type Phase = "idle" | "transferring" | "done" | "error";
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-const tab      = ref<Tab>("send");
-const phase    = ref<Phase>("idle");
-const errorMsg = ref("");
+const tab = ref<Tab>("send");
 
-const dragOver     = ref(false);
+// Send
+const sendPhase    = ref<Phase>("idle");
+const sendError    = ref("");
+const sendProgress = ref<TransferEvent>({ bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false });
+const sendPeer     = ref("");
 const selectedPath = ref("");
-const session      = ref<SendSession | null>(null);
-const receiveInput = ref("");
-const outDir       = ref(".");
-const progress     = ref<TransferEvent>({ bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false });
-const connectedPeer = ref("");
-const devices      = ref<Device[]>([]);
+const dragOver     = ref(false);
+
+// Receive (auto, no user input needed)
+const recvPhase    = ref<Phase>("idle");
+const recvError    = ref("");
+const recvProgress = ref<TransferEvent>({ bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false });
+const recvPeer     = ref("");
+const savedPath    = ref("");
+const recvHistory  = ref<{peer: string; path: string; bytes: number}[]>([]);
+
+// Devices
+const devices     = ref<Device[]>([]);
+const scanning    = ref(false);
+const myPort      = ref(0);
 
 // Search
 const searchPattern    = ref("");
@@ -60,19 +69,26 @@ const unlisten = ref<UnlistenFn[]>([]);
 
 // ── Computed ──────────────────────────────────────────────────────────────────
 
-const pct = computed(() => {
-  if (!progress.value.total_bytes) return null;
-  return Math.min(100, Math.round((progress.value.bytes_done / progress.value.total_bytes) * 100));
-});
-const speed = computed(() => {
-  const bps = progress.value.bytes_per_sec;
-  if (bps > 1_000_000) return `${(bps / 1_000_000).toFixed(1)} MB/s`;
-  if (bps > 1_000)     return `${(bps / 1_000).toFixed(0)} KB/s`;
+function makePct(p: TransferEvent) {
+  if (!p.total_bytes) return null;
+  return Math.min(100, Math.round((p.bytes_done / p.total_bytes) * 100));
+}
+function makeSpeed(p: TransferEvent) {
+  const bps = p.bytes_per_sec;
+  if (bps > 1_000_000) return `${(bps/1_000_000).toFixed(1)} MB/s`;
+  if (bps > 1_000)     return `${(bps/1_000).toFixed(0)} KB/s`;
   return `${bps} B/s`;
-});
-const shareCode = computed(() =>
-  session.value ? `${session.value.instance_name}:${session.value.key_b64}` : ""
+}
+const sendPct   = computed(() => makePct(sendProgress.value));
+const sendSpeed = computed(() => makeSpeed(sendProgress.value));
+const recvPct   = computed(() => makePct(recvProgress.value));
+const recvSpeed = computed(() => makeSpeed(recvProgress.value));
+
+// Devices excluding self
+const peersOnly = computed(() =>
+  devices.value.filter(d => d.addr && !d.addr.startsWith(primaryIp.value + ":"))
 );
+
 const filteredResults = computed(() => {
   const q = searchFilter.value.trim().toLowerCase();
   return q ? searchResults.value.filter(r => r.path.toLowerCase().includes(q)) : searchResults.value;
@@ -81,32 +97,36 @@ const filteredResults = computed(() => {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 onMounted(async () => {
+  // Start listener + mDNS registration
+  myPort.value = await invoke<number>("start_listener");
+
+  localIps.value = await invoke<string[]>("get_local_ips");
+
   unlisten.value.push(
-    await listen<SearchEvent>("search-result", (e) => {
-      const ev = e.payload;
-      if (ev.kind === "Result") {
-        searchResults.value.push({ path: ev.path!, icon: ev.icon!, matches: ev.matches! });
-        searchStatus.value = `搜索中… 已找到 ${searchResults.value.length} 个`;
-      } else if (ev.kind === "Done") {
-        searchRunning.value = false;
-        searchStatus.value = searchResults.value.length === 0
-          ? `未找到结果 (${ev.ms}ms)`
-          : `找到 ${ev.total} 个文件 (${ev.ms}ms)`;
-      } else if (ev.kind === "Error") {
-        searchRunning.value = false;
-        searchStatus.value = `错误: ${ev.msg}`;
-      }
+    // Send events
+    await listen<TransferEvent>("send-progress", (e) => {
+      sendProgress.value = e.payload;
+      sendPhase.value = "transferring";
     }),
-    await listen<TransferEvent>("transfer-progress", (e) => {
-      progress.value = e.payload;
-      if (phase.value === "waiting") phase.value = "transferring";
+    await listen<string>("send-peer-connected", (e) => { sendPeer.value = e.payload; }),
+    await listen("send-done", () => { sendPhase.value = "done"; }),
+    await listen<string>("send-error", (e) => { sendError.value = e.payload; sendPhase.value = "error"; }),
+
+    // Receive events (auto)
+    await listen<string>("recv-peer-connected", (e) => {
+      recvPeer.value = e.payload;
+      recvPhase.value = "transferring";
+      tab.value = "receive";
     }),
-    await listen<string>("transfer-peer-connected", (e) => {
-      connectedPeer.value = e.payload;
-      phase.value = "transferring";
+    await listen<TransferEvent>("recv-progress", (e) => { recvProgress.value = e.payload; }),
+    await listen<string>("recv-done", (e) => {
+      savedPath.value = e.payload ?? "";
+      recvHistory.value.unshift({ peer: recvPeer.value, path: savedPath.value, bytes: recvProgress.value.bytes_done });
+      recvPhase.value = "done";
     }),
-    await listen("transfer-done", () => { phase.value = "done"; }),
-    await listen<string>("transfer-error", (e) => { errorMsg.value = e.payload; phase.value = "error"; }),
+    await listen<string>("recv-error", (e) => { recvError.value = e.payload; recvPhase.value = "error"; }),
+
+    // Device discovery
     await listen<Device>("device-found", (e) => {
       const dev = e.payload;
       const idx = devices.value.findIndex(d => d.name === dev.name);
@@ -114,6 +134,8 @@ onMounted(async () => {
       else if (idx >= 0) { devices.value[idx] = dev; }
       else { devices.value.push(dev); }
     }),
+
+    // Sync events
     await listen<SyncEventPayload>("sync-event", (e) => {
       const ev = e.payload;
       if (ev.kind === "Copied")        syncLog.value.unshift(`✅ ${ev.rel}  (${ev.bytes} B)`);
@@ -129,13 +151,31 @@ onMounted(async () => {
     await listen("sync-done", async () => {
       syncStatus.value = await invoke<SyncStatus>("get_sync_status");
     }),
+
+    // Search events
+    await listen<SearchEvent>("search-result", (e) => {
+      const ev = e.payload;
+      if (ev.kind === "Result") {
+        searchResults.value.push({ path: ev.path!, icon: ev.icon!, matches: ev.matches! });
+        searchStatus.value = `搜索中… 已找到 ${searchResults.value.length} 个`;
+      } else if (ev.kind === "Done") {
+        searchRunning.value = false;
+        searchStatus.value = searchResults.value.length === 0
+          ? `未找到结果 (${ev.ms}ms)` : `找到 ${ev.total} 个文件 (${ev.ms}ms)`;
+      } else if (ev.kind === "Error") {
+        searchRunning.value = false;
+        searchStatus.value = `错误: ${ev.msg}`;
+      }
+    }),
   );
 
   syncConfig.value = await invoke<SyncConfig>("get_sync_config");
   syncStatus.value = await invoke<SyncStatus>("get_sync_status");
   const defaultEx  = await invoke<string[]>("get_default_excludes");
   if (syncConfig.value.excludes.length === 0) syncConfig.value.excludes = defaultEx;
-  localIps.value   = await invoke<string[]>("get_local_ips");
+
+  // Auto-scan on startup
+  startScan();
 });
 
 onUnmounted(async () => {
@@ -143,7 +183,7 @@ onUnmounted(async () => {
   await invoke("cancel_search").catch(() => {});
 });
 
-// ── Transfer ──────────────────────────────────────────────────────────────────
+// ── Send ──────────────────────────────────────────────────────────────────────
 
 async function pickFile()   { const r = await open({ multiple: false, directory: false }); if (r) selectedPath.value = r as string; }
 async function pickFolder() { const r = await open({ multiple: false, directory: true  }); if (r) selectedPath.value = r as string; }
@@ -152,51 +192,51 @@ function onDrop(e: DragEvent) {
   const f = e.dataTransfer?.files[0];
   if (f) selectedPath.value = (f as any).path ?? f.name;
 }
-async function startSend() {
+
+async function sendToDevice(dev: Device) {
   if (!selectedPath.value) return;
-  phase.value = "waiting"; errorMsg.value = "";
-  progress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
-  try { session.value = await invoke<SendSession>("start_send", { path: selectedPath.value }); }
-  catch (e: any) { errorMsg.value = String(e); phase.value = "error"; }
+  sendPhase.value = "transferring"; sendError.value = ""; sendPeer.value = dev.addr;
+  sendProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
+  try {
+    await invoke("send_to", { path: selectedPath.value, addr: dev.addr });
+  } catch (e: any) { sendError.value = String(e); sendPhase.value = "error"; }
 }
-async function startReceive() {
-  if (!receiveInput.value.trim()) return;
-  const [instance_name, key_b64] = receiveInput.value.trim().split(":");
-  if (!key_b64) { errorMsg.value = "Format: instance-name:key"; phase.value = "error"; return; }
-  phase.value = "waiting"; errorMsg.value = "";
-  progress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
-  try { await invoke("start_receive", { instanceName: instance_name, keyB64: key_b64, outDir: outDir.value }); }
-  catch (e: any) { errorMsg.value = String(e); phase.value = "error"; }
-}
-function reset() {
+
+function resetSend() {
   invoke("cancel_send").catch(() => {});
-  phase.value = "idle"; session.value = null; connectedPeer.value = ""; errorMsg.value = "";
-  progress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
+  sendPhase.value = "idle"; sendPeer.value = ""; sendError.value = "";
+  sendProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
 }
-async function startScan() { devices.value = []; await invoke("scan_devices"); }
-function copyCode() { navigator.clipboard.writeText(shareCode.value); }
+
+function resetRecv() {
+  recvPhase.value = "idle"; recvPeer.value = ""; recvError.value = ""; savedPath.value = "";
+  recvProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
+}
+
+// ── Devices ───────────────────────────────────────────────────────────────────
+
+async function startScan() {
+  scanning.value = true;
+  devices.value = [];
+  await invoke("scan_devices");
+  setTimeout(() => { scanning.value = false; }, 5000);
+}
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
 async function doSearch() {
   if (!searchPattern.value.trim()) return;
-  searchResults.value = [];
-  searchRunning.value = true;
-  searchStatus.value = "搜索中…";
+  searchResults.value = []; searchRunning.value = true; searchStatus.value = "搜索中…";
   try {
     await invoke("start_search", {
-      pattern: searchPattern.value,
-      path: searchPath.value,
-      ignoreCase: searchIgnoreCase.value,
-      fixedString: searchFixed.value,
-      mode: searchMode.value,
+      pattern: searchPattern.value, path: searchPath.value,
+      ignoreCase: searchIgnoreCase.value, fixedString: searchFixed.value, mode: searchMode.value,
     });
   } catch (e: any) { searchRunning.value = false; searchStatus.value = `错误: ${e}`; }
 }
 async function stopSearch() {
   await invoke("cancel_search").catch(() => {});
-  searchRunning.value = false;
-  searchStatus.value = "已取消";
+  searchRunning.value = false; searchStatus.value = "已取消";
 }
 async function pickSearchPath() {
   const r = await open({ multiple: false, directory: true });
@@ -209,14 +249,12 @@ async function pickSyncSrc() { const r = await open({ multiple: false, directory
 async function pickSyncDst() { const r = await open({ multiple: false, directory: true }); if (r) syncConfig.value.dst = r as string; }
 async function saveAndSync() {
   await invoke("save_sync_config", { config: syncConfig.value });
-  syncLog.value = [];
-  syncStatus.value.is_running = true;
+  syncLog.value = []; syncStatus.value.is_running = true;
   await invoke("start_sync").catch((e: any) => { syncLog.value.unshift(`❌ ${e}`); syncStatus.value.is_running = false; });
 }
 async function toggleWatch() {
   if (syncStatus.value.is_watching) {
-    await invoke("stop_watch");
-    syncStatus.value.is_watching = false;
+    await invoke("stop_watch"); syncStatus.value.is_watching = false;
   } else {
     await invoke("save_sync_config", { config: syncConfig.value });
     await invoke("start_watch").catch((e: any) => syncLog.value.unshift(`❌ ${e}`));
@@ -233,25 +271,22 @@ function removeExclude(i: number) { syncConfig.value.excludes.splice(i, 1); }
 // ── IP ────────────────────────────────────────────────────────────────────────
 
 async function copyIp() {
-  const addr = primaryIp.value;
-  if (!addr) return;
-  await invoke("write_clipboard", { text: addr }).catch(() =>
-    navigator.clipboard?.writeText(addr).catch(() => {})
-  );
-  ipCopied.value = true;
-  setTimeout(() => { ipCopied.value = false; }, 1500);
+  const addr = primaryIp.value; if (!addr) return;
+  await invoke("write_clipboard", { text: addr }).catch(() => navigator.clipboard?.writeText(addr).catch(() => {}));
+  ipCopied.value = true; setTimeout(() => { ipCopied.value = false; }, 1500);
 }
-async function refreshIps() {
-  localIps.value = await invoke<string[]>("get_local_ips");
-}
+async function refreshIps() { localIps.value = await invoke<string[]>("get_local_ips"); }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtBytes(n: number) {
-  if (n > 1e9) return `${(n / 1e9).toFixed(2)} GB`;
-  if (n > 1e6) return `${(n / 1e6).toFixed(1)} MB`;
-  if (n > 1e3) return `${(n / 1e3).toFixed(0)} KB`;
+  if (n > 1e9) return `${(n/1e9).toFixed(2)} GB`;
+  if (n > 1e6) return `${(n/1e6).toFixed(1)} MB`;
+  if (n > 1e3) return `${(n/1e3).toFixed(0)} KB`;
   return `${n} B`;
+}
+function shortName(fullname: string) {
+  return fullname.split(".")[0] ?? fullname;
 }
 </script>
 
@@ -265,9 +300,8 @@ function fmtBytes(n: number) {
       <div class="flex-1"></div>
       <button v-if="primaryIp" @click="copyIp"
         :class="['flex items-center gap-2.5 px-4 py-1.5 rounded-xl font-mono transition-all duration-200',
-          ipCopied
-            ? 'bg-green-500/15 text-green-300 ring-1 ring-green-500/30'
-            : 'bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 ring-1 ring-cyan-500/20']">
+          ipCopied ? 'bg-green-500/15 text-green-300 ring-1 ring-green-500/30'
+                   : 'bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 ring-1 ring-cyan-500/20']">
         <span class="text-[11px] text-gray-500 font-sans">本机</span>
         <span class="text-base font-bold tracking-wide">{{ primaryIp }}</span>
         <span class="text-xs opacity-70">{{ ipCopied ? 'ok' : 'copy' }}</span>
@@ -284,8 +318,10 @@ function fmtBytes(n: number) {
           @click="tab = t"
           :class="['flex flex-col items-center gap-1 py-2.5 rounded-xl text-xs transition-all duration-150 w-full',
             tab === t ? 'bg-cyan-500/15 text-cyan-300' : 'text-gray-500 hover:text-gray-200 hover:bg-white/5']">
-          <span class="text-[15px] leading-none">{{ t === 'send' ? '📤' : t === 'receive' ? '📥' : t === 'devices' ? '🔍' : t === 'search' ? '📂' : '🔄' }}</span>
-          <span class="text-[10px] mt-0.5">{{ t === 'send' ? '发送' : t === 'receive' ? '接收' : t === 'devices' ? '设备' : t === 'search' ? '搜索' : '同步' }}</span>
+          <span class="text-[15px] leading-none">{{ t==='send'?'📤':t==='receive'?'📥':t==='devices'?'🔍':t==='search'?'📂':'🔄' }}</span>
+          <span class="text-[10px] mt-0.5">{{ t==='send'?'发送':t==='receive'?'接收':t==='devices'?'设备':t==='search'?'搜索':'同步' }}</span>
+          <!-- Badge for incoming transfer -->
+          <span v-if="t==='receive' && recvPhase==='transferring'" class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse mt-0.5"></span>
         </button>
       </nav>
 
@@ -294,92 +330,136 @@ function fmtBytes(n: number) {
 
         <!-- SEND TAB -->
         <template v-if="tab === 'send'">
-          <div class="flex-1 flex flex-col items-center justify-center gap-4">
-            <template v-if="phase === 'idle'">
-              <div @dragover.prevent="dragOver = true" @dragleave="dragOver = false" @drop.prevent="onDrop"
-                :class="['w-full max-w-md border-2 border-dashed rounded-2xl p-8 text-center transition-all duration-200 cursor-pointer',
-                  dragOver ? 'border-cyan-400 bg-cyan-950/30' : 'border-gray-700/60 hover:border-gray-500']"
-                @click="pickFile">
-                <div class="text-4xl mb-2">📦</div>
-                <p class="text-gray-300 font-medium text-sm">拖拽文件或文件夹到此处</p>
-                <p class="text-gray-600 text-xs mt-1">或点击选择</p>
+          <div class="flex-1 flex flex-col gap-4">
+
+            <!-- File picker -->
+            <div @dragover.prevent="dragOver=true" @dragleave="dragOver=false" @drop.prevent="onDrop"
+              :class="['border-2 border-dashed rounded-2xl p-6 text-center transition-all cursor-pointer flex-shrink-0',
+                dragOver ? 'border-cyan-400 bg-cyan-950/30' : 'border-gray-700/60 hover:border-gray-500']"
+              @click="pickFile">
+              <div class="text-3xl mb-1">📦</div>
+              <p class="text-gray-300 text-sm">拖拽文件 / 文件夹，或点击选择</p>
+            </div>
+            <div class="flex gap-2 flex-shrink-0">
+              <button @click="pickFile"   class="px-3 py-1.5 bg-gray-800/80 hover:bg-gray-700 rounded-lg text-sm transition-colors">📄 文件</button>
+              <button @click="pickFolder" class="px-3 py-1.5 bg-gray-800/80 hover:bg-gray-700 rounded-lg text-sm transition-colors">📁 文件夹</button>
+            </div>
+
+            <!-- Selected file -->
+            <div v-if="selectedPath" class="bg-gray-900/80 rounded-xl p-3 flex items-center gap-3 ring-1 ring-white/5 flex-shrink-0">
+              <span class="text-cyan-400">📎</span>
+              <span class="text-sm text-gray-300 truncate flex-1">{{ selectedPath }}</span>
+              <button @click="selectedPath=''" class="text-gray-600 hover:text-red-400 text-xs">✕</button>
+            </div>
+
+            <!-- Transfer progress -->
+            <div v-if="sendPhase === 'transferring'" class="bg-gray-900/80 rounded-xl p-4 ring-1 ring-white/5 flex-shrink-0">
+              <div class="flex items-center justify-between mb-2">
+                <span class="text-sm text-gray-300">发送中 → {{ sendPeer }}</span>
+                <span class="text-sm text-cyan-300">{{ sendSpeed }}</span>
               </div>
-              <div class="flex gap-2">
-                <button @click="pickFile"   class="px-4 py-2 bg-gray-800/80 hover:bg-gray-700 rounded-lg text-sm transition-colors">📄 文件</button>
-                <button @click="pickFolder" class="px-4 py-2 bg-gray-800/80 hover:bg-gray-700 rounded-lg text-sm transition-colors">📁 文件夹</button>
+              <div class="w-full bg-gray-800 rounded-full h-2">
+                <div class="bg-cyan-500 h-2 rounded-full transition-all duration-300"
+                  :style="{ width: sendPct !== null ? sendPct + '%' : '0%' }"></div>
               </div>
-              <div v-if="selectedPath" class="w-full max-w-md bg-gray-900/80 rounded-xl p-3 flex items-center gap-3 ring-1 ring-white/5">
-                <span class="text-cyan-400">📎</span>
-                <span class="text-sm text-gray-300 truncate flex-1">{{ selectedPath }}</span>
-                <button @click="startSend" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm font-medium transition-colors">发送 →</button>
+              <div class="flex justify-between mt-1 text-xs text-gray-500">
+                <span>{{ fmtBytes(sendProgress.bytes_done) }}</span>
+                <span>{{ sendPct !== null ? sendPct + '%' : '…' }}</span>
               </div>
-            </template>
-            <template v-else-if="phase === 'waiting'">
-              <div class="text-center space-y-4">
-                <div class="text-4xl animate-pulse">⏳</div>
-                <p class="text-gray-300 font-medium">等待接收方…</p>
-                <div v-if="session" class="bg-gray-900/80 rounded-xl p-4 space-y-2 text-left w-80 ring-1 ring-white/5">
-                  <p class="text-xs text-gray-500 uppercase tracking-wider">分享码</p>
-                  <div class="flex items-center gap-2">
-                    <code class="text-cyan-300 text-xs break-all flex-1">{{ shareCode }}</code>
-                    <button @click="copyCode" class="text-gray-400 hover:text-white text-lg">⎘</button>
-                  </div>
-                  <p class="text-xs text-gray-600">🔒 E2EE · SHA-256 校验</p>
+            </div>
+            <div v-else-if="sendPhase === 'done'" class="bg-green-900/20 rounded-xl p-3 ring-1 ring-green-500/20 flex items-center gap-3 flex-shrink-0">
+              <span class="text-2xl">✅</span>
+              <span class="text-green-300 text-sm">发送完成！{{ fmtBytes(sendProgress.bytes_done) }}</span>
+              <button @click="resetSend" class="ml-auto text-xs text-gray-500 hover:text-gray-300">关闭</button>
+            </div>
+            <div v-else-if="sendPhase === 'error'" class="bg-red-900/20 rounded-xl p-3 ring-1 ring-red-500/20 flex items-center gap-3 flex-shrink-0">
+              <span class="text-2xl">❌</span>
+              <span class="text-red-400 text-sm truncate flex-1">{{ sendError }}</span>
+              <button @click="resetSend" class="ml-auto text-xs text-gray-500 hover:text-gray-300">关闭</button>
+            </div>
+
+            <!-- Device list to send to -->
+            <div class="flex-1 min-h-0 flex flex-col gap-2">
+              <div class="flex items-center justify-between flex-shrink-0">
+                <p class="text-xs text-gray-500">选择目标设备发送</p>
+                <button @click="startScan" :class="['text-xs px-2 py-1 rounded-lg transition-colors', scanning ? 'text-cyan-400 animate-pulse' : 'text-gray-500 hover:text-gray-300 bg-gray-800/60']">
+                  {{ scanning ? '扫描中…' : '🔄 刷新' }}
+                </button>
+              </div>
+              <div v-if="peersOnly.length === 0" class="text-center text-gray-600 py-8 text-sm">
+                {{ scanning ? '正在扫描局域网…' : '未发现设备 — 点击刷新' }}
+              </div>
+              <div v-for="dev in peersOnly" :key="dev.name"
+                @click="selectedPath && sendToDevice(dev)"
+                :class="['rounded-xl p-3.5 flex items-center gap-3 ring-1 ring-white/5 transition-all',
+                  selectedPath
+                    ? 'bg-gray-900/80 hover:bg-cyan-900/30 hover:ring-cyan-500/30 cursor-pointer'
+                    : 'bg-gray-900/40 opacity-50 cursor-not-allowed']">
+                <div class="w-2.5 h-2.5 rounded-full bg-green-400 flex-shrink-0"></div>
+                <div class="flex-1 min-w-0">
+                  <p class="text-sm font-medium text-gray-200">{{ shortName(dev.name) }}</p>
+                  <p class="text-xs text-gray-500">{{ dev.addr }}</p>
                 </div>
-                <button @click="reset" class="text-sm text-gray-500 hover:text-gray-300">取消</button>
+                <span v-if="selectedPath" class="text-xs text-cyan-400">点击发送 →</span>
               </div>
-            </template>
-            <template v-else-if="phase === 'transferring'">
-              <ProgressRing :pct="pct" :speed="speed" :done-bytes="progress.bytes_done" :total-bytes="progress.total_bytes" :peer="connectedPeer" />
-            </template>
-            <template v-else-if="phase === 'done'">
-              <div class="text-center space-y-3">
-                <div class="text-6xl">✅</div>
-                <p class="text-gray-200 font-semibold text-lg">传输完成！</p>
-                <p class="text-gray-500 text-sm">{{ fmtBytes(progress.bytes_done) }} 已发送</p>
-                <button @click="reset" class="mt-2 px-5 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm font-medium transition-colors">再发一个</button>
-              </div>
-            </template>
-            <template v-else-if="phase === 'error'">
-              <div class="text-center space-y-3">
-                <div class="text-5xl">❌</div>
-                <p class="text-red-400 font-medium">{{ errorMsg }}</p>
-                <button @click="reset" class="px-5 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm transition-colors">重试</button>
-              </div>
-            </template>
+              <p v-if="!selectedPath && peersOnly.length > 0" class="text-xs text-gray-600 text-center">请先选择要发送的文件</p>
+            </div>
+
           </div>
         </template>
 
         <!-- RECEIVE TAB -->
         <template v-else-if="tab === 'receive'">
-          <div class="flex-1 flex flex-col items-center justify-center gap-4">
-            <template v-if="phase === 'idle' || phase === 'error'">
-              <div class="w-full max-w-md space-y-4">
-                <h2 class="text-gray-300 font-medium text-sm">输入发送方的分享码</h2>
-                <textarea v-model="receiveInput" rows="2" placeholder="rust-air-abc12345:base64key..."
-                  class="w-full bg-gray-900/80 border border-gray-700/60 rounded-xl p-3 text-sm text-cyan-300 font-mono resize-none focus:outline-none focus:border-cyan-500 transition-all" />
-                <div class="flex gap-2 items-center">
-                  <input v-model="outDir" placeholder="保存目录"
-                    class="flex-1 bg-gray-900/80 border border-gray-700/60 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-cyan-500 transition-all" />
-                  <button @click="startReceive" class="px-5 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm font-medium transition-colors">接收 →</button>
-                </div>
-                <p v-if="phase === 'error'" class="text-red-400 text-sm">{{ errorMsg }}</p>
+          <div class="flex-1 flex flex-col gap-4 min-h-0">
+            <p class="text-xs text-gray-500 flex-shrink-0">自动接收 — 有人向你发送文件时会在此显示</p>
+
+            <!-- Active incoming transfer -->
+            <div v-if="recvPhase === 'transferring'" class="bg-gray-900/80 rounded-xl p-4 ring-1 ring-cyan-500/20 flex-shrink-0">
+              <div class="flex items-center justify-between mb-2">
+                <span class="text-sm text-gray-300">接收中 ← {{ recvPeer }}</span>
+                <span class="text-sm text-cyan-300">{{ recvSpeed }}</span>
               </div>
-            </template>
-            <template v-else-if="phase === 'waiting'">
-              <div class="text-center space-y-3"><div class="text-4xl animate-pulse">🔍</div><p class="text-gray-300">正在通过 mDNS 查找发送方…</p></div>
-            </template>
-            <template v-else-if="phase === 'transferring'">
-              <ProgressRing :pct="pct" :speed="speed" :done-bytes="progress.bytes_done" :total-bytes="progress.total_bytes" :peer="connectedPeer" />
-            </template>
-            <template v-else-if="phase === 'done'">
-              <div class="text-center space-y-3">
-                <div class="text-6xl">✅</div>
-                <p class="text-gray-200 font-semibold text-lg">接收完成！</p>
-                <p class="text-gray-500 text-sm">{{ fmtBytes(progress.bytes_done) }} · SHA-256 已验证</p>
-                <button @click="reset" class="mt-2 px-5 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-sm font-medium transition-colors">再接收一个</button>
+              <div class="w-full bg-gray-800 rounded-full h-2">
+                <div class="bg-cyan-500 h-2 rounded-full transition-all duration-300"
+                  :style="{ width: recvPct !== null ? recvPct + '%' : '0%' }"></div>
               </div>
-            </template>
+              <div class="flex justify-between mt-1 text-xs text-gray-500">
+                <span>{{ fmtBytes(recvProgress.bytes_done) }}</span>
+                <span>{{ recvPct !== null ? recvPct + '%' : '…' }}</span>
+              </div>
+            </div>
+
+            <div v-else-if="recvPhase === 'done'" class="bg-green-900/20 rounded-xl p-3 ring-1 ring-green-500/20 flex items-center gap-3 flex-shrink-0">
+              <span class="text-2xl">✅</span>
+              <div class="flex-1 min-w-0">
+                <p class="text-green-300 text-sm">接收完成！{{ fmtBytes(recvProgress.bytes_done) }}</p>
+                <p class="text-xs text-gray-500 truncate">{{ savedPath }}</p>
+              </div>
+              <button @click="resetRecv" class="text-xs text-gray-500 hover:text-gray-300">关闭</button>
+            </div>
+
+            <div v-else-if="recvPhase === 'error'" class="bg-red-900/20 rounded-xl p-3 ring-1 ring-red-500/20 flex items-center gap-3 flex-shrink-0">
+              <span class="text-2xl">❌</span>
+              <span class="text-red-400 text-sm truncate flex-1">{{ recvError }}</span>
+              <button @click="resetRecv" class="text-xs text-gray-500 hover:text-gray-300">关闭</button>
+            </div>
+
+            <div v-else class="flex flex-col items-center justify-center py-10 text-gray-600 flex-shrink-0">
+              <div class="text-4xl mb-2">📥</div>
+              <p class="text-sm">等待接收…</p>
+              <p class="text-xs mt-1">文件将保存到下载目录</p>
+            </div>
+
+            <!-- History -->
+            <div v-if="recvHistory.length > 0" class="flex-1 min-h-0 overflow-y-auto space-y-1">
+              <p class="text-xs text-gray-600 mb-2">接收历史</p>
+              <div v-for="(h, i) in recvHistory" :key="i"
+                class="bg-gray-900/60 rounded-lg p-2.5 flex items-center gap-2 text-xs">
+                <span class="text-green-400">✓</span>
+                <span class="text-gray-400 truncate flex-1">{{ h.path.split(/[/\\]/).pop() }}</span>
+                <span class="text-gray-600">{{ fmtBytes(h.bytes) }}</span>
+              </div>
+            </div>
           </div>
         </template>
 
@@ -388,19 +468,18 @@ function fmtBytes(n: number) {
           <div class="flex-1 flex flex-col gap-4 max-w-lg mx-auto w-full">
             <div class="flex items-center justify-between">
               <h2 class="text-gray-300 font-medium text-sm">局域网设备</h2>
-              <button @click="startScan" class="px-3 py-1.5 bg-gray-800/80 hover:bg-gray-700 rounded-lg text-xs transition-colors">🔄 扫描</button>
+              <button @click="startScan" :class="['px-3 py-1.5 rounded-lg text-xs transition-colors', scanning ? 'text-cyan-400 animate-pulse bg-gray-800/60' : 'bg-gray-800/80 hover:bg-gray-700']">
+                {{ scanning ? '扫描中…' : '🔄 扫描' }}
+              </button>
             </div>
             <div v-if="devices.length === 0" class="text-center text-gray-600 py-12 text-sm">未发现设备 — 点击扫描</div>
             <div v-for="dev in devices" :key="dev.name"
-              class="bg-gray-900/80 rounded-xl p-3.5 flex items-center gap-4 hover:bg-gray-800/80 transition-colors ring-1 ring-white/5">
-              <div :class="['w-3 h-3 rounded-full flex-shrink-0', dev.status === 'Idle' ? 'bg-green-400' : 'bg-yellow-400']" />
+              class="bg-gray-900/80 rounded-xl p-3.5 flex items-center gap-4 ring-1 ring-white/5">
+              <div class="w-3 h-3 rounded-full flex-shrink-0 bg-green-400"></div>
               <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-gray-200 truncate">{{ dev.name }}</p>
+                <p class="text-sm font-medium text-gray-200 truncate">{{ shortName(dev.name) }}</p>
                 <p class="text-xs text-gray-500">{{ dev.addr }}</p>
               </div>
-              <span :class="['text-xs px-2 py-0.5 rounded-full', dev.status === 'Idle' ? 'bg-green-900/50 text-green-400' : 'bg-yellow-900/50 text-yellow-400']">
-                {{ dev.status === 'Idle' ? '空闲' : '忙碌' }}
-              </span>
             </div>
           </div>
         </template>
@@ -438,8 +517,7 @@ function fmtBytes(n: number) {
               <div v-if="filteredResults.length === 0 && !searchRunning" class="text-center text-gray-600 py-16 text-sm">
                 {{ searchResults.length === 0 ? '输入内容后按回车搜索' : '无匹配结果' }}
               </div>
-              <div v-for="r in filteredResults" :key="r.path"
-                class="bg-gray-900/80 rounded-xl p-3 ring-1 ring-white/5">
+              <div v-for="r in filteredResults" :key="r.path" class="bg-gray-900/80 rounded-xl p-3 ring-1 ring-white/5">
                 <div class="flex items-center gap-2 mb-1">
                   <span>{{ r.icon }}</span>
                   <span class="text-xs text-cyan-300 font-mono truncate flex-1">{{ r.path }}</span>
@@ -526,45 +604,7 @@ function fmtBytes(n: number) {
     </div>
 
     <footer class="text-center text-[11px] text-gray-700 py-1.5 border-t border-white/5 bg-[#161b22]">
-      rust-air v0.2 · E2EE · mDNS · SHA-256
+      rust-air v0.3 · E2EE · mDNS · SHA-256
     </footer>
   </div>
 </template>
-
-<script lang="ts">
-import { defineComponent } from "vue";
-
-export const ProgressRing = defineComponent({
-  props: {
-    pct:        { type: Number, default: null },
-    speed:      { type: String, default: "" },
-    doneBytes:  { type: Number, default: 0 },
-    totalBytes: { type: Number, default: 0 },
-    peer:       { type: String, default: "" },
-  },
-  setup(props) {
-    const R = 54, C = 2 * Math.PI * R;
-    const dash = () => props.pct !== null ? `${(props.pct / 100) * C} ${C}` : `0 ${C}`;
-    const fmt  = (n: number) => n > 1e9 ? `${(n/1e9).toFixed(2)} GB`
-      : n > 1e6 ? `${(n/1e6).toFixed(1)} MB` : n > 1e3 ? `${(n/1e3).toFixed(0)} KB` : `${n} B`;
-    return { R, C, dash, fmt };
-  },
-  template: `
-    <div class="flex flex-col items-center gap-4">
-      <svg width="140" height="140" class="-rotate-90">
-        <circle :cx="70" :cy="70" :r="R" fill="none" stroke="#1f2937" stroke-width="12"/>
-        <circle :cx="70" :cy="70" :r="R" fill="none" stroke="#06b6d4" stroke-width="12"
-          stroke-linecap="round" :stroke-dasharray="dash()" style="transition:stroke-dasharray 0.3s ease"/>
-      </svg>
-      <div class="text-center -mt-20 mb-16 pointer-events-none">
-        <p class="text-2xl font-bold text-cyan-300">{{ pct !== null ? pct + '%' : '…' }}</p>
-        <p class="text-sm text-gray-400">{{ speed }}</p>
-      </div>
-      <div class="text-center space-y-1">
-        <p class="text-gray-300 text-sm">{{ fmt(doneBytes) }}<span v-if="totalBytes"> / {{ fmt(totalBytes) }}</span></p>
-        <p v-if="peer" class="text-xs text-gray-600">{{ peer }}</p>
-      </div>
-    </div>
-  `,
-});
-</script>

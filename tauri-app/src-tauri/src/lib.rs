@@ -15,9 +15,9 @@ pub fn run() {
         .manage(search_commands::SearchState::new())
         .invoke_handler(tauri::generate_handler![
             // File transfer
-            commands::start_send,
+            commands::start_listener,
+            commands::send_to,
             commands::cancel_send,
-            commands::start_receive,
             commands::scan_devices,
             commands::read_clipboard,
             commands::write_clipboard,
