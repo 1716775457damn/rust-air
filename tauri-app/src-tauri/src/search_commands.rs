@@ -185,6 +185,8 @@ pub fn cancel_search(state: State<'_, SearchState>) {
 // ── Search helpers ────────────────────────────────────────────────────────────
 
 fn search_filename(path: &Path, re: &regex::Regex) -> Option<FileResult> {
+    // Only match actual files, not directories.
+    if path.is_dir() { return None; }
     let name = path.file_name()?.to_string_lossy();
     let ranges: Vec<(usize, usize)> = re.find_iter(name.as_ref())
         .map(|m| {
@@ -205,19 +207,25 @@ fn search_filename(path: &Path, re: &regex::Regex) -> Option<FileResult> {
 fn search_file(path: &Path, re: &regex::Regex) -> anyhow::Result<Option<FileResult>> {
     let len = std::fs::metadata(path)?.len();
     if len == 0 || len > MAX_FILE_SIZE { return Ok(None); }
+    let display = normalize_path(path);
 
     // Use mmap above threshold, direct read for small files.
-    let content = if len >= MMAP_THRESHOLD {
+    // Process each branch separately so the backing buffer lives long enough.
+    if len >= MMAP_THRESHOLD {
         let mmap = unsafe { Mmap::map(&File::open(path)?)? };
         if is_binary(&mmap) { return Ok(None); }
-        decode_bytes(&mmap)
+        let content = decode_bytes(&mmap);
+        return Ok(collect_matches(&content, re, &display));
     } else {
         let bytes = std::fs::read(path)?;
         if is_binary(&bytes) { return Ok(None); }
-        decode_bytes(&bytes)
-    };
+        let content = decode_bytes(&bytes);
+        return Ok(collect_matches(&content, re, &display));
+    }
+}
 
-    // Stream lines; stop early once we have enough matches per file.
+/// Collect matching lines from decoded text content.
+fn collect_matches(content: &str, re: &regex::Regex, display: &str) -> Option<FileResult> {
     const MAX_MATCHES_PER_FILE: usize = 100;
     let mut matches: Vec<MatchLine> = Vec::new();
     for (i, line) in content.lines().enumerate() {
@@ -229,13 +237,12 @@ fn search_file(path: &Path, re: &regex::Regex) -> anyhow::Result<Option<FileResu
             })
             .collect();
         if ranges.is_empty() { continue; }
-        matches.push(MatchLine { line_num: i + 1, line: truncate_line(line), ranges });
+        let line_str = if line.len() <= MAX_LINE_LEN { line.to_string() } else { truncate_line(line) };
+        matches.push(MatchLine { line_num: i + 1, line: line_str, ranges });
         if matches.len() >= MAX_MATCHES_PER_FILE { break; }
     }
-
-    if matches.is_empty() { return Ok(None); }
-    let display = normalize_path(path);
-    Ok(Some(FileResult { icon: file_icon(&display).to_string(), path: display, matches }))
+    if matches.is_empty() { return None; }
+    Some(FileResult { icon: file_icon(display).to_string(), path: display.to_string(), matches })
 }
 
 /// Normalise path separators to forward-slash for cross-platform display.
@@ -262,11 +269,12 @@ fn is_binary(data: &[u8]) -> bool {
     data[..data.len().min(BINARY_CHECK_LEN)].contains(&0)
 }
 
-/// Decode bytes as UTF-8; fall back to GBK for Windows legacy files.
-fn decode_bytes(bytes: &[u8]) -> String {
+/// Decode bytes as UTF-8; fall back to GBK. Avoids double-copy by borrowing
+/// the input slice directly when it is valid UTF-8.
+fn decode_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     match std::str::from_utf8(bytes) {
-        Ok(s)  => s.to_string(),
-        Err(_) => GBK.decode(bytes).0.into_owned(),
+        Ok(s)  => std::borrow::Cow::Borrowed(s),
+        Err(_) => std::borrow::Cow::Owned(GBK.decode(bytes).0.into_owned()),
     }
 }
 

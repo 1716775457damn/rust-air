@@ -33,6 +33,7 @@ pub fn run() {
             commands::read_clipboard,
             commands::write_clipboard,
             commands::get_local_ips,
+            commands::open_path,
             // Sync vault
             sync_commands::get_sync_config,
             sync_commands::save_sync_config,
