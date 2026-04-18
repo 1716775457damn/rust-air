@@ -11,6 +11,7 @@
 //! to minimize system call overhead on high-frequency small chunks.
 
 use anyhow::Result;
+use crate::proto::CHUNK;
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
@@ -23,28 +24,39 @@ pub struct Encryptor<W> {
     cipher:  ChaCha20Poly1305,
     inner:   W,
     counter: u64,
+    /// Reusable frame buffer: [4B len][16B tag][ciphertext] — avoids per-chunk allocation.
+    frame_buf: Vec<u8>,
 }
 
 impl<W: AsyncWrite + Unpin> Encryptor<W> {
     pub fn new(key: &[u8; 32], inner: W) -> Self {
-        Self { cipher: ChaCha20Poly1305::new(Key::from_slice(key)), inner, counter: 0 }
+        use crate::proto::CHUNK;
+        Self {
+            cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
+            inner,
+            counter: 0,
+            frame_buf: Vec::with_capacity(4 + 16 + CHUNK),
+        }
     }
 
     /// Encrypt `plaintext` and write `[len][tag][ciphertext]` in a single syscall.
+    /// Reuses an internal buffer to avoid per-chunk heap allocation.
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
-        let mut buf = plaintext.to_vec();
+        // Build frame in reusable buffer: [4B len][16B tag placeholder][ciphertext]
+        self.frame_buf.clear();
+        self.frame_buf.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        self.frame_buf.extend_from_slice(&[0u8; 16]); // tag placeholder
+        self.frame_buf.extend_from_slice(plaintext);
+
         let nonce = frame_nonce(self.counter);
+        let ciphertext_start = 4 + 16;
         let tag = self.cipher
-            .encrypt_in_place_detached(&nonce, b"", &mut buf)
+            .encrypt_in_place_detached(&nonce, b"", &mut self.frame_buf[ciphertext_start..])
             .map_err(|e| anyhow::anyhow!("encrypt frame {}: {e}", self.counter))?;
+        self.frame_buf[4..20].copy_from_slice(tag.as_slice());
         self.counter += 1;
 
-        // Single allocation, single write_all → one syscall instead of three.
-        let mut frame = Vec::with_capacity(4 + 16 + buf.len());
-        frame.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
-        frame.extend_from_slice(tag.as_slice());
-        frame.extend_from_slice(&buf);
-        self.inner.write_all(&frame).await?;
+        self.inner.write_all(&self.frame_buf).await?;
         Ok(())
     }
 
@@ -67,18 +79,23 @@ impl<W: AsyncWrite + Unpin> Encryptor<W> {
 // ── Decryptor ─────────────────────────────────────────────────────────────────
 
 pub struct Decryptor<R> {
-    cipher:  ChaCha20Poly1305,
-    inner:   R,
-    counter: u64,
+    cipher:    ChaCha20Poly1305,
+    inner:     R,
+    counter:   u64,
+    /// Reusable ciphertext buffer — decrypted in-place, ownership transferred to caller.
+    data_buf:  Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> Decryptor<R> {
     pub fn new(key: &[u8; 32], inner: R) -> Self {
-        Self { cipher: ChaCha20Poly1305::new(Key::from_slice(key)), inner, counter: 0 }
+        Self {
+            cipher:   ChaCha20Poly1305::new(Key::from_slice(key)),
+            inner,
+            counter:  0,
+            data_buf: Vec::with_capacity(CHUNK),
+        }
     }
 
-    /// Read 32 trailing bytes after the EOF sentinel (SHA-256 checksum in v4).
-    /// Must be called after `read_chunk` returns `None`.
     pub async fn read_trailing(&mut self) -> Result<[u8; 32]> {
         let mut buf = [0u8; 32];
         self.inner.read_exact(&mut buf).await?;
@@ -86,30 +103,35 @@ impl<R: AsyncRead + Unpin> Decryptor<R> {
     }
 
     /// Read and authenticate one frame. Returns `None` on end-of-stream sentinel.
+    /// Tag and ciphertext are read into separate fixed buffers — zero shift, zero copy.
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         let mut len_buf = [0u8; 4];
         self.inner.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len == 0 {
-            return Ok(None);
-        }
+        if len == 0 { return Ok(None); }
 
-        let mut tag_buf = [0u8; 16];
-        self.inner.read_exact(&mut tag_buf).await?;
-        let tag = chacha20poly1305::Tag::from_slice(&tag_buf);
+        // Read tag (16 B) into a stack buffer — no heap allocation.
+        let mut tag_bytes = [0u8; 16];
+        self.inner.read_exact(&mut tag_bytes).await?;
+        let tag = chacha20poly1305::Tag::from(tag_bytes);
 
-        let mut buf = vec![0u8; len];
-        self.inner.read_exact(&mut buf).await?;
+        // Read ciphertext into reusable buffer, decrypt in-place.
+        self.data_buf.resize(len, 0);
+        self.inner.read_exact(&mut self.data_buf[..len]).await?;
 
         let nonce = frame_nonce(self.counter);
         self.cipher
-            .decrypt_in_place_detached(&nonce, b"", &mut buf, tag)
+            .decrypt_in_place_detached(&nonce, b"", &mut self.data_buf[..len], &tag)
             .map_err(|_| anyhow::anyhow!(
                 "decryption failed on frame {} — wrong key or data corrupted",
                 self.counter
             ))?;
         self.counter += 1;
-        Ok(Some(buf))
+
+        // Transfer ownership of the plaintext buffer; replace with a fresh one.
+        let mut out = std::mem::replace(&mut self.data_buf, Vec::with_capacity(CHUNK));
+        out.truncate(len);
+        Ok(Some(out))
     }
 }
 

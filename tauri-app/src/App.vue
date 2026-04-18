@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -53,6 +53,13 @@ const searchResults    = ref<FileResult[]>([]);
 const searchStatus     = ref("就绪");
 const searchRunning    = ref(false);
 const searchFilter     = ref("");
+const searchFilterDebounced = ref("");
+let searchFilterTimer: ReturnType<typeof setTimeout> | null = null;
+function onSearchFilterInput(v: string) {
+  searchFilter.value = v;
+  if (searchFilterTimer) clearTimeout(searchFilterTimer);
+  searchFilterTimer = setTimeout(() => { searchFilterDebounced.value = v; }, 150);
+}
 
 // Sync
 const syncConfig       = ref<SyncConfig>({ src: "", dst: "", delete_removed: false, excludes: [], auto_watch: false });
@@ -92,9 +99,19 @@ const peersOnly = computed(() =>
 const selectedName = computed(() => selectedPath.value.split(/[\/\\]/).pop() ?? selectedPath.value);
 
 const filteredResults = computed(() => {
-  const q = searchFilter.value.trim().toLowerCase();
+  const q = searchFilterDebounced.value.trim().toLowerCase();
   return q ? searchResults.value.filter(r => r.path.toLowerCase().includes(q)) : searchResults.value;
 });
+
+// Cache highlight segments to avoid recomputing on every render.
+const hlCache = new Map<string, { text: string; hl: boolean }[][]>();
+function cachedHighlight(path: string, lineNum: number, line: string, ranges: [number,number][]) {
+  const key = `${path}:${lineNum}`;
+  if (!hlCache.has(key)) hlCache.set(key, [highlightSegments(line, ranges)]);
+  return hlCache.get(key)![0];
+}
+// Clear cache when results change.
+watch(searchResults, () => hlCache.clear());
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -537,7 +554,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
             </div>
             <div class="flex items-center gap-2 flex-shrink-0">
               <span class="text-xs text-gray-500 flex-1">{{ searchStatus }}</span>
-              <input v-if="searchResults.length > 0" v-model="searchFilter" placeholder="过滤结果…"
+              <input v-if="searchResults.length > 0" :value="searchFilter" @input="onSearchFilterInput(($event.target as HTMLInputElement).value)" placeholder="过滤结果…"
                 class="w-36 bg-gray-900 border border-gray-700 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-cyan-500 transition-colors" />
             </div>
             <div class="flex-1 overflow-y-auto space-y-1 pr-1 min-h-0">
@@ -552,7 +569,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
                 </div>
                 <!-- filename mode: highlight matched chars in filename -->
                 <div v-if="searchMode === 'filename'" class="font-mono text-xs mt-0.5">
-                  <template v-for="seg in highlightSegments(r.matches[0].line, r.matches[0].ranges)" :key="seg.text">
+                  <template v-for="seg in cachedHighlight(r.path, r.matches[0].line_num, r.matches[0].line, r.matches[0].ranges)" :key="seg.text">
                     <span :class="seg.hl ? 'bg-yellow-400/30 text-yellow-200 rounded px-0.5' : 'text-gray-400'">{{ seg.text }}</span>
                   </template>
                 </div>
@@ -561,7 +578,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
                   <div v-for="(m, mi) in r.matches.slice(0, 5)" :key="mi" class="flex gap-2 font-mono text-xs">
                     <span class="text-green-500 w-8 text-right flex-shrink-0">{{ m.line_num }}:</span>
                     <span class="truncate">
-                      <template v-for="seg in highlightSegments(m.line, m.ranges)" :key="seg.text">
+                      <template v-for="seg in cachedHighlight(r.path, m.line_num, m.line, m.ranges)" :key="seg.text">
                         <span :class="seg.hl ? 'bg-yellow-400/30 text-yellow-200 rounded px-0.5' : 'text-gray-300'">{{ seg.text }}</span>
                       </template>
                     </span>

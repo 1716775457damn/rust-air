@@ -22,8 +22,9 @@ use anyhow::Result;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::{path::{Path, PathBuf}, sync::Arc, time::Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
+use walkdir;
 
 // ── Send ──────────────────────────────────────────────────────────────────────
 
@@ -39,8 +40,16 @@ pub async fn send_path(
     let is_dir = meta.is_dir();
     let kind = if is_dir { Kind::Archive } else { Kind::File };
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    // Directories: total_size=0 (indeterminate); no need to pre-walk.
-    let total_size: u64 = if is_dir { 0 } else { meta.len() };
+    let total_size: u64;
+    let dir_entries: Option<Vec<(walkdir::DirEntry, std::fs::Metadata)>>;
+    if is_dir {
+        let (sz, entries) = archive::walk_dir(path);
+        total_size = sz;
+        dir_entries = Some(entries);
+    } else {
+        total_size = meta.len();
+        dir_entries = None;
+    }
 
     let (mut rx, mut tx) = stream.into_split();
     send_header(&mut tx, &key, kind, &name, total_size).await?;
@@ -53,23 +62,23 @@ pub async fn send_path(
     let on_progress = Arc::new(on_progress);
 
     let checksum: [u8; 32] = if is_dir {
-        let mut reader = archive::stream_archive(path)?;
-        stream_encrypted_hash(&mut reader, &mut enc, 0, 0, on_progress, Sha256::new()).await?
+        let mut reader = archive::stream_archive_with_entries(path, dir_entries.unwrap())?;
+        stream_encrypted_hash(&mut reader, &mut enc, 0, total_size, on_progress, Sha256::new()).await?
     } else {
         let mut f = tokio::fs::File::open(path).await?;
         let mut full_hasher = Sha256::new();
         if resume_offset > 0 {
-            let mut pre = tokio::fs::File::open(path).await?;
+            // Single file handle: hash the already-sent prefix, then continue from resume_offset.
             let mut buf = vec![0u8; CHUNK];
             let mut remaining = resume_offset;
             while remaining > 0 {
                 let to_read = (remaining as usize).min(buf.len());
-                let n = pre.read(&mut buf[..to_read]).await?;
+                let n = f.read(&mut buf[..to_read]).await?;
                 if n == 0 { break; }
                 full_hasher.update(&buf[..n]);
                 remaining -= n as u64;
             }
-            f.seek(std::io::SeekFrom::Start(resume_offset)).await?;
+            // f is now positioned at resume_offset — no seek needed.
         }
         stream_encrypted_hash(&mut f, &mut enc, resume_offset, total_size, on_progress, full_hasher).await?
     };
@@ -115,11 +124,12 @@ pub async fn receive_to_disk(
     match kind {
         Kind::File => {
             let file = open_part_file(&part_path, already_have).await?;
-            let mut f = BufWriter::with_capacity(256 * 1024, file);
+            let mut f = BufWriter::with_capacity(4 * 256 * 1024, file); // 1 MB write buffer
             let mut dec = Decryptor::new(&key, rx);
             let mut hasher = Sha256::new();
             let mut done = already_have;
             let start = Instant::now();
+            let mut last_emit = start;
 
             // Resume: pre-hash the bytes we already have so the final digest
             // covers the complete file, matching what the sender computed.
@@ -137,7 +147,10 @@ pub async fn receive_to_disk(
                 hasher.update(&chunk);
                 f.write_all(&chunk).await?;
                 done += chunk.len() as u64;
-                emit_progress(&on_progress, done, total_size, &start, false);
+                if last_emit.elapsed().as_millis() >= 50 {
+                    emit_progress(&on_progress, done, total_size, &start, false);
+                    last_emit = Instant::now();
+                }
             }
             f.flush().await?;
             drop(f);
@@ -171,13 +184,17 @@ pub async fn receive_to_disk(
             let mut hasher = Sha256::new();
             let mut done: u64 = 0;
             let start = Instant::now();
+            let mut last_emit = start;
 
             while let Some(chunk) = dec.read_chunk().await? {
                 use std::io::Write;
                 hasher.update(&chunk);
                 sync_w.write_all(&chunk)?;
                 done += chunk.len() as u64;
-                emit_progress(&on_progress, done, total_size, &start, false);
+                if last_emit.elapsed().as_millis() >= 50 {
+                    emit_progress(&on_progress, done, total_size, &start, false);
+                    last_emit = Instant::now();
+                }
             }
             drop(sync_w);
             unpack.await??;
@@ -285,13 +302,23 @@ async fn stream_encrypted_hash<R: AsyncRead + Unpin>(
     let mut hasher = hasher;
     let mut done = initial;
     let start = Instant::now();
+    let mut last_emit = start;
     loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 { break; }
-        hasher.update(&buf[..n]);
-        enc.write_chunk(&buf[..n]).await?;
-        done += n as u64;
-        emit_progress(&on_progress, done, total, &start, false);
+        let mut filled = 0;
+        while filled < buf.len() {
+            match reader.read(&mut buf[filled..]).await? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if filled == 0 { break; }
+        hasher.update(&buf[..filled]);
+        enc.write_chunk(&buf[..filled]).await?;
+        done += filled as u64;
+        if last_emit.elapsed().as_millis() >= 50 {
+            emit_progress(&on_progress, done, total, &start, false);
+            last_emit = Instant::now();
+        }
     }
     Ok(hasher.finalize().into())
 }

@@ -259,11 +259,13 @@ pub fn start_watcher(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn hash_file(path: &Path) -> anyhow::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut h    = Sha256::new();
-    let mut buf  = vec![0u8; 256 * 1024]; // 256 KB aligned with transfer CHUNK
+    use std::io::BufReader;
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 { break; }
         h.update(&buf[..n]);
     }
@@ -292,9 +294,10 @@ fn scan_needed(
     tx: &Sender<SyncEvent>,
 ) -> (Vec<(String, PathBuf, u64, String)>, HashSet<String>) {
     let ex = ExcludeSet::new(excludes);
-    let mut to_copy = Vec::new();
     let mut seen    = HashSet::new();
     let mut scanned = 0usize;
+    // Candidates that passed the size+mtime fast-path and need hashing.
+    let mut need_hash: Vec<(String, PathBuf, u64)> = Vec::new();
 
     for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() { continue; }
@@ -308,41 +311,47 @@ fn scan_needed(
         if ex.matches(&rel) { continue; }
         seen.insert(rel.clone());
 
-        let size = match std::fs::metadata(abs) { Ok(m) => m.len(), Err(_) => continue };
+        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+        let size = meta.len();
 
         // Fast path: skip hash if size AND mtime both match the record.
         if let Some(rec) = store.state.files.get(&rel) {
             if rec.size == size {
-                let current_secs = std::fs::metadata(abs)
+                let current_secs = meta.modified()
                     .ok()
-                    .and_then(|m| m.modified().ok())
                     .map(|t| chrono::DateTime::<Local>::from(t).timestamp())
                     .unwrap_or(0);
                 if rec.modified.timestamp() == current_secs {
-                    seen.insert(rel);
-                    continue; // size + mtime match: skip hash entirely
+                    continue;
                 }
             }
         }
-
-        // Compute hash once; compare with record if size matches.
-        let cached_hash = store.state.files.get(&rel)
-            .filter(|rec| rec.size == size)
-            .map(|rec| rec.hash.clone());
-
-        let hash = match hash_file(abs) {
-            Ok(h)  => h,
-            Err(e) => { let _ = tx.send(SyncEvent::Error { rel, err: e.to_string() }); continue; }
-        };
-
-        let needs_copy = match cached_hash {
-            Some(ref cached) => &hash != cached,
-            None => true,
-        };
-        if !needs_copy { continue; }
-        to_copy.push((rel, abs.to_path_buf(), size, hash));
+        need_hash.push((rel, abs.to_path_buf(), size));
     }
     let _ = tx.send(SyncEvent::Progress { scanned, total: scanned });
+
+    // Parallel hash of all candidates.
+    // Pre-extract cached records to avoid borrowing store inside par_iter.
+    use rayon::prelude::*;
+    let cached: std::collections::HashMap<String, (u64, String)> = need_hash.iter()
+        .filter_map(|(rel, _, size)| {
+            store.state.files.get(rel)
+                .filter(|rec| rec.size == *size)
+                .map(|rec| (rel.clone(), (*size, rec.hash.clone())))
+        })
+        .collect();
+
+    let to_copy: Vec<(String, PathBuf, u64, String)> = need_hash
+        .into_par_iter()
+        .filter_map(|(rel, abs, size)| {
+            let hash = hash_file(&abs).ok()?;
+            if let Some((_, cached_hash)) = cached.get(&rel) {
+                if *cached_hash == hash { return None; }
+            }
+            Some((rel, abs, size, hash))
+        })
+        .collect();
+
     (to_copy, seen)
 }
 

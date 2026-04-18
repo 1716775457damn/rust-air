@@ -22,6 +22,7 @@ sha2             = "0.10"
 tar     = "0.4"
 zstd    = "0.13"
 os_pipe = "1"
+rayon   = "1"
 
 # Discovery (mDNS-SD replaces UDP broadcast)
 mdns-sd = "0.19"

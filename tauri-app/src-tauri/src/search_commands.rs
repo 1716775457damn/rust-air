@@ -138,6 +138,9 @@ pub fn start_search(
                     }
                     search_file(entry.path(), &re).ok().flatten()
                 } else {
+                    if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                        return ignore::WalkState::Continue;
+                    }
                     search_filename(entry.path(), &re)
                 };
                 if let Some(r) = result {
@@ -185,16 +188,8 @@ pub fn cancel_search(state: State<'_, SearchState>) {
 // ── Search helpers ────────────────────────────────────────────────────────────
 
 fn search_filename(path: &Path, re: &regex::Regex) -> Option<FileResult> {
-    // Only match actual files, not directories.
-    if path.is_dir() { return None; }
     let name = path.file_name()?.to_string_lossy();
-    let ranges: Vec<(usize, usize)> = re.find_iter(name.as_ref())
-        .map(|m| {
-            let start = name[..m.start()].chars().count();
-            let end   = start + name[m.start()..m.end()].chars().count();
-            (start, end)
-        })
-        .collect();
+    let ranges = byte_ranges_to_char_ranges(name.as_ref(), re);
     if ranges.is_empty() { return None; }
     let display = normalize_path(path);
     Some(FileResult {
@@ -229,20 +224,40 @@ fn collect_matches(content: &str, re: &regex::Regex, display: &str) -> Option<Fi
     const MAX_MATCHES_PER_FILE: usize = 100;
     let mut matches: Vec<MatchLine> = Vec::new();
     for (i, line) in content.lines().enumerate() {
-        let ranges: Vec<_> = re.find_iter(line)
-            .map(|m| {
-                let start = line[..m.start()].chars().count();
-                let end   = start + line[m.start()..m.end()].chars().count();
-                (start, end)
-            })
-            .collect();
+        if !re.is_match(line) { continue; }
+        let ranges: Vec<_> = byte_ranges_to_char_ranges(line, re);
         if ranges.is_empty() { continue; }
-        let line_str = if line.len() <= MAX_LINE_LEN { line.to_string() } else { truncate_line(line) };
+        let line_str = if line.len() <= MAX_LINE_LEN { line.to_owned() } else { truncate_line(line) };
         matches.push(MatchLine { line_num: i + 1, line: line_str, ranges });
         if matches.len() >= MAX_MATCHES_PER_FILE { break; }
     }
     if matches.is_empty() { return None; }
     Some(FileResult { icon: file_icon(display).to_string(), path: display.to_string(), matches })
+}
+
+/// Convert byte-offset regex matches to char-offset [start, end) ranges in one O(n) pass.
+/// Avoids the O(n*m) cost of calling `line[..m.start()].chars().count()` per match.
+fn byte_ranges_to_char_ranges(line: &str, re: &regex::Regex) -> Vec<(usize, usize)> {
+    let byte_matches: Vec<_> = re.find_iter(line).collect();
+    if byte_matches.is_empty() { return vec![]; }
+
+    let mut ranges = Vec::with_capacity(byte_matches.len());
+    let mut mi = 0usize;          // index into byte_matches
+    let mut char_idx = 0usize;    // current char position
+
+    for (byte_idx, ch) in line.char_indices() {
+        while mi < byte_matches.len() && byte_matches[mi].start() == byte_idx {
+            let m = &byte_matches[mi];
+            let start_char = char_idx;
+            let end_char   = start_char + line[m.start()..m.end()].chars().count();
+            ranges.push((start_char, end_char));
+            mi += 1;
+        }
+        if mi >= byte_matches.len() { break; }
+        char_idx += 1;
+        let _ = ch;
+    }
+    ranges
 }
 
 /// Normalise path separators to forward-slash for cross-platform display.
@@ -251,11 +266,8 @@ fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// Truncate a line at `MAX_LINE_LEN` chars, respecting char boundaries.
+/// Truncate a line to `MAX_LINE_LEN` chars, appending `…`.
 fn truncate_line(line: &str) -> String {
-    if line.len() <= MAX_LINE_LEN {
-        return line.to_string();
-    }
     let end = line.char_indices()
         .nth(MAX_LINE_LEN)
         .map(|(i, _)| i)
@@ -263,10 +275,15 @@ fn truncate_line(line: &str) -> String {
     format!("{}…", &line[..end])
 }
 
-/// Heuristic binary detection: look for null bytes in the first chunk.
+/// Heuristic binary detection on the first chunk.
+/// Treats the file as binary if it contains null bytes OR if more than 30% of
+/// sampled bytes are non-printable non-whitespace ASCII (common in compiled files).
 #[inline]
 fn is_binary(data: &[u8]) -> bool {
-    data[..data.len().min(BINARY_CHECK_LEN)].contains(&0)
+    let sample = &data[..data.len().min(BINARY_CHECK_LEN)];
+    if sample.contains(&0) { return true; }
+    let non_text = sample.iter().filter(|&&b| b < 0x09 || (b > 0x0d && b < 0x20) || b == 0x7f).count();
+    non_text * 10 > sample.len() * 3  // > 30%
 }
 
 /// Decode bytes as UTF-8; fall back to GBK. Avoids double-copy by borrowing
