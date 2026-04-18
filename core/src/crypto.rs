@@ -6,6 +6,9 @@
 //! Nonce construction: 8-byte little-endian frame counter ++ 4 zero bytes.
 //! Counter is monotonically increasing — nonces are never reused under the same key.
 //! End-of-stream sentinel: a single frame with plaintext_len == 0.
+//!
+//! Optimization: header + tag + ciphertext are written in a single write_all call
+//! to minimize system call overhead on high-frequency small chunks.
 
 use anyhow::Result;
 use chacha20poly1305::{
@@ -27,9 +30,8 @@ impl<W: AsyncWrite + Unpin> Encryptor<W> {
         Self { cipher: ChaCha20Poly1305::new(Key::from_slice(key)), inner, counter: 0 }
     }
 
-    /// Encrypt `plaintext` and write `[len][tag][ciphertext]` to the inner writer.
+    /// Encrypt `plaintext` and write `[len][tag][ciphertext]` in a single syscall.
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
-        // Copy into buf then encrypt in-place — single allocation, no second Vec.
         let mut buf = plaintext.to_vec();
         let nonce = frame_nonce(self.counter);
         let tag = self.cipher
@@ -37,16 +39,26 @@ impl<W: AsyncWrite + Unpin> Encryptor<W> {
             .map_err(|e| anyhow::anyhow!("encrypt frame {}: {e}", self.counter))?;
         self.counter += 1;
 
-        // Three sequential writes; tokio/OS coalesces them in the socket send buffer.
-        self.inner.write_all(&(plaintext.len() as u32).to_be_bytes()).await?;
-        self.inner.write_all(tag.as_slice()).await?;
-        self.inner.write_all(&buf).await?;
+        // Single allocation, single write_all → one syscall instead of three.
+        let mut frame = Vec::with_capacity(4 + 16 + buf.len());
+        frame.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        frame.extend_from_slice(tag.as_slice());
+        frame.extend_from_slice(&buf);
+        self.inner.write_all(&frame).await?;
         Ok(())
     }
 
     /// Write the end-of-stream sentinel (zero-length frame) and flush.
     pub async fn shutdown(&mut self) -> Result<()> {
         self.inner.write_all(&0u32.to_be_bytes()).await?;
+        self.inner.flush().await?;
+        Ok(())
+    }
+
+    /// Write trailing bytes after the EOF sentinel (e.g. SHA-256 checksum).
+    /// Must be called after `shutdown()`.
+    pub async fn write_trailing(&mut self, data: &[u8]) -> Result<()> {
+        self.inner.write_all(data).await?;
         self.inner.flush().await?;
         Ok(())
     }
@@ -63,6 +75,14 @@ pub struct Decryptor<R> {
 impl<R: AsyncRead + Unpin> Decryptor<R> {
     pub fn new(key: &[u8; 32], inner: R) -> Self {
         Self { cipher: ChaCha20Poly1305::new(Key::from_slice(key)), inner, counter: 0 }
+    }
+
+    /// Read 32 trailing bytes after the EOF sentinel (SHA-256 checksum in v4).
+    /// Must be called after `read_chunk` returns `None`.
+    pub async fn read_trailing(&mut self) -> Result<[u8; 32]> {
+        let mut buf = [0u8; 32];
+        self.inner.read_exact(&mut buf).await?;
+        Ok(buf)
     }
 
     /// Read and authenticate one frame. Returns `None` on end-of-stream sentinel.
@@ -96,7 +116,6 @@ impl<R: AsyncRead + Unpin> Decryptor<R> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build a 12-byte nonce from an 8-byte frame counter (little-endian) + 4 zero bytes.
-/// Counter monotonically increases per session — nonces are never reused under the same key.
 #[inline]
 fn frame_nonce(counter: u64) -> Nonce {
     let mut n = [0u8; 12];

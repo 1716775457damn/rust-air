@@ -4666,11 +4666,13 @@ name = "tauri-app"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "base64 0.22.1",
  "dirs 5.0.1",
  "encoding_rs",
  "hex",
  "ignore",
+ "image",
  "local-ip-address",
  "memmap2",
  "notify",

@@ -32,3 +32,5 @@ num_cpus           = "1"
 encoding_rs        = "0.8"
 notify             = "6"
 hex                = "0.4"
+arboard            = "3"
+image              = { version = "0.25", default-features = false, features = ["png"] }

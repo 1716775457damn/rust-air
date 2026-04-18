@@ -73,9 +73,7 @@ fn print_qr(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Determine the local LAN IP by connecting a UDP socket (no packets are sent).
+/// Determine the local LAN IP — delegates to discovery to avoid duplication.
 fn local_ip() -> Result<String> {
-    let s = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    s.connect("8.8.8.8:80")?;
-    Ok(s.local_addr()?.ip().to_string())
+    crate::discovery::local_lan_ip().ok_or_else(|| anyhow::anyhow!("no LAN IP found"))
 }

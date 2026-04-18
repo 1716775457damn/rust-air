@@ -138,11 +138,21 @@ pub fn cancel_send(state: State<'_, AppState>) {
 #[tauri::command]
 pub async fn scan_devices(app: AppHandle) -> Result<(), String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DeviceInfo>(32);
-    tokio::spawn(discovery::browse_devices(tx));
+
+    // browse_devices_sync starts a background thread and returns a handle.
+    // Dropping the handle shuts down the daemon, which unblocks receiver.recv()
+    // in the thread immediately — no quiet-LAN deadlock.
+    let handle = discovery::browse_devices_sync(tx).map_err(|e| e.to_string())?;
+
     tokio::spawn(async move {
-        while let Some(dev) = rx.recv().await {
-            app.emit("device-found", &dev).ok();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(dev)) => { app.emit("device-found", &dev).ok(); }
+                _ => break,
+            }
         }
+        drop(handle); // shuts down daemon → thread exits cleanly
     });
     Ok(())
 }
@@ -163,14 +173,7 @@ pub fn write_clipboard(text: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_local_ips() -> Vec<String> {
-    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = sock.local_addr() {
-                return vec![addr.ip().to_string()];
-            }
-        }
-    }
-    Vec::new()
+    discovery::local_lan_ip().into_iter().collect()
 }
 
 // ── Response types ────────────────────────────────────────────────────────────
@@ -178,9 +181,8 @@ pub fn get_local_ips() -> Vec<String> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "rust-air".to_string())
+    // Use the same safe ASCII label as mDNS registration to avoid mismatches.
+    discovery::safe_device_name()
 }
 
 fn default_download_dir() -> PathBuf {

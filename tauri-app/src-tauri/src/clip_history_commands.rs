@@ -1,6 +1,6 @@
 use rust_air_core::{ClipContent, ClipEntry, HistoryStore};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
 pub struct HistoryState {
@@ -127,13 +127,13 @@ fn fnv1a(data: &[u8]) -> u64 {
 // ── Commands (still needed for mutations) ────────────────────────────────────
 
 #[tauri::command]
-pub fn get_history(state: State<'_, HistoryState>) -> Vec<ClipEntryView> {
+pub fn get_history(state: State<'_, Arc<HistoryState>>) -> Vec<ClipEntryView> {
     state.store.lock().unwrap_or_else(|e| e.into_inner())
         .entries.iter().map(ClipEntryView::from).collect()
 }
 
 #[tauri::command]
-pub fn copy_history_entry(id: u64, app: AppHandle, state: State<'_, HistoryState>) -> Result<(), String> {
+pub fn copy_history_entry(id: u64, app: AppHandle, state: State<'_, Arc<HistoryState>>) -> Result<(), String> {
     let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let entry = store.entries.iter().find(|e| e.id == id).cloned()
         .ok_or_else(|| format!("entry {id} not found"))?;
@@ -154,7 +154,7 @@ pub fn copy_history_entry(id: u64, app: AppHandle, state: State<'_, HistoryState
 }
 
 #[tauri::command]
-pub fn delete_history_entry(id: u64, app: AppHandle, state: State<'_, HistoryState>) {
+pub fn delete_history_entry(id: u64, app: AppHandle, state: State<'_, Arc<HistoryState>>) {
     let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     store.remove(id);
     let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
@@ -162,7 +162,7 @@ pub fn delete_history_entry(id: u64, app: AppHandle, state: State<'_, HistorySta
 }
 
 #[tauri::command]
-pub fn toggle_pin_entry(id: u64, app: AppHandle, state: State<'_, HistoryState>) {
+pub fn toggle_pin_entry(id: u64, app: AppHandle, state: State<'_, Arc<HistoryState>>) {
     let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     store.toggle_pin(id);
     let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
@@ -170,7 +170,7 @@ pub fn toggle_pin_entry(id: u64, app: AppHandle, state: State<'_, HistoryState>)
 }
 
 #[tauri::command]
-pub fn clear_history(app: AppHandle, state: State<'_, HistoryState>) {
+pub fn clear_history(app: AppHandle, state: State<'_, Arc<HistoryState>>) {
     let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     store.clear_unpinned();
     let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
@@ -178,23 +178,22 @@ pub fn clear_history(app: AppHandle, state: State<'_, HistoryState>) {
 }
 
 #[tauri::command]
-pub fn set_history_paused(paused: bool, state: State<'_, HistoryState>) {
+pub fn set_history_paused(paused: bool, state: State<'_, Arc<HistoryState>>) {
     *state.paused.lock().unwrap_or_else(|e| e.into_inner()) = paused;
 }
 
 #[tauri::command]
-pub fn flush_history(state: State<'_, HistoryState>) {
+pub fn flush_history(state: State<'_, Arc<HistoryState>>) {
     state.store.lock().unwrap_or_else(|e| e.into_inner()).flush_now();
 }
 
-// keep for backward compat — now a no-op since monitor is push-based
 #[tauri::command]
-pub fn tick_history(state: State<'_, HistoryState>) -> Vec<ClipEntryView> {
+pub fn tick_history(state: State<'_, Arc<HistoryState>>) -> Vec<ClipEntryView> {
     state.store.lock().unwrap_or_else(|e| e.into_inner())
         .entries.iter().map(ClipEntryView::from).collect()
 }
 
 #[tauri::command]
-pub fn get_history_paused(state: State<'_, HistoryState>) -> bool {
+pub fn get_history_paused(state: State<'_, Arc<HistoryState>>) -> bool {
     *state.paused.lock().unwrap_or_else(|e| e.into_inner())
 }

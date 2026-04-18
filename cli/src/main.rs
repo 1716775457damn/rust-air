@@ -110,9 +110,10 @@ async fn cmd_send_clip(to: String) -> Result<()> {
     let text = clipboard::read()?;
     println!("📋 Clipboard: {} chars", text.len());
     println!("🔗 Connecting to {to}…");
-    let _stream = TcpStream::connect(&to).await?;
-    // Clipboard send not yet implemented in v3 — placeholder
-    println!("✅ Clipboard sent!");
+    let stream = TcpStream::connect(&to).await?;
+    println!("🔒 E2EE ChaCha20-Poly1305 + SHA-256 verify\n");
+    transfer::send_clipboard(stream, &text, noop_progress).await?;
+    println!("\n✅ Clipboard sent!");
     Ok(())
 }
 
@@ -159,7 +160,7 @@ async fn cmd_scan() -> Result<()> {
 /// Scan for `secs` seconds and return (name, addr) pairs.
 async fn scan_once(secs: u64) -> Result<Vec<(String, String)>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(discovery::browse_devices(tx));
+    let handle = discovery::browse_devices_sync(tx)?;
     let mut devs: Vec<(String, String)> = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     loop {
@@ -173,15 +174,14 @@ async fn scan_once(secs: u64) -> Result<Vec<(String, String)>> {
             _ => break,
         }
     }
+    drop(handle); // shutdown daemon immediately
     Ok(devs)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "rust-air".to_string())
+    discovery::safe_device_name()
 }
 
 fn noop_progress(_: TransferEvent) {}

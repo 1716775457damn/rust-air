@@ -5,6 +5,8 @@
 //! duplex pipe (the reader will get an EOF / broken-pipe on failure).
 //!
 //! `unpack_archive_sync` is called inside `spawn_blocking` on the receiver side.
+//!
+//! `dir_total_size` walks a directory and sums file sizes for progress reporting.
 
 use anyhow::Result;
 use std::path::Path;
@@ -18,7 +20,6 @@ pub fn stream_archive(path: &Path) -> Result<impl AsyncRead + Send + Unpin + 'st
 
     std::thread::spawn(move || {
         if let Err(e) = compress_to_pipe(pipe_writer, &path) {
-            // The broken pipe will propagate as an error on the async reader side.
             eprintln!("archive compression error: {e}");
         }
     });
@@ -38,11 +39,24 @@ pub fn unpack_archive_sync(reader: impl std::io::Read, dest: &Path) -> Result<()
     Ok(())
 }
 
+/// Walk `path` and sum all file sizes. Used to populate `total_size` for
+/// directory transfers so the receiver can show a real progress percentage.
+/// Returns 0 on any error (graceful degradation).
+pub fn dir_total_size(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 fn compress_to_pipe(writer: os_pipe::PipeWriter, path: &Path) -> Result<()> {
-    // zstd level 3: good balance of speed and ratio for LAN transfers.
-    let enc = zstd::Encoder::new(writer, 3)?;
+    // Level 1: ~3-5x faster than level 3 with minimal ratio loss — ideal for LAN.
+    let enc = zstd::Encoder::new(writer, 1)?;
     let mut tar = tar::Builder::new(enc);
     let entry_name = path.file_name().unwrap_or_default();
     if path.is_dir() {
@@ -55,21 +69,26 @@ fn compress_to_pipe(writer: os_pipe::PipeWriter, path: &Path) -> Result<()> {
 }
 
 /// Pump bytes from a synchronous `PipeReader` into an async writer.
-/// The blocking `read()` is acceptable here: os_pipe reads are kernel buffer
-/// copies and complete in microseconds, so they don't meaningfully stall the
-/// tokio thread pool.
-async fn pump_pipe(mut src: os_pipe::PipeReader, mut dst: impl AsyncWrite + Unpin) {
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        use std::io::Read;
-        match src.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if dst.write_all(&buf[..n]).await.is_err() {
-                    break;
+/// Runs the blocking read inside spawn_blocking to avoid stalling the tokio thread.
+async fn pump_pipe(mut src: os_pipe::PipeReader, mut dst: impl AsyncWrite + Unpin + Send + 'static) {
+    // Channel bridges the blocking read thread and the async write side.
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            use std::io::Read;
+            match src.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if chunk_tx.blocking_send(buf[..n].to_vec()).is_err() { break; }
                 }
             }
         }
+    });
+
+    while let Some(chunk) = chunk_rx.recv().await {
+        if dst.write_all(&chunk).await.is_err() { break; }
     }
     let _ = dst.shutdown().await;
 }

@@ -134,14 +134,11 @@ impl HistoryStore {
 
     /// Add a new entry, deduplicating and trimming to 500 unpinned items.
     pub fn push(&mut self, content: ClipContent) {
+        // Dedup: remove existing entry with same text in O(n) retain, then re-insert at top.
         if let ClipContent::Text { text: ref t } = content {
             if self.text_set.contains(t.as_str()) {
-                if let Some(pos) = self.entries.iter().position(|e| match &e.content {
-                    ClipContent::Text { text } => text == t,
-                    _ => false,
-                }) {
-                    self.entries.remove(pos);
-                }
+                let t_clone = t.clone();
+                self.entries.retain(|e| !matches!(&e.content, ClipContent::Text { text } if text == &t_clone));
                 self.text_set.remove(t.as_str());
             }
         }

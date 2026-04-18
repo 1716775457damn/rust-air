@@ -213,23 +213,34 @@ pub fn start_watcher(
     let pending: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_flush = pending.clone();
     let tx_flush = tx.clone();
+    // stop_tx is held by the watcher; dropping the watcher closes the channel,
+    // which causes the debounce thread to exit.
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(100));
-        let mut map = pending_flush.lock().unwrap();
-        let ready: Vec<PathBuf> = map.iter()
-            .filter(|(_, t)| t.elapsed() >= Duration::from_millis(DEBOUNCE_MS))
-            .map(|(p, _)| p.clone())
-            .collect();
-        if !ready.is_empty() {
-            for p in &ready { map.remove(p); }
-            drop(map);
-            if tx_flush.send(ready).is_err() { return; }
+    std::thread::spawn(move || {
+        loop {
+            // Exit when watcher is dropped (stop_tx dropped → recv returns Err).
+            if stop_rx.try_recv() == Err(std::sync::mpsc::TryRecvError::Disconnected) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let mut map = pending_flush.lock().unwrap();
+            let ready: Vec<PathBuf> = map.iter()
+                .filter(|(_, t)| t.elapsed() >= Duration::from_millis(DEBOUNCE_MS))
+                .map(|(p, _)| p.clone())
+                .collect();
+            if !ready.is_empty() {
+                for p in &ready { map.remove(p); }
+                drop(map);
+                if tx_flush.send(ready).is_err() { return; }
+            }
         }
     });
 
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<Event>| {
+            // Keep stop_tx alive inside the closure so it's dropped with the watcher.
+            let _keep = &stop_tx;
             if let Ok(event) = res {
                 if !matches!(event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
@@ -250,7 +261,7 @@ pub fn start_watcher(
 pub fn hash_file(path: &Path) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut h    = Sha256::new();
-    let mut buf  = vec![0u8; 65536];
+    let mut buf  = vec![0u8; 256 * 1024]; // 256 KB aligned with transfer CHUNK
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 { break; }
@@ -299,16 +310,37 @@ fn scan_needed(
 
         let size = match std::fs::metadata(abs) { Ok(m) => m.len(), Err(_) => continue };
 
-        let needs_copy = match store.state.files.get(&rel) {
-            None      => true,
-            Some(rec) => rec.size != size || hash_file(abs).map(|h| h != rec.hash).unwrap_or(true),
+        // Fast path: skip hash if size AND mtime both match the record.
+        if let Some(rec) = store.state.files.get(&rel) {
+            if rec.size == size {
+                let current_secs = std::fs::metadata(abs)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| chrono::DateTime::<Local>::from(t).timestamp())
+                    .unwrap_or(0);
+                if rec.modified.timestamp() == current_secs {
+                    seen.insert(rel);
+                    continue; // size + mtime match: skip hash entirely
+                }
+            }
+        }
+
+        // Compute hash once; compare with record if size matches.
+        let cached_hash = store.state.files.get(&rel)
+            .filter(|rec| rec.size == size)
+            .map(|rec| rec.hash.clone());
+
+        let hash = match hash_file(abs) {
+            Ok(h)  => h,
+            Err(e) => { let _ = tx.send(SyncEvent::Error { rel, err: e.to_string() }); continue; }
+        };
+
+        let needs_copy = match cached_hash {
+            Some(ref cached) => &hash != cached,
+            None => true,
         };
         if !needs_copy { continue; }
-
-        match hash_file(abs) {
-            Ok(h)  => to_copy.push((rel, abs.to_path_buf(), size, h)),
-            Err(e) => { let _ = tx.send(SyncEvent::Error { rel, err: e.to_string() }); }
-        }
+        to_copy.push((rel, abs.to_path_buf(), size, hash));
     }
     let _ = tx.send(SyncEvent::Progress { scanned, total: scanned });
     (to_copy, seen)
@@ -361,7 +393,8 @@ impl ExcludeSet {
         rel.split('/').any(|seg| {
             self.exact.contains(seg)
                 || self.exts.iter().any(|ext| {
-                    seg.len() > ext.len() + 1
+                    // seg must be at least "x.ext" — length >= ext.len() + 2
+                    seg.len() >= ext.len() + 2
                         && seg.as_bytes()[seg.len() - ext.len() - 1] == b'.'
                         && seg.ends_with(ext.as_str())
                 })

@@ -1,19 +1,22 @@
-/// Wire protocol v3 — key-in-header, no pre-shared secret needed.
+/// Wire protocol v4 — key-in-header, checksum sent AFTER data stream.
 ///
 /// After TCP connect the SENDER writes:
-///   [4B MAGIC "RAR3"][32B one-time key][1B kind]
-///   [2B name_len][name bytes][8B total_size][32B sha256]
+///   [4B MAGIC "RAR4"][32B one-time key][1B kind]
+///   [2B name_len][name bytes][8B total_size]
 ///
 /// RECEIVER replies:
 ///   [8B already_have]   (0 = fresh)
 ///
-/// Then AEAD-encrypted data chunks follow (see crypto.rs).
+/// SENDER streams AEAD-encrypted chunks, then appends:
+///   [32B sha256]   ← computed on-the-fly while streaming, sent after EOF sentinel
+///
+/// This eliminates the double-read of large files (no pre-scan for checksum).
 
 use serde::{Deserialize, Serialize};
 
-pub const MAGIC: &[u8; 4] = b"RAR3";
+pub const MAGIC: &[u8; 4] = b"RAR4";
 pub const MDNS_SERVICE: &str = "_rustair._tcp.local.";
-pub const CHUNK: usize = 64 * 1024;
+pub const CHUNK: usize = 256 * 1024; // 256 KB: better throughput on fast LANs
 pub const MAX_NAME_LEN: usize = 512;
 
 #[repr(u8)]
