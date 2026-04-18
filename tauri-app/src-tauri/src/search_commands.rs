@@ -15,9 +15,10 @@ use std::{
 use tauri::{AppHandle, Emitter, State};
 
 const MAX_RESULTS: usize = 2000;
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
+const MMAP_THRESHOLD: u64 = 32 * 1024;       // use mmap above 32 KB
 const MAX_LINE_LEN: usize = 512;
-const BINARY_CHECK_LEN: usize = 1024;
+const BINARY_CHECK_LEN: usize = 8 * 1024;    // check first 8 KB for binary
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -169,7 +170,11 @@ pub fn cancel_search(state: State<'_, SearchState>) {
 fn search_filename(path: &Path, re: &regex::Regex) -> Option<FileResult> {
     let name = path.file_name()?.to_string_lossy();
     let ranges: Vec<(usize, usize)> = re.find_iter(name.as_ref())
-        .map(|m| (m.start(), m.end()))
+        .map(|m| {
+            let start = name[..m.start()].chars().count();
+            let end   = start + name[m.start()..m.end()].chars().count();
+            (start, end)
+        })
         .collect();
     if ranges.is_empty() { return None; }
     let display = normalize_path(path);
@@ -184,28 +189,31 @@ fn search_file(path: &Path, re: &regex::Regex) -> anyhow::Result<Option<FileResu
     let len = std::fs::metadata(path)?.len();
     if len == 0 || len > MAX_FILE_SIZE { return Ok(None); }
 
-    // Use mmap for large files, direct read for small ones
-    let content = if len < 4096 {
-        let bytes = std::fs::read(path)?;
-        if is_binary(&bytes) { return Ok(None); }
-        decode_bytes(&bytes)
-    } else {
+    // Use mmap above threshold, direct read for small files.
+    let content = if len >= MMAP_THRESHOLD {
         let mmap = unsafe { Mmap::map(&File::open(path)?)? };
         if is_binary(&mmap) { return Ok(None); }
         decode_bytes(&mmap)
+    } else {
+        let bytes = std::fs::read(path)?;
+        if is_binary(&bytes) { return Ok(None); }
+        decode_bytes(&bytes)
     };
 
-    let matches: Vec<MatchLine> = content.lines().enumerate()
-        .filter_map(|(i, line)| {
-            let ranges: Vec<_> = re.find_iter(line)
-                .map(|m| (m.start(), m.end()))
-                .collect();
-            if ranges.is_empty() { return None; }
-            // Truncate long lines at a char boundary
-            let line = truncate_line(line);
-            Some(MatchLine { line_num: i + 1, line, ranges })
-        })
-        .collect();
+    // Stream lines without collecting into a Vec first.
+    let mut matches: Vec<MatchLine> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        // Compute ranges in char units so frontend highlights correctly for Unicode.
+        let ranges: Vec<_> = re.find_iter(line)
+            .map(|m| {
+                let start = line[..m.start()].chars().count();
+                let end   = start + line[m.start()..m.end()].chars().count();
+                (start, end)
+            })
+            .collect();
+        if ranges.is_empty() { continue; }
+        matches.push(MatchLine { line_num: i + 1, line: truncate_line(line), ranges });
+    }
 
     if matches.is_empty() { return Ok(None); }
     let display = normalize_path(path);

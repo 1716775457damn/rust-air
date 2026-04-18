@@ -45,7 +45,7 @@ const myPort      = ref(0);
 
 // Search
 const searchPattern    = ref("");
-const searchPath       = ref("C:/");
+const searchPath       = ref(localStorage.getItem('searchPath') || "C:/");
 const searchMode       = ref<"filename"|"text">("filename");
 const searchIgnoreCase = ref(true);
 const searchFixed      = ref(false);
@@ -123,6 +123,9 @@ onMounted(async () => {
       savedPath.value = e.payload ?? "";
       recvHistory.value.unshift({ peer: recvPeer.value, path: savedPath.value, bytes: recvProgress.value.bytes_done });
       recvPhase.value = "done";
+      // System notification
+      const filename = savedPath.value.split(/[\/\\]/).pop() ?? savedPath.value;
+      new Notification("rust-air — 文件已接收", { body: filename, silent: false }).onclick = () => {};
     }),
     await listen<string>("recv-error", (e) => { recvError.value = e.payload; recvPhase.value = "error"; }),
 
@@ -217,9 +220,9 @@ function resetRecv() {
 
 async function startScan() {
   scanning.value = true;
-  devices.value = [];
+  // Don't clear existing devices during rescan — avoids flicker.
   await invoke("scan_devices");
-  setTimeout(() => { scanning.value = false; }, 5000);
+  setTimeout(() => { scanning.value = false; }, 8000);
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
@@ -240,7 +243,10 @@ async function stopSearch() {
 }
 async function pickSearchPath() {
   const r = await open({ multiple: false, directory: true });
-  if (r) searchPath.value = r as string;
+  if (r) {
+    searchPath.value = r as string;
+    localStorage.setItem('searchPath', searchPath.value);
+  }
 }
 
 // ── Sync ──────────────────────────────────────────────────────────────────────
@@ -287,6 +293,21 @@ function fmtBytes(n: number) {
 }
 function shortName(fullname: string) {
   return fullname.split(".")[0] ?? fullname;
+}
+
+/** Split a line into plain/highlighted segments for rendering.
+ *  ranges are char-unit [start, end) pairs from the backend. */
+function highlightSegments(line: string, ranges: [number,number][]) {
+  const chars = [...line];
+  const out: { text: string; hl: boolean }[] = [];
+  let pos = 0;
+  for (const [s, e] of ranges) {
+    if (s > pos) out.push({ text: chars.slice(pos, s).join(''), hl: false });
+    out.push({ text: chars.slice(s, e).join(''), hl: true });
+    pos = e;
+  }
+  if (pos < chars.length) out.push({ text: chars.slice(pos).join(''), hl: false });
+  return out;
 }
 </script>
 
@@ -523,10 +544,21 @@ function shortName(fullname: string) {
                   <span class="text-xs text-cyan-300 font-mono truncate flex-1">{{ r.path }}</span>
                   <span class="text-xs text-gray-600">{{ r.matches.length }} 处</span>
                 </div>
-                <div v-if="searchMode === 'text'" class="space-y-0.5 mt-1">
+                <!-- filename mode: highlight matched chars in filename -->
+                <div v-if="searchMode === 'filename'" class="font-mono text-xs mt-0.5">
+                  <template v-for="seg in highlightSegments(r.matches[0].line, r.matches[0].ranges)" :key="seg.text">
+                    <span :class="seg.hl ? 'bg-yellow-400/30 text-yellow-200 rounded px-0.5' : 'text-gray-400'">{{ seg.text }}</span>
+                  </template>
+                </div>
+                <!-- text mode: show matching lines with highlights -->
+                <div v-else class="space-y-0.5 mt-1">
                   <div v-for="(m, mi) in r.matches.slice(0, 5)" :key="mi" class="flex gap-2 font-mono text-xs">
                     <span class="text-green-500 w-8 text-right flex-shrink-0">{{ m.line_num }}:</span>
-                    <span class="text-gray-300 truncate">{{ m.line }}</span>
+                    <span class="truncate">
+                      <template v-for="seg in highlightSegments(m.line, m.ranges)" :key="seg.text">
+                        <span :class="seg.hl ? 'bg-yellow-400/30 text-yellow-200 rounded px-0.5' : 'text-gray-300'">{{ seg.text }}</span>
+                      </template>
+                    </span>
                   </div>
                   <div v-if="r.matches.length > 5" class="text-xs text-gray-600 pl-10">…另外 {{ r.matches.length - 5 }} 处</div>
                 </div>
