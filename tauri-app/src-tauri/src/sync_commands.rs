@@ -7,7 +7,7 @@ use rust_air_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
 };
 use tauri::{AppHandle, Emitter, State};
@@ -19,7 +19,7 @@ pub struct SyncState {
     config:  Mutex<SyncConfig>,
     /// Drop to stop the watcher
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
-    running: Mutex<bool>,
+    running: Arc<Mutex<bool>>,
 }
 
 impl SyncState {
@@ -29,7 +29,7 @@ impl SyncState {
             store:   Mutex::new(SyncStore::load()),
             config:  Mutex::new(config),
             watcher: Mutex::new(None),
-            running: Mutex::new(false),
+            running: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -108,22 +108,20 @@ pub async fn start_sync(state: State<'_, SyncState>, app: AppHandle) -> Result<(
         }
     });
 
-    // Run sync in blocking thread
-    let tx2 = tx.clone();
+    // Run sync in blocking thread; reset running flag when done regardless of frontend state.
+    let tx2      = tx.clone();
     let excludes = config.excludes.clone();
     let delete   = config.delete_removed;
     let app2     = app.clone();
+    let running  = Arc::clone(&state.running);
 
     thread::spawn(move || {
         full_sync(&src, &dst, &mut store, delete, &excludes, &tx2);
         store.flush_now();
         drop(tx2);
+        *running.lock().unwrap_or_else(|e| e.into_inner()) = false;
         app2.emit("sync-done", ()).ok();
     });
-
-    // Mark not-running after done event (frontend handles this via sync-event Done)
-    let running_flag = state.running.lock().unwrap_or_else(|e| e.into_inner());
-    drop(running_flag); // will be reset by stop_sync or on Done
 
     Ok(())
 }

@@ -103,7 +103,7 @@ pub fn start_search(
         let mut total = 0usize;
 
         let walker = WalkBuilder::new(&path)
-            .hidden(true)
+            .hidden(false)   // skip hidden files/dirs (e.g. .git internals)
             .git_ignore(false)
             .ignore(false)
             .filter_entry(|e| {
@@ -215,12 +215,12 @@ fn search_file(path: &Path, re: &regex::Regex) -> anyhow::Result<Option<FileResu
         let mmap = unsafe { Mmap::map(&File::open(path)?)? };
         if is_binary(&mmap) { return Ok(None); }
         let content = decode_bytes(&mmap);
-        return Ok(collect_matches(&content, re, &display));
+        Ok(collect_matches(&content, re, &display))
     } else {
         let bytes = std::fs::read(path)?;
         if is_binary(&bytes) { return Ok(None); }
         let content = decode_bytes(&bytes);
-        return Ok(collect_matches(&content, re, &display));
+        Ok(collect_matches(&content, re, &display))
     }
 }
 
