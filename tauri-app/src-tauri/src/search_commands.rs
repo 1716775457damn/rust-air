@@ -96,7 +96,7 @@ pub fn start_search(
     state.set_cancel(cancelled.clone());
 
     let is_text = mode == "text";
-    let threads = num_cpus::get();
+    let threads = num_cpus::get().min(8); // cap at 8 to avoid thrashing on large machines
 
     thread::spawn(move || {
         let start = std::time::Instant::now();
@@ -106,6 +106,14 @@ pub fn start_search(
             .hidden(true)
             .git_ignore(false)
             .ignore(false)
+            .filter_entry(|e| {
+                // Skip known large/irrelevant directories early.
+                let name = e.file_name().to_string_lossy();
+                !matches!(name.as_ref(),
+                    "node_modules" | ".git" | ".svn" | "target" |
+                    ".cache" | "__pycache__" | ".next" | "dist" | "build"
+                )
+            })
             .threads(threads)
             .build_parallel();
 
@@ -138,13 +146,22 @@ pub fn start_search(
                 ignore::WalkState::Continue
             })
         });
-        drop(tx); // close sender so rx.recv() returns Err when done
+        drop(tx);
 
+        // Batch results: emit up to 50 at a time to reduce IPC round-trips.
+        let mut batch: Vec<FileResult> = Vec::with_capacity(50);
         while let Ok(r) = rx.recv() {
             if cancelled.load(Ordering::Relaxed) { break; }
             total += 1;
-            let _ = app.emit("search-result", SearchEvent::Result(r));
+            batch.push(r);
+            if batch.len() >= 50 || total >= MAX_RESULTS {
+                let _ = app.emit("search-batch", &batch);
+                batch.clear();
+            }
             if total >= MAX_RESULTS { break; }
+        }
+        if !batch.is_empty() {
+            let _ = app.emit("search-batch", &batch);
         }
 
         if !cancelled.load(Ordering::Relaxed) {
@@ -200,10 +217,10 @@ fn search_file(path: &Path, re: &regex::Regex) -> anyhow::Result<Option<FileResu
         decode_bytes(&bytes)
     };
 
-    // Stream lines without collecting into a Vec first.
+    // Stream lines; stop early once we have enough matches per file.
+    const MAX_MATCHES_PER_FILE: usize = 100;
     let mut matches: Vec<MatchLine> = Vec::new();
     for (i, line) in content.lines().enumerate() {
-        // Compute ranges in char units so frontend highlights correctly for Unicode.
         let ranges: Vec<_> = re.find_iter(line)
             .map(|m| {
                 let start = line[..m.start()].chars().count();
@@ -213,6 +230,7 @@ fn search_file(path: &Path, re: &regex::Regex) -> anyhow::Result<Option<FileResu
             .collect();
         if ranges.is_empty() { continue; }
         matches.push(MatchLine { line_num: i + 1, line: truncate_line(line), ranges });
+        if matches.len() >= MAX_MATCHES_PER_FILE { break; }
     }
 
     if matches.is_empty() { return Ok(None); }

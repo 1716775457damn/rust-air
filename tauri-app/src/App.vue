@@ -89,6 +89,8 @@ const peersOnly = computed(() =>
   devices.value.filter(d => d.addr && !d.addr.startsWith(primaryIp.value + ":"))
 );
 
+const selectedName = computed(() => selectedPath.value.split(/[\/\\]/).pop() ?? selectedPath.value);
+
 const filteredResults = computed(() => {
   const q = searchFilter.value.trim().toLowerCase();
   return q ? searchResults.value.filter(r => r.path.toLowerCase().includes(q)) : searchResults.value;
@@ -156,12 +158,13 @@ onMounted(async () => {
     }),
 
     // Search events
+    await listen<FileResult[]>("search-batch", (e) => {
+      for (const r of e.payload) searchResults.value.push(r);
+      searchStatus.value = `搜索中… 已找到 ${searchResults.value.length} 个`;
+    }),
     await listen<SearchEvent>("search-result", (e) => {
       const ev = e.payload;
-      if (ev.kind === "Result") {
-        searchResults.value.push({ path: ev.path!, icon: ev.icon!, matches: ev.matches! });
-        searchStatus.value = `搜索中… 已找到 ${searchResults.value.length} 个`;
-      } else if (ev.kind === "Done") {
+      if (ev.kind === "Done") {
         searchRunning.value = false;
         searchStatus.value = searchResults.value.length === 0
           ? `未找到结果 (${ev.ms}ms)` : `找到 ${ev.total} 个文件 (${ev.ms}ms)`;
@@ -390,7 +393,10 @@ function highlightSegments(line: string, ranges: [number,number][]) {
             </div>
             <div v-else-if="sendPhase === 'done'" class="bg-green-900/20 rounded-xl p-3 ring-1 ring-green-500/20 flex items-center gap-3 flex-shrink-0">
               <span class="text-2xl">✅</span>
-              <span class="text-green-300 text-sm">发送完成！{{ fmtBytes(sendProgress.bytes_done) }}</span>
+              <div class="flex-1 min-w-0">
+                <span class="text-green-300 text-sm">发送完成！{{ fmtBytes(sendProgress.bytes_done) }}</span>
+                <p class="text-xs text-gray-500 truncate">{{ selectedName }}</p>
+              </div>
               <button @click="resetSend" class="ml-auto text-xs text-gray-500 hover:text-gray-300">关闭</button>
             </div>
             <div v-else-if="sendPhase === 'error'" class="bg-red-900/20 rounded-xl p-3 ring-1 ring-red-500/20 flex items-center gap-3 flex-shrink-0">
