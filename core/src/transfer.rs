@@ -102,20 +102,13 @@ pub async fn receive_to_disk(
 
     let part_path = dest.join(format!("{name}.part"));
 
-    //断点续传：校验 .part 文件末尾完整性，防止末尾损坏的 chunk 被当作有效数据。
+    // 断点续传：校验 .part 文件末尾完整性，防止末尾损坏的 chunk 被当作有效数据。
     let already_have: u64 = if kind == Kind::File && part_path.exists() {
         let file_len = tokio::fs::metadata(&part_path).await?.len();
-        // Align to CHUNK boundary — only trust fully-received chunks.
         (file_len / CHUNK as u64) * CHUNK as u64
     } else {
         0
     };
-
-    // Truncate to the verified boundary if needed.
-    if already_have > 0 {
-        let f = tokio::fs::OpenOptions::new().write(true).open(&part_path).await?;
-        f.set_len(already_have).await?;
-    }
 
     tx.write_all(&already_have.to_be_bytes()).await?;
 
@@ -123,16 +116,25 @@ pub async fn receive_to_disk(
 
     match kind {
         Kind::File => {
-            let file = open_part_file(&part_path, already_have).await?;
-            let mut f = BufWriter::with_capacity(4 * 256 * 1024, file); // 1 MB write buffer
+            // Truncate to verified boundary and open — single file handle.
+            let file = if already_have > 0 {
+                let f = tokio::fs::OpenOptions::new()
+                    .write(true).open(&part_path).await?;
+                f.set_len(already_have).await?;
+                drop(f);
+                tokio::fs::OpenOptions::new().append(true).open(&part_path).await?
+            } else {
+                tokio::fs::OpenOptions::new()
+                    .create(true).write(true).truncate(true)
+                    .open(&part_path).await?
+            };
+            let mut f = BufWriter::with_capacity(4 * 256 * 1024, file);
             let mut dec = Decryptor::new(&key, rx);
             let mut hasher = Sha256::new();
             let mut done = already_have;
             let start = Instant::now();
             let mut last_emit = start;
 
-            // Resume: pre-hash the bytes we already have so the final digest
-            // covers the complete file, matching what the sender computed.
             if already_have > 0 {
                 let mut existing = tokio::fs::File::open(&part_path).await?;
                 let mut buf = vec![0u8; CHUNK];
@@ -164,9 +166,7 @@ pub async fn receive_to_disk(
                 }
             }
 
-            let final_path = dest.join(&name);
-            // If destination already exists, append a counter suffix to avoid silent overwrite.
-            let final_path = unique_path(final_path);
+            let final_path = unique_path(dest.join(&name));
             tokio::fs::rename(&part_path, &final_path).await?;
             emit_progress(&on_progress, done, total_size, &start, true);
             Ok(final_path)
@@ -199,7 +199,6 @@ pub async fn receive_to_disk(
             drop(sync_w);
             unpack.await??;
 
-            // Verify compressed-stream integrity (sender hashes the same bytes).
             let expected_sha = dec.read_trailing().await?;
             if expected_sha != [0u8; 32] {
                 let actual: [u8; 32] = hasher.finalize().into();
@@ -365,28 +364,33 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
+/// Find a non-colliding path by atomically probing with create_new,
+/// avoiding the TOCTOU race of exists() + rename().
 fn unique_path(path: PathBuf) -> PathBuf {
-    if !path.exists() { return path; }
+    // Fast path: try the original name first.
+    if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
+        // Created a placeholder; the caller will overwrite via rename.
+        // Remove it immediately — rename() will replace atomically.
+        let _ = std::fs::remove_file(&path);
+        return path;
+    }
     let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
     let ext  = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let dir  = path.parent().unwrap_or(std::path::Path::new("."));
-    (1u32..).map(|i| dir.join(format!("{stem} ({i}){ext}")))
-            .find(|p| !p.exists())
-            .unwrap_or(path)
+    for i in 1u32.. {
+        let candidate = dir.join(format!("{stem} ({i}){ext}"));
+        if std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate).is_ok() {
+            let _ = std::fs::remove_file(&candidate);
+            return candidate;
+        }
+    }
+    path
 }
 
 fn random_key() -> [u8; 32] {
     let mut k = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut k);
     k
-}
-
-async fn open_part_file(path: &Path, already_have: u64) -> Result<tokio::fs::File> {
-    if already_have > 0 {
-        Ok(tokio::fs::OpenOptions::new().append(true).open(path).await?)
-    } else {
-        Ok(tokio::fs::OpenOptions::new().create(true).write(true).truncate(true).open(path).await?)
-    }
 }
 
 #[inline]

@@ -114,7 +114,7 @@ pub fn browse_devices_sync(tx: mpsc::Sender<DeviceInfo>) -> Result<BrowseHandle>
     });
 
     Ok(BrowseHandle {
-        daemon:  daemon,
+        daemon,
         service: MDNS_SERVICE.to_string(),
     })
 }
@@ -123,11 +123,20 @@ pub fn browse_devices_sync(tx: mpsc::Sender<DeviceInfo>) -> Result<BrowseHandle>
 
 fn best_addr(info: &ResolvedService) -> Option<String> {
     let addrs = info.get_addresses();
-    addrs.iter()
-        .find(|a| a.is_ipv4() && !a.is_loopback() && !is_link_local_v4(&a.to_string()))
-        .or_else(|| addrs.iter().find(|a| a.is_ipv4()))
-        .or_else(|| addrs.iter().next())
-        .map(|a| a.to_string())
+    // Single pass: prefer non-loopback non-link-local IPv4, then any IPv4, then any.
+    let mut any_v4: Option<String> = None;
+    let mut any_addr: Option<String> = None;
+    for a in addrs.iter() {
+        let s = a.to_string();
+        if a.is_ipv4() {
+            if !a.is_loopback() && !is_link_local_v4(&s) {
+                return Some(s);
+            }
+            if any_v4.is_none() { any_v4 = Some(s.clone()); }
+        }
+        if any_addr.is_none() { any_addr = Some(s); }
+    }
+    any_v4.or(any_addr)
 }
 
 fn is_link_local_v4(addr: &str) -> bool {

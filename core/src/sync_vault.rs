@@ -297,7 +297,7 @@ fn scan_needed(
     // Candidates that passed the size+mtime fast-path and need hashing.
     let mut need_hash: Vec<(String, PathBuf, u64)> = Vec::new();
 
-    for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(src).follow_links(false).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() { continue; }
         let abs = entry.path();
         let rel = match abs.strip_prefix(src) {
@@ -386,7 +386,7 @@ fn atomic_copy(
 
 struct ExcludeSet {
     exact: HashSet<String>,
-    exts:  Vec<String>,
+    exts:  HashSet<String>,
 }
 
 impl ExcludeSet {
@@ -398,13 +398,12 @@ impl ExcludeSet {
     }
     fn matches(&self, rel: &str) -> bool {
         rel.split('/').any(|seg| {
-            self.exact.contains(seg)
-                || self.exts.iter().any(|ext| {
-                    // seg must be at least "x.ext" — length >= ext.len() + 2
-                    seg.len() >= ext.len() + 2
-                        && seg.as_bytes()[seg.len() - ext.len() - 1] == b'.'
-                        && seg.ends_with(ext.as_str())
-                })
+            if self.exact.contains(seg) { return true; }
+            // Extract extension from segment and check the set.
+            if let Some(dot) = seg.rfind('.') {
+                if dot > 0 { return self.exts.contains(&seg[dot + 1..]); }
+            }
+            false
         })
     }
 }
