@@ -53,6 +53,7 @@ pub fn unpack_archive_sync(reader: impl std::io::Read, dest: &Path) -> Result<()
 /// Caches metadata alongside each entry to avoid re-reading it in compress_entries.
 pub fn walk_dir(path: &Path) -> (u64, Vec<(walkdir::DirEntry, std::fs::Metadata)>) {
     let entries: Vec<_> = WalkDir::new(path)
+        .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter_map(|e| e.metadata().ok().map(|m| (e, m)))

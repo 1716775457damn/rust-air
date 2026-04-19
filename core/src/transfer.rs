@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use std::{path::{Path, PathBuf}, sync::Arc, time::Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
-use walkdir;
+use walkdir::DirEntry as WalkDirEntry;
 
 // ── Send ──────────────────────────────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ pub async fn send_path(
     let kind = if is_dir { Kind::Archive } else { Kind::File };
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let total_size: u64;
-    let dir_entries: Option<Vec<(walkdir::DirEntry, std::fs::Metadata)>>;
+    let dir_entries: Option<Vec<(WalkDirEntry, std::fs::Metadata)>>;
     if is_dir {
         let (sz, entries) = archive::walk_dir(path);
         total_size = sz;
@@ -344,17 +344,16 @@ pub async fn send_clipboard(
 
     let mut enc = Encryptor::new(&key, tx);
     let on_progress = Arc::new(on_progress);
-    let checksum = {
-        let mut hasher = Sha256::new();
-        let start = Instant::now();
-        for chunk in data.chunks(CHUNK) {
-            hasher.update(chunk);
-            enc.write_chunk(chunk).await?;
-            emit_progress(&on_progress, chunk.len() as u64, total_size, &start, false);
-        }
-        let digest: [u8; 32] = hasher.finalize().into();
-        digest
-    };
+    let mut hasher = Sha256::new();
+    let mut done = 0u64;
+    let start = Instant::now();
+    for chunk in data.chunks(CHUNK) {
+        hasher.update(chunk);
+        enc.write_chunk(chunk).await?;
+        done += chunk.len() as u64;
+        emit_progress(&on_progress, done, total_size, &start, false);
+    }
+    let checksum: [u8; 32] = hasher.finalize().into();
     enc.shutdown().await?;
     enc.write_trailing(&checksum).await?;
     Ok(())

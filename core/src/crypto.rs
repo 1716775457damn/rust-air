@@ -30,7 +30,6 @@ pub struct Encryptor<W> {
 
 impl<W: AsyncWrite + Unpin> Encryptor<W> {
     pub fn new(key: &[u8; 32], inner: W) -> Self {
-        use crate::proto::CHUNK;
         Self {
             cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
             inner,

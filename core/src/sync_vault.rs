@@ -259,13 +259,11 @@ pub fn start_watcher(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn hash_file(path: &Path) -> anyhow::Result<String> {
-    use std::io::BufReader;
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut file = std::fs::File::open(path)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = file.read(&mut buf)?;
         if n == 0 { break; }
         h.update(&buf[..n]);
     }
