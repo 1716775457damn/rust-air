@@ -297,32 +297,32 @@ fn decode_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
 
 fn file_icon(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("");
-    if ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("msi") { return "\u2699"; }
+    if ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("msi") { return "⚙"; }
     if ext.eq_ignore_ascii_case("rs")   || ext.eq_ignore_ascii_case("py")
     || ext.eq_ignore_ascii_case("js")   || ext.eq_ignore_ascii_case("ts")
     || ext.eq_ignore_ascii_case("go")   || ext.eq_ignore_ascii_case("c")
     || ext.eq_ignore_ascii_case("cpp")  || ext.eq_ignore_ascii_case("java")
     || ext.eq_ignore_ascii_case("cs")   || ext.eq_ignore_ascii_case("rb")
-    || ext.eq_ignore_ascii_case("swift")                                   { return "\u{1F4DD}"; }
+    || ext.eq_ignore_ascii_case("swift")                                   { return "📝"; }
     if ext.eq_ignore_ascii_case("toml") || ext.eq_ignore_ascii_case("json")
     || ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
     || ext.eq_ignore_ascii_case("xml")  || ext.eq_ignore_ascii_case("ini")
-    || ext.eq_ignore_ascii_case("cfg")  || ext.eq_ignore_ascii_case("env") { return "\u{1F527}"; }
+    || ext.eq_ignore_ascii_case("cfg")  || ext.eq_ignore_ascii_case("env") { return "🔧"; }
     if ext.eq_ignore_ascii_case("md")   || ext.eq_ignore_ascii_case("txt")
-    || ext.eq_ignore_ascii_case("log")                                     { return "\u{1F4C4}"; }
+    || ext.eq_ignore_ascii_case("log")                                     { return "📄"; }
     if ext.eq_ignore_ascii_case("png")  || ext.eq_ignore_ascii_case("jpg")
     || ext.eq_ignore_ascii_case("jpeg") || ext.eq_ignore_ascii_case("gif")
     || ext.eq_ignore_ascii_case("svg")  || ext.eq_ignore_ascii_case("ico")
-    || ext.eq_ignore_ascii_case("bmp")  || ext.eq_ignore_ascii_case("webp"){ return "\u{1F5BC}"; }
+    || ext.eq_ignore_ascii_case("bmp")  || ext.eq_ignore_ascii_case("webp"){ return "🖼"; }
     if ext.eq_ignore_ascii_case("mp4")  || ext.eq_ignore_ascii_case("mkv")
-    || ext.eq_ignore_ascii_case("avi")  || ext.eq_ignore_ascii_case("mov") { return "\u{1F3AC}"; }
+    || ext.eq_ignore_ascii_case("avi")  || ext.eq_ignore_ascii_case("mov") { return "🎬"; }
     if ext.eq_ignore_ascii_case("mp3")  || ext.eq_ignore_ascii_case("wav")
-    || ext.eq_ignore_ascii_case("flac") || ext.eq_ignore_ascii_case("ogg") { return "\u{1F3B5}"; }
+    || ext.eq_ignore_ascii_case("flac") || ext.eq_ignore_ascii_case("ogg") { return "🎵"; }
     if ext.eq_ignore_ascii_case("zip")  || ext.eq_ignore_ascii_case("rar")
     || ext.eq_ignore_ascii_case("7z")   || ext.eq_ignore_ascii_case("tar")
-    || ext.eq_ignore_ascii_case("gz")   || ext.eq_ignore_ascii_case("xz")  { return "\u{1F4E6}"; }
-    if ext.eq_ignore_ascii_case("pdf")                                     { return "\u{1F4D5}"; }
+    || ext.eq_ignore_ascii_case("gz")   || ext.eq_ignore_ascii_case("xz")  { return "📦"; }
+    if ext.eq_ignore_ascii_case("pdf")                                     { return "📕"; }
     if ext.eq_ignore_ascii_case("db")   || ext.eq_ignore_ascii_case("sqlite")
-    || ext.eq_ignore_ascii_case("sql")                                     { return "\u{1F5C4}"; }
-    "\u{1F4C4}"
+    || ext.eq_ignore_ascii_case("sql")                                     { return "🗄"; }
+    "📄"
 }
