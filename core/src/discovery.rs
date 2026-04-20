@@ -1,11 +1,20 @@
-//! mDNS-SD peer discovery — v4.
+//! mDNS-SD peer discovery — v5.
 //!
-//! CRITICAL: On Windows, only ONE ServiceDaemon can own the UDP 5353 multicast
-//! socket at a time. Using two daemons (one for register, one for browse) causes
-//! the second daemon to silently fail to send multicast packets, making this
-//! device invisible to others on the LAN.
+//! Architecture:
+//!   - REGISTER daemon: a long-lived singleton used exclusively for
+//!     `register_self`. Stays alive for the entire app lifetime so our
+//!     mDNS advertisement is never interrupted.
 //!
-//! Solution: a single shared daemon for both registration and browsing.
+//!   - BROWSE daemon: a fresh `ServiceDaemon` created per scan and
+//!     shutdown when the `BrowseHandle` is dropped. Completely isolated
+//!     from the register daemon so stopping a scan never affects our own
+//!     advertisement.
+//!
+//! Why two daemons instead of one?
+//!   On Windows a single daemon CAN do both, but `stop_browse` on the
+//!   shared daemon was silently clearing internal browse state and making
+//!   subsequent scans return zero results. Separating concerns is simpler
+//!   and more robust.
 
 use crate::proto::{DeviceInfo, DeviceStatus, MDNS_SERVICE};
 use anyhow::Result;
@@ -13,12 +22,12 @@ use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-// ── Shared daemon singleton ───────────────────────────────────────────────────
+// ── Register daemon singleton (never stopped) ─────────────────────────────────
 
-static SHARED_DAEMON: Mutex<Option<Arc<ServiceDaemon>>> = Mutex::new(None);
+static REG_DAEMON: Mutex<Option<Arc<ServiceDaemon>>> = Mutex::new(None);
 
-fn shared_daemon() -> Result<Arc<ServiceDaemon>> {
-    let mut guard = SHARED_DAEMON.lock().unwrap();
+fn reg_daemon() -> Result<Arc<ServiceDaemon>> {
+    let mut guard = REG_DAEMON.lock().unwrap();
     if let Some(ref d) = *guard {
         return Ok(d.clone());
     }
@@ -35,7 +44,7 @@ pub struct ServiceHandle {
 
 impl Drop for ServiceHandle {
     fn drop(&mut self) {
-        if let Ok(d) = shared_daemon() {
+        if let Ok(d) = reg_daemon() {
             let _ = d.unregister(&self.fullname);
         }
     }
@@ -43,7 +52,7 @@ impl Drop for ServiceHandle {
 
 /// Register this device on the LAN so others can discover and connect to it.
 pub fn register_self(port: u16, device_name: &str) -> Result<ServiceHandle> {
-    let daemon   = shared_daemon()?;
+    let daemon   = reg_daemon()?;
     let hostname = safe_hostname();
     let local_ip = local_lan_ip().unwrap_or_default();
 
@@ -67,21 +76,27 @@ pub fn register_self(port: u16, device_name: &str) -> Result<ServiceHandle> {
 
 // ── Device browsing ───────────────────────────────────────────────────────────
 
+/// Owns the per-scan daemon. Dropping this stops the browse and shuts down
+/// the temporary daemon — the register daemon is completely unaffected.
 pub struct BrowseHandle {
-    daemon:  Arc<ServiceDaemon>,
-    service: String,
+    // Keep the daemon alive until the handle is dropped.
+    _daemon: Arc<ServiceDaemon>,
 }
 
 impl Drop for BrowseHandle {
     fn drop(&mut self) {
-        let _ = self.daemon.stop_browse(&self.service);
+        // stop_browse on the *browse* daemon only — register daemon untouched.
+        let _ = self._daemon.stop_browse(MDNS_SERVICE);
+        // Arc refcount drops to zero here → daemon shuts down.
     }
 }
 
-/// Browse the LAN using the shared daemon.
-/// Returns a `BrowseHandle` — drop it to stop browsing.
+/// Browse the LAN using a **fresh, dedicated daemon** (never shared with
+/// registration). Returns a `BrowseHandle` — drop it to stop browsing.
 pub fn browse_devices_sync(tx: mpsc::Sender<DeviceInfo>) -> Result<BrowseHandle> {
-    let daemon = shared_daemon()?;
+    // Always create a new daemon for browsing so stop_browse never touches
+    // the registration daemon.
+    let daemon = Arc::new(ServiceDaemon::new()?);
     let receiver = daemon.browse(MDNS_SERVICE)?;
 
     std::thread::spawn(move || {
@@ -113,10 +128,7 @@ pub fn browse_devices_sync(tx: mpsc::Sender<DeviceInfo>) -> Result<BrowseHandle>
         }
     });
 
-    Ok(BrowseHandle {
-        daemon,
-        service: MDNS_SERVICE.to_string(),
-    })
+    Ok(BrowseHandle { _daemon: daemon })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
