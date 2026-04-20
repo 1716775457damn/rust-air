@@ -118,12 +118,12 @@ const filteredResults = computed(() => {
   return q ? searchResults.value.filter(r => r.path.toLowerCase().includes(q)) : searchResults.value;
 });
 
-// Highlight cache
-const hlCache = new Map<string, { text: string; hl: boolean }[][]>();
+// Highlight cache: key → segments array (flat, no extra nesting)
+const hlCache = new Map<string, { text: string; hl: boolean }[]>();
 function cachedHighlight(path: string, lineNum: number, line: string, ranges: [number,number][]) {
   const key = `${path}:${lineNum}`;
-  if (!hlCache.has(key)) hlCache.set(key, [highlightSegments(line, ranges)]);
-  return hlCache.get(key)![0];
+  if (!hlCache.has(key)) hlCache.set(key, highlightSegments(line, ranges));
+  return hlCache.get(key)!;
 }
 watch(searchResults, () => hlCache.clear());
 
@@ -351,11 +351,17 @@ function fmtBytes(n: number) {
 function shortName(fullname: string) {
   return fullname.split(".")[0] ?? fullname;
 }
+// lastSeen ticker: update every 10 s so relative timestamps stay fresh
+const now = ref(Date.now());
+let _nowTimer: ReturnType<typeof setInterval>;
+onMounted(() => { _nowTimer = setInterval(() => { now.value = Date.now(); }, 10_000); });
+onUnmounted(() => clearInterval(_nowTimer));
+
 function fmtLastSeen(ts?: number): string {
   if (!ts) return "";
-  const secs = Math.floor((Date.now() - ts) / 1000);
-  if (secs < 10)  return "刚刚";
-  if (secs < 60)  return `${secs}s 前`;
+  const secs = Math.floor((now.value - ts) / 1000);
+  if (secs < 10)   return "刚刚";
+  if (secs < 60)   return `${secs}s 前`;
   if (secs < 3600) return `${Math.floor(secs/60)}m 前`;
   return `${Math.floor(secs/3600)}h 前`;
 }

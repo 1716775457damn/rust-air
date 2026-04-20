@@ -156,24 +156,33 @@ fn best_addr(info: &ResolvedService) -> Option<String> {
 fn is_link_local_v4(addr: &str) -> bool { addr.starts_with("169.254.") }
 
 /// Return all non-loopback, non-link-local IPv4 addresses on this machine.
-/// Falls back to the routing-trick result, then to 127.0.0.1 as last resort.
+/// Uses multiple UDP routing-trick targets to discover addresses on different
+/// interfaces (e.g. Wi-Fi + Ethernet simultaneously active).
 pub fn lan_ipv4_addrs() -> Vec<String> {
+    // Probe several well-known destinations to trigger routing decisions
+    // on each active interface. No packets are actually sent.
+    const PROBES: &[&str] = &[
+        "8.8.8.8:80",
+        "1.1.1.1:80",
+        "192.168.1.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+    ];
+
+    let mut seen = std::collections::HashSet::new();
     let mut addrs: Vec<String> = Vec::new();
 
-    // Primary method: enumerate network interfaces via std
-    if let Ok(ifaces) = get_if_addrs() {
-        for ip in ifaces {
-            let s = ip.to_string();
-            if !s.starts_with("127.") && !s.starts_with("169.254.") {
-                addrs.push(s);
+    for probe in PROBES {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect(probe).is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    let ip = local.ip();
+                    let s  = ip.to_string();
+                    if !s.starts_with("127.") && !s.starts_with("169.254.") && seen.insert(s.clone()) {
+                        addrs.push(s);
+                    }
+                }
             }
-        }
-    }
-
-    // Fallback: routing trick (no packet sent)
-    if addrs.is_empty() {
-        if let Some(ip) = routing_trick_ip() {
-            addrs.push(ip);
         }
     }
 
@@ -195,46 +204,6 @@ fn routing_trick_ip() -> Option<String> {
     }
 }
 
-/// Enumerate IPv4 addresses using std::net (no external crate needed).
-fn get_if_addrs() -> Result<Vec<IpAddr>> {
-    // Use a UDP connect trick per interface — not ideal but avoids adding
-    // the `if-addrs` crate. Instead we parse the output of the OS.
-    // Actually: use the approach of binding to 0.0.0.0 and checking all
-    // local addresses via a platform call.
-    //
-    // Simplest cross-platform approach without extra deps:
-    // resolve the machine's own hostname to get all its IPs.
-    let hostname = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "localhost".to_string());
-
-    let mut result = Vec::new();
-
-    // Try hostname resolution first
-    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
-        &format!("{}:0", hostname).as_str()
-    ) {
-        for sa in addrs {
-            if let IpAddr::V4(v4) = sa.ip() {
-                if !v4.is_loopback() && !v4.is_link_local() {
-                    result.push(IpAddr::V4(v4));
-                }
-            }
-        }
-    }
-
-    // Also try "localhost" resolution to catch any missed addresses
-    // and the routing trick as a guaranteed single result
-    if result.is_empty() {
-        if let Some(ip) = routing_trick_ip() {
-            if let Ok(parsed) = ip.parse::<IpAddr>() {
-                result.push(parsed);
-            }
-        }
-    }
-
-    Ok(result)
-}
 
 /// A 4-hex-char suffix unique to this machine, derived from its primary IP.
 /// Ensures two machines with the same hostname don't collide on mDNS.

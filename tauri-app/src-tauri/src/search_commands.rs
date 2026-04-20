@@ -224,8 +224,8 @@ fn collect_matches(content: &str, re: &regex::Regex, display: &str) -> Option<Fi
     const MAX_MATCHES_PER_FILE: usize = 100;
     let mut matches: Vec<MatchLine> = Vec::new();
     for (i, line) in content.lines().enumerate() {
-        if !re.is_match(line) { continue; }
-        let ranges: Vec<_> = byte_ranges_to_char_ranges(line, re);
+        // Single find_iter pass: collect ranges and check for match simultaneously.
+        let ranges = byte_ranges_to_char_ranges(line, re);
         if ranges.is_empty() { continue; }
         let line_str = if line.len() <= MAX_LINE_LEN { line.to_owned() } else { truncate_line(line) };
         matches.push(MatchLine { line_num: i + 1, line: line_str, ranges });
@@ -296,21 +296,33 @@ fn decode_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
 }
 
 fn file_icon(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "exe" | "msi"                                    => "⚙",
-        "rs" | "py" | "js" | "ts" | "go"
-        | "c" | "cpp" | "java" | "cs" | "rb" | "swift"  => "📝",
-        "toml" | "json" | "yaml" | "yml"
-        | "xml" | "ini" | "cfg" | "env"                  => "🔧",
-        "md" | "txt" | "log"                             => "📄",
-        "png" | "jpg" | "jpeg" | "gif"
-        | "svg" | "ico" | "bmp" | "webp"                 => "🖼",
-        "mp4" | "mkv" | "avi" | "mov"                    => "🎬",
-        "mp3" | "wav" | "flac" | "ogg"                   => "🎵",
-        "zip" | "rar" | "7z" | "tar" | "gz" | "xz"      => "📦",
-        "pdf"                                            => "📕",
-        "db" | "sqlite" | "sql"                          => "🗄",
-        _                                                => "📄",
-    }
+    let ext = path.rsplit('.').next().unwrap_or("");
+    if ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("msi") { return "\u2699"; }
+    if ext.eq_ignore_ascii_case("rs")   || ext.eq_ignore_ascii_case("py")
+    || ext.eq_ignore_ascii_case("js")   || ext.eq_ignore_ascii_case("ts")
+    || ext.eq_ignore_ascii_case("go")   || ext.eq_ignore_ascii_case("c")
+    || ext.eq_ignore_ascii_case("cpp")  || ext.eq_ignore_ascii_case("java")
+    || ext.eq_ignore_ascii_case("cs")   || ext.eq_ignore_ascii_case("rb")
+    || ext.eq_ignore_ascii_case("swift")                                   { return "\u{1F4DD}"; }
+    if ext.eq_ignore_ascii_case("toml") || ext.eq_ignore_ascii_case("json")
+    || ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
+    || ext.eq_ignore_ascii_case("xml")  || ext.eq_ignore_ascii_case("ini")
+    || ext.eq_ignore_ascii_case("cfg")  || ext.eq_ignore_ascii_case("env") { return "\u{1F527}"; }
+    if ext.eq_ignore_ascii_case("md")   || ext.eq_ignore_ascii_case("txt")
+    || ext.eq_ignore_ascii_case("log")                                     { return "\u{1F4C4}"; }
+    if ext.eq_ignore_ascii_case("png")  || ext.eq_ignore_ascii_case("jpg")
+    || ext.eq_ignore_ascii_case("jpeg") || ext.eq_ignore_ascii_case("gif")
+    || ext.eq_ignore_ascii_case("svg")  || ext.eq_ignore_ascii_case("ico")
+    || ext.eq_ignore_ascii_case("bmp")  || ext.eq_ignore_ascii_case("webp"){ return "\u{1F5BC}"; }
+    if ext.eq_ignore_ascii_case("mp4")  || ext.eq_ignore_ascii_case("mkv")
+    || ext.eq_ignore_ascii_case("avi")  || ext.eq_ignore_ascii_case("mov") { return "\u{1F3AC}"; }
+    if ext.eq_ignore_ascii_case("mp3")  || ext.eq_ignore_ascii_case("wav")
+    || ext.eq_ignore_ascii_case("flac") || ext.eq_ignore_ascii_case("ogg") { return "\u{1F3B5}"; }
+    if ext.eq_ignore_ascii_case("zip")  || ext.eq_ignore_ascii_case("rar")
+    || ext.eq_ignore_ascii_case("7z")   || ext.eq_ignore_ascii_case("tar")
+    || ext.eq_ignore_ascii_case("gz")   || ext.eq_ignore_ascii_case("xz")  { return "\u{1F4E6}"; }
+    if ext.eq_ignore_ascii_case("pdf")                                     { return "\u{1F4D5}"; }
+    if ext.eq_ignore_ascii_case("db")   || ext.eq_ignore_ascii_case("sqlite")
+    || ext.eq_ignore_ascii_case("sql")                                     { return "\u{1F5C4}"; }
+    "\u{1F4C4}"
 }

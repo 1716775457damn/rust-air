@@ -22,7 +22,7 @@ use anyhow::Result;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::{path::{Path, PathBuf}, sync::Arc, time::Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use walkdir::DirEntry as WalkDirEntry;
 
@@ -102,7 +102,7 @@ pub async fn receive_to_disk(
 
     let part_path = dest.join(format!("{name}.part"));
 
-    // 断点续传：校验 .part 文件末尾完整性，防止末尾损坏的 chunk 被当作有效数据。
+    // Resume: align to chunk boundary to avoid partial-chunk corruption.
     let already_have: u64 = if kind == Kind::File && part_path.exists() {
         let file_len = tokio::fs::metadata(&part_path).await?.len();
         (file_len / CHUNK as u64) * CHUNK as u64
@@ -116,34 +116,46 @@ pub async fn receive_to_disk(
 
     match kind {
         Kind::File => {
-            // Truncate to verified boundary and open — single file handle.
+            // Single file handle: open read+write, truncate to resume boundary,
+            // hash the existing prefix in spawn_blocking, then seek to end and append.
             let file = if already_have > 0 {
                 let f = tokio::fs::OpenOptions::new()
-                    .write(true).open(&part_path).await?;
+                    .read(true).write(true).open(&part_path).await?;
                 f.set_len(already_have).await?;
-                drop(f);
-                tokio::fs::OpenOptions::new().append(true).open(&part_path).await?
+                f
             } else {
                 tokio::fs::OpenOptions::new()
-                    .create(true).write(true).truncate(true)
+                    .create(true).read(true).write(true).truncate(true)
                     .open(&part_path).await?
             };
-            let mut f = BufWriter::with_capacity(4 * 256 * 1024, file);
+
+            // Hash existing prefix in a blocking task — avoids blocking the async runtime.
+            let mut hasher = if already_have > 0 {
+                let part2 = part_path.clone();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<Sha256> {
+                    let mut f = std::fs::File::open(&part2)?;
+                    let mut h = Sha256::new();
+                    let mut buf = vec![0u8; CHUNK];
+                    loop {
+                        let n = std::io::Read::read(&mut f, &mut buf)?;
+                        if n == 0 { break; }
+                        h.update(&buf[..n]);
+                    }
+                    Ok(h)
+                }).await??
+            } else {
+                Sha256::new()
+            };
+
+            // Seek to end for appending, wrap in BufWriter.
+            let mut file = file;
+            file.seek(std::io::SeekFrom::End(0)).await?;
+            let mut f = BufWriter::with_capacity(4 * CHUNK, file);
+
             let mut dec = Decryptor::new(&key, rx);
-            let mut hasher = Sha256::new();
             let mut done = already_have;
             let start = Instant::now();
             let mut last_emit = start;
-
-            if already_have > 0 {
-                let mut existing = tokio::fs::File::open(&part_path).await?;
-                let mut buf = vec![0u8; CHUNK];
-                loop {
-                    let n = existing.read(&mut buf).await?;
-                    if n == 0 { break; }
-                    hasher.update(&buf[..n]);
-                }
-            }
 
             while let Some(chunk) = dec.read_chunk().await? {
                 hasher.update(&chunk);
@@ -238,7 +250,6 @@ async fn send_header(
 ) -> Result<()> {
     let nb = name.as_bytes();
     anyhow::ensure!(nb.len() <= MAX_NAME_LEN, "filename too long ({} bytes)", nb.len());
-    // Single write: MAGIC + key + kind + name_len + name + total_size
     let mut hdr = Vec::with_capacity(4 + 32 + 1 + 2 + nb.len() + 8);
     hdr.extend_from_slice(MAGIC);
     hdr.extend_from_slice(key);
@@ -287,22 +298,22 @@ async fn recv_header(
 }
 
 /// Stream `reader` through `enc`, computing SHA-256 on-the-fly.
-/// `hasher` can be pre-seeded for resume scenarios.
-/// Returns the digest covering all bytes (pre-seeded + streamed).
+/// Fills the buffer with `read` (not read_exact) to handle streams that
+/// return short reads at EOF without erroring.
 async fn stream_encrypted_hash<R: AsyncRead + Unpin>(
     reader: &mut R,
     enc: &mut Encryptor<impl AsyncWriteExt + Unpin>,
     initial: u64,
     total: u64,
     on_progress: Arc<impl Fn(TransferEvent)>,
-    hasher: Sha256,
+    mut hasher: Sha256,
 ) -> Result<[u8; 32]> {
     let mut buf = vec![0u8; CHUNK];
-    let mut hasher = hasher;
     let mut done = initial;
     let start = Instant::now();
     let mut last_emit = start;
     loop {
+        // Fill the buffer as much as possible in one pass.
         let mut filled = 0;
         while filled < buf.len() {
             match reader.read(&mut buf[filled..]).await? {
@@ -322,7 +333,7 @@ async fn stream_encrypted_hash<R: AsyncRead + Unpin>(
     Ok(hasher.finalize().into())
 }
 
-// ── Clipboard send ───────────────────────────────────────────────────────────
+// ── Clipboard send ────────────────────────────────────────────────────────────
 
 /// Send clipboard text as `Kind::Clipboard` so the receiver writes it to clipboard.
 pub async fn send_clipboard(
@@ -337,7 +348,6 @@ pub async fn send_clipboard(
     let (mut rx, mut tx) = stream.into_split();
     send_header(&mut tx, &key, Kind::Clipboard, "clipboard", total_size).await?;
 
-    // Consume the resume handshake (always 0 for clipboard).
     let mut resume_buf = [0u8; 8];
     rx.read_exact(&mut resume_buf).await?;
 
@@ -364,13 +374,9 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
-/// Find a non-colliding path by atomically probing with create_new,
-/// avoiding the TOCTOU race of exists() + rename().
+/// Find a non-colliding path by atomically probing with create_new.
 fn unique_path(path: PathBuf) -> PathBuf {
-    // Fast path: try the original name first.
     if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
-        // Created a placeholder; the caller will overwrite via rename.
-        // Remove it immediately — rename() will replace atomically.
         let _ = std::fs::remove_file(&path);
         return path;
     }
