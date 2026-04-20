@@ -165,16 +165,19 @@ async fn scan_once(secs: u64) -> Result<Vec<(String, String)>> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(dev)) if !dev.addr.is_empty() => {
+            Ok(Some(dev)) => {
+                // addr=="" means ServiceRemoved — skip, do NOT break
+                if dev.addr.is_empty() { continue; }
                 let short = dev.name.split('.').next().unwrap_or(&dev.name).to_string();
                 if !devs.iter().any(|(_, a)| a == &dev.addr) {
                     devs.push((short, dev.addr));
                 }
             }
-            _ => break,
+            Ok(None) => break, // channel closed
+            Err(_)   => break, // deadline reached
         }
     }
-    drop(handle); // shutdown daemon immediately
+    drop(handle);
     Ok(devs)
 }
 

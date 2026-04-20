@@ -138,21 +138,22 @@ pub fn cancel_send(state: State<'_, AppState>) {
 #[tauri::command]
 pub async fn scan_devices(app: AppHandle) -> Result<(), String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DeviceInfo>(32);
-
-    // browse_devices_sync starts a background thread and returns a handle.
-    // Dropping the handle shuts down the daemon, which unblocks receiver.recv()
-    // in the thread immediately — no quiet-LAN deadlock.
     let handle = discovery::browse_devices_sync(tx).map_err(|e| e.to_string())?;
 
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(dev)) => { app.emit("device-found", &dev).ok(); }
-                _ => break,
+                Ok(Some(dev)) => {
+                    // addr=="" means ServiceRemoved — skip, do NOT break
+                    if dev.addr.is_empty() { continue; }
+                    app.emit("device-found", &dev).ok();
+                }
+                Ok(None) => break, // channel closed
+                Err(_)   => break, // deadline reached
             }
         }
-        drop(handle); // shuts down daemon → thread exits cleanly
+        drop(handle);
     });
     Ok(())
 }

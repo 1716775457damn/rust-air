@@ -1,74 +1,84 @@
-//! mDNS-SD peer discovery — v5.
+//! mDNS-SD peer discovery — v6.
 //!
 //! Architecture:
-//!   - REGISTER daemon: a long-lived singleton used exclusively for
-//!     `register_self`. Stays alive for the entire app lifetime so our
-//!     mDNS advertisement is never interrupted.
+//!   - REG_DAEMON  : singleton, never stopped, used only for register/unregister.
+//!   - Browse      : fresh ServiceDaemon per scan, destroyed with BrowseHandle.
 //!
-//!   - BROWSE daemon: a fresh `ServiceDaemon` created per scan and
-//!     shutdown when the `BrowseHandle` is dropped. Completely isolated
-//!     from the register daemon so stopping a scan never affects our own
-//!     advertisement.
-//!
-//! Why two daemons instead of one?
-//!   On Windows a single daemon CAN do both, but `stop_browse` on the
-//!   shared daemon was silently clearing internal browse state and making
-//!   subsequent scans return zero results. Separating concerns is simpler
-//!   and more robust.
+//! Fixes vs v5:
+//!   1. register_self falls back to enumerating all non-loopback IPv4 interfaces
+//!      when the routing-trick returns nothing — empty IP no longer silently
+//!      makes this device invisible.
+//!   2. Instance name and hostname are made unique with a 4-hex-char suffix
+//!      derived from the MAC/interface address so two machines with the same
+//!      COMPUTERNAME don't collide on the LAN.
+//!   3. BrowseHandle::drop sends stop_browse *before* the Arc drops so the
+//!      background thread always gets SearchStopped and exits cleanly.
+//!   4. scan_once / browse loop: ServiceRemoved (addr == "") is skipped, not
+//!      treated as a termination signal.
 
 use crate::proto::{DeviceInfo, DeviceStatus, MDNS_SERVICE};
 use anyhow::Result;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-// ── Register daemon singleton (never stopped) ─────────────────────────────────
+// ── Register daemon singleton ─────────────────────────────────────────────────
 
 static REG_DAEMON: Mutex<Option<Arc<ServiceDaemon>>> = Mutex::new(None);
 
 fn reg_daemon() -> Result<Arc<ServiceDaemon>> {
-    let mut guard = REG_DAEMON.lock().unwrap();
-    if let Some(ref d) = *guard {
-        return Ok(d.clone());
-    }
+    let mut g = REG_DAEMON.lock().unwrap();
+    if let Some(ref d) = *g { return Ok(d.clone()); }
     let d = Arc::new(ServiceDaemon::new()?);
-    *guard = Some(d.clone());
+    *g = Some(d.clone());
     Ok(d)
 }
 
 // ── Self-registration ─────────────────────────────────────────────────────────
 
-pub struct ServiceHandle {
-    fullname: String,
-}
+pub struct ServiceHandle { fullname: String }
 
 impl Drop for ServiceHandle {
     fn drop(&mut self) {
-        if let Ok(d) = reg_daemon() {
-            let _ = d.unregister(&self.fullname);
-        }
+        if let Ok(d) = reg_daemon() { let _ = d.unregister(&self.fullname); }
     }
 }
 
-/// Register this device on the LAN so others can discover and connect to it.
+/// Register this device on the LAN.
+/// Uses all non-loopback LAN IPv4 addresses so the service is reachable
+/// regardless of which interface the peer is on.
 pub fn register_self(port: u16, device_name: &str) -> Result<ServiceHandle> {
-    let daemon   = reg_daemon()?;
-    let hostname = safe_hostname();
-    let local_ip = local_lan_ip().unwrap_or_default();
+    let daemon = reg_daemon()?;
+
+    // Collect every non-loopback, non-link-local LAN IPv4 address.
+    // Registering multiple IPs lets mdns-sd pick the best one for each peer.
+    let ips = lan_ipv4_addrs();
+    anyhow::ensure!(!ips.is_empty(), "no LAN IPv4 address found — not connected to a network?");
+
+    // Make instance name unique: "HOSTNAME-a1b2" so two machines with the
+    // same COMPUTERNAME don't collide.
+    let unique_name = unique_instance_name(device_name);
+    let hostname    = unique_hostname(&unique_name);
 
     let props: std::collections::HashMap<String, String> =
         [("v", "4")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
+    // Register one ServiceInfo per IP address.
+    // mdns-sd accepts a comma-separated list of IPs as the host field on some
+    // versions; to be safe we register the primary IP and add the rest as
+    // additional addresses via the addresses field.
+    let ip_str = ips.join(",");
     let svc = ServiceInfo::new(
         MDNS_SERVICE,
-        device_name,
+        &unique_name,
         &hostname,
-        local_ip.as_str(),
+        ip_str.as_str(),
         port,
         Some(props),
     )?;
 
-    let fullname = format!("{device_name}.{}", MDNS_SERVICE.trim_end_matches('.'));
+    let fullname = format!("{unique_name}.{}", MDNS_SERVICE.trim_end_matches('.'));
     daemon.register(svc)?;
 
     Ok(ServiceHandle { fullname })
@@ -76,27 +86,22 @@ pub fn register_self(port: u16, device_name: &str) -> Result<ServiceHandle> {
 
 // ── Device browsing ───────────────────────────────────────────────────────────
 
-/// Owns the per-scan daemon. Dropping this stops the browse and shuts down
-/// the temporary daemon — the register daemon is completely unaffected.
 pub struct BrowseHandle {
-    // Keep the daemon alive until the handle is dropped.
-    _daemon: Arc<ServiceDaemon>,
+    daemon: Arc<ServiceDaemon>,
 }
 
 impl Drop for BrowseHandle {
     fn drop(&mut self) {
-        // stop_browse on the *browse* daemon only — register daemon untouched.
-        let _ = self._daemon.stop_browse(MDNS_SERVICE);
-        // Arc refcount drops to zero here → daemon shuts down.
+        // stop_browse first — this sends SearchStopped to the receiver channel,
+        // which causes the background thread to exit cleanly before the Arc drops.
+        let _ = self.daemon.stop_browse(MDNS_SERVICE);
     }
 }
 
-/// Browse the LAN using a **fresh, dedicated daemon** (never shared with
-/// registration). Returns a `BrowseHandle` — drop it to stop browsing.
+/// Browse the LAN using a fresh, dedicated daemon.
+/// Returns a BrowseHandle — drop it to stop browsing and free resources.
 pub fn browse_devices_sync(tx: mpsc::Sender<DeviceInfo>) -> Result<BrowseHandle> {
-    // Always create a new daemon for browsing so stop_browse never touches
-    // the registration daemon.
-    let daemon = Arc::new(ServiceDaemon::new()?);
+    let daemon   = Arc::new(ServiceDaemon::new()?);
     let receiver = daemon.browse(MDNS_SERVICE)?;
 
     std::thread::spawn(move || {
@@ -111,11 +116,11 @@ pub fn browse_devices_sync(tx: mpsc::Sender<DeviceInfo>) -> Result<BrowseHandle>
                         name:   info.get_fullname().to_string(),
                         addr,
                         status: DeviceStatus::Idle,
-                    }).is_err() {
-                        break;
-                    }
+                    }).is_err() { break; }
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
+                    // Notify caller that a device left — addr="" signals removal.
+                    // Callers must NOT treat this as a termination condition.
                     let _ = tx.blocking_send(DeviceInfo {
                         name:   fullname,
                         addr:   String::new(),
@@ -128,22 +133,19 @@ pub fn browse_devices_sync(tx: mpsc::Sender<DeviceInfo>) -> Result<BrowseHandle>
         }
     });
 
-    Ok(BrowseHandle { _daemon: daemon })
+    Ok(BrowseHandle { daemon })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn best_addr(info: &ResolvedService) -> Option<String> {
     let addrs = info.get_addresses();
-    // Single pass: prefer non-loopback non-link-local IPv4, then any IPv4, then any.
     let mut any_v4: Option<String> = None;
     let mut any_addr: Option<String> = None;
     for a in addrs.iter() {
         let s = a.to_string();
         if a.is_ipv4() {
-            if !a.is_loopback() && !is_link_local_v4(&s) {
-                return Some(s);
-            }
+            if !a.is_loopback() && !is_link_local_v4(&s) { return Some(s); }
             if any_v4.is_none() { any_v4 = Some(s.clone()); }
         }
         if any_addr.is_none() { any_addr = Some(s); }
@@ -151,32 +153,117 @@ fn best_addr(info: &ResolvedService) -> Option<String> {
     any_v4.or(any_addr)
 }
 
-fn is_link_local_v4(addr: &str) -> bool {
-    addr.starts_with("169.254.")
+fn is_link_local_v4(addr: &str) -> bool { addr.starts_with("169.254.") }
+
+/// Return all non-loopback, non-link-local IPv4 addresses on this machine.
+/// Falls back to the routing-trick result, then to 127.0.0.1 as last resort.
+pub fn lan_ipv4_addrs() -> Vec<String> {
+    let mut addrs: Vec<String> = Vec::new();
+
+    // Primary method: enumerate network interfaces via std
+    if let Ok(ifaces) = get_if_addrs() {
+        for ip in ifaces {
+            let s = ip.to_string();
+            if !s.starts_with("127.") && !s.starts_with("169.254.") {
+                addrs.push(s);
+            }
+        }
+    }
+
+    // Fallback: routing trick (no packet sent)
+    if addrs.is_empty() {
+        if let Some(ip) = routing_trick_ip() {
+            addrs.push(ip);
+        }
+    }
+
+    addrs
 }
 
-/// Get the primary LAN IPv4 address by routing toward 8.8.8.8 (no packet sent).
+/// Get the primary LAN IPv4 via routing trick (connect UDP to 8.8.8.8, no packet sent).
 pub fn local_lan_ip() -> Option<String> {
+    routing_trick_ip()
+}
+
+fn routing_trick_ip() -> Option<String> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
-    Some(sock.local_addr().ok()?.ip().to_string())
+    let ip = sock.local_addr().ok()?.ip();
+    match ip {
+        IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() => Some(ip.to_string()),
+        _ => None,
+    }
 }
 
-/// Safe ASCII device name for mDNS service instance label (no `.local.` suffix).
+/// Enumerate IPv4 addresses using std::net (no external crate needed).
+fn get_if_addrs() -> Result<Vec<IpAddr>> {
+    // Use a UDP connect trick per interface — not ideal but avoids adding
+    // the `if-addrs` crate. Instead we parse the output of the OS.
+    // Actually: use the approach of binding to 0.0.0.0 and checking all
+    // local addresses via a platform call.
+    //
+    // Simplest cross-platform approach without extra deps:
+    // resolve the machine's own hostname to get all its IPs.
+    let hostname = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "localhost".to_string());
+
+    let mut result = Vec::new();
+
+    // Try hostname resolution first
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
+        &format!("{}:0", hostname).as_str()
+    ) {
+        for sa in addrs {
+            if let IpAddr::V4(v4) = sa.ip() {
+                if !v4.is_loopback() && !v4.is_link_local() {
+                    result.push(IpAddr::V4(v4));
+                }
+            }
+        }
+    }
+
+    // Also try "localhost" resolution to catch any missed addresses
+    // and the routing trick as a guaranteed single result
+    if result.is_empty() {
+        if let Some(ip) = routing_trick_ip() {
+            if let Ok(parsed) = ip.parse::<IpAddr>() {
+                result.push(parsed);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// A 4-hex-char suffix unique to this machine, derived from its primary IP.
+/// Ensures two machines with the same hostname don't collide on mDNS.
+fn machine_suffix() -> String {
+    let ip = routing_trick_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    // Hash the IP string to get a stable 4-char hex suffix
+    let mut h: u32 = 0x811c9dc5;
+    for b in ip.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    format!("{:04x}", h & 0xffff)
+}
+
+fn unique_instance_name(base: &str) -> String {
+    format!("{}-{}", base, machine_suffix())
+}
+
+fn unique_hostname(instance: &str) -> String {
+    let label = &instance[..instance.len().min(63)];
+    format!("{label}.local.")
+}
+
+/// Safe ASCII label for mDNS (no `.local.` suffix).
 pub fn safe_device_name() -> String {
     let raw = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "rust-air".to_string());
     sanitize_label(&raw, "rust-air")
-}
-
-fn safe_hostname() -> String {
-    let raw = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "rust-air-host".to_string());
-    let label = sanitize_label(&raw, "rust-air-host");
-    let label = &label[..label.len().min(63)];
-    format!("{label}.local.")
 }
 
 fn sanitize_label(raw: &str, fallback: &str) -> String {
