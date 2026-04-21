@@ -1,11 +1,47 @@
 @import "tailwindcss";
 
-/* Smooth scrollbar */
+:root {
+  --bg-base:    #0d1117;
+  --bg-surface: #161b22;
+  --bg-card:    rgba(17,24,39,0.8);
+  --bg-input:   #111827;
+  --bg-muted:   rgba(255,255,255,0.05);
+  --border:     rgba(255,255,255,0.08);
+  --border-input: #374151;
+  --text-primary:   #f0f6fc;
+  --text-secondary: #9ca3af;
+  --text-muted:     #4b5563;
+  --text-faint:     #374151;
+  --accent:     #22d3ee;
+  --accent-bg:  rgba(34,211,238,0.1);
+  --accent-ring:rgba(34,211,238,0.2);
+  --scrollbar-thumb: rgba(255,255,255,0.08);
+  --scrollbar-hover: rgba(255,255,255,0.15);
+}
+
+:root.light {
+  --bg-base:    #f3f4f6;
+  --bg-surface: #ffffff;
+  --bg-card:    rgba(255,255,255,0.9);
+  --bg-input:   #ffffff;
+  --bg-muted:   rgba(0,0,0,0.04);
+  --border:     rgba(0,0,0,0.08);
+  --border-input: #d1d5db;
+  --text-primary:   #111827;
+  --text-secondary: #6b7280;
+  --text-muted:     #9ca3af;
+  --text-faint:     #d1d5db;
+  --accent:     #0891b2;
+  --accent-bg:  rgba(8,145,178,0.08);
+  --accent-ring:rgba(8,145,178,0.2);
+  --scrollbar-thumb: rgba(0,0,0,0.12);
+  --scrollbar-hover: rgba(0,0,0,0.22);
+}
+
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
 
-/* Prevent text selection on UI chrome */
 body { -webkit-user-select: none; user-select: none; }
 textarea, input, code, .font-mono { -webkit-user-select: text; user-select: text; }

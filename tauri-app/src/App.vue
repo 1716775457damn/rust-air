@@ -22,6 +22,14 @@ type Phase = "idle" | "transferring" | "done" | "error";
 
 const tab = ref<Tab>("send");
 
+// Theme
+const isDark = ref(true);
+function toggleTheme() {
+  isDark.value = !isDark.value;
+  document.documentElement.classList.toggle("light", !isDark.value);
+  localStorage.setItem("theme", isDark.value ? "dark" : "light");
+}
+
 // Send
 const sendPhase    = ref<Phase>("idle");
 const sendError    = ref("");
@@ -87,11 +95,10 @@ function makeSpeed(p: TransferEvent) {
   if (bps > 1_000)     return `${(bps/1_000).toFixed(0)} KB/s`;
   return `${bps} B/s`;
 }
-// ETA: remaining bytes / speed → seconds
 function makeEta(p: TransferEvent): string {
   if (!p.total_bytes || !p.bytes_per_sec || p.bytes_done >= p.total_bytes) return "";
   const secs = Math.ceil((p.total_bytes - p.bytes_done) / p.bytes_per_sec);
-  if (secs < 60)  return `${secs}s`;
+  if (secs < 60)   return `${secs}s`;
   if (secs < 3600) return `${Math.floor(secs/60)}m${secs%60}s`;
   return `${Math.floor(secs/3600)}h${Math.floor((secs%3600)/60)}m`;
 }
@@ -103,7 +110,6 @@ const recvPct   = computed(() => makePct(recvProgress.value));
 const recvSpeed = computed(() => makeSpeed(recvProgress.value));
 const recvEta   = computed(() => makeEta(recvProgress.value));
 
-// Indeterminate progress: total_bytes unknown (directory transfer)
 const sendIndeterminate = computed(() => sendPhase.value === "transferring" && !sendProgress.value.total_bytes);
 const recvIndeterminate = computed(() => recvPhase.value === "transferring" && !recvProgress.value.total_bytes);
 
@@ -118,7 +124,6 @@ const filteredResults = computed(() => {
   return q ? searchResults.value.filter(r => r.path.toLowerCase().includes(q)) : searchResults.value;
 });
 
-// Highlight cache: key → segments array (flat, no extra nesting)
 const hlCache = new Map<string, { text: string; hl: boolean }[]>();
 function cachedHighlight(path: string, lineNum: number, line: string, ranges: [number,number][]) {
   const key = `${path}:${lineNum}`;
@@ -130,10 +135,13 @@ watch(searchResults, () => hlCache.clear());
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 onMounted(async () => {
+  // Restore theme
+  const saved = localStorage.getItem("theme");
+  if (saved === "light") { isDark.value = false; document.documentElement.classList.add("light"); }
+
   myPort.value    = await invoke<number>("start_listener");
   localIps.value  = await invoke<string[]>("get_local_ips");
 
-  // Keyboard shortcuts: 1-5 switch tabs
   window.addEventListener("keydown", onKeyDown);
 
   unlisten.value.push(
@@ -147,7 +155,6 @@ onMounted(async () => {
     }),
     await listen("send-done", () => {
       sendPhase.value = "done";
-      // Auto-reset after 4 s so the UI is ready for the next send
       setTimeout(() => { if (sendPhase.value === "done") resetSend(); }, 4000);
     }),
     await listen<string>("send-error", (e) => { sendError.value = e.payload; sendPhase.value = "error"; }),
@@ -227,11 +234,9 @@ onUnmounted(async () => {
 
 const TAB_KEYS: Record<string, Tab> = { "1": "send", "2": "receive", "3": "devices", "4": "search", "5": "sync" };
 function onKeyDown(e: KeyboardEvent) {
-  // Only when no input is focused
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
   if (TAB_KEYS[e.key]) { tab.value = TAB_KEYS[e.key]; e.preventDefault(); }
 }
-
 
 // ── Send ──────────────────────────────────────────────────────────────────────
 
@@ -295,13 +300,8 @@ async function pickSearchPath() {
   }
 }
 
-// Open a file or folder in the system file manager
-async function openPath(p: string) {
-  await invoke("open_path", { path: p }).catch(() => {});
-}
-// Open the containing folder of a file path
+async function openPath(p: string) { await invoke("open_path", { path: p }).catch(() => {}); }
 async function revealInFolder(p: string) {
-  // Strip filename to get parent dir
   const dir = p.replace(/[\/\\][^\/\\]+$/, "") || p;
   await openPath(dir);
 }
@@ -348,10 +348,8 @@ function fmtBytes(n: number) {
   if (n > 1e3) return `${(n/1e3).toFixed(0)} KB`;
   return `${n} B`;
 }
-function shortName(fullname: string) {
-  return fullname.split(".")[0] ?? fullname;
-}
-// lastSeen ticker: update every 10 s so relative timestamps stay fresh
+function shortName(fullname: string) { return fullname.split(".")[0] ?? fullname; }
+
 const now = ref(Date.now());
 let _nowTimer: ReturnType<typeof setInterval>;
 onMounted(() => { _nowTimer = setInterval(() => { now.value = Date.now(); }, 10_000); });
@@ -381,133 +379,173 @@ function highlightSegments(line: string, ranges: [number,number][]) {
 </script>
 
 <template>
-  <div class="h-screen bg-[#0d1117] text-gray-100 flex flex-col select-none font-sans overflow-hidden">
+  <div class="h-screen flex flex-col select-none font-sans overflow-hidden"
+    style="background:var(--bg-base);color:var(--text-primary)">
 
     <!-- Header -->
-    <header class="flex items-center gap-4 px-5 h-14 border-b border-white/8 bg-[#161b22] flex-shrink-0">
+    <header class="flex items-center gap-4 px-5 h-14 flex-shrink-0"
+      style="background:var(--bg-surface);border-bottom:1px solid var(--border)">
       <span class="text-lg">✈️</span>
-      <h1 class="text-sm font-bold tracking-wide text-white/90">rust-air</h1>
+      <h1 class="text-sm font-bold tracking-wide" style="color:var(--text-primary)">rust-air</h1>
       <div class="flex-1"></div>
       <button v-if="primaryIp" @click="copyIp"
-        :class="['flex items-center gap-2.5 px-4 py-1.5 rounded-xl font-mono transition-all duration-200',
-          ipCopied ? 'bg-green-500/15 text-green-300 ring-1 ring-green-500/30'
-                   : 'bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 ring-1 ring-cyan-500/20']">
-        <span class="text-[11px] text-gray-500 font-sans">本机</span>
+        :style="ipCopied
+          ? 'background:rgba(34,197,94,0.12);color:#86efac;box-shadow:0 0 0 1px rgba(34,197,94,0.25)'
+          : 'background:var(--accent-bg);color:var(--accent);box-shadow:0 0 0 1px var(--accent-ring)'"
+        class="flex items-center gap-2.5 px-4 py-1.5 rounded-xl font-mono transition-all duration-200">
+        <span class="text-[11px] font-sans" style="color:var(--text-muted)">本机</span>
         <span class="text-base font-bold tracking-wide">{{ primaryIp }}</span>
         <span class="text-xs opacity-70">{{ ipCopied ? '✓' : 'copy' }}</span>
       </button>
-      <button @click="refreshIps" class="text-gray-600 hover:text-gray-300 text-sm transition-colors" title="刷新 IP">↻</button>
+      <!-- Theme toggle -->
+      <button @click="toggleTheme"
+        class="w-8 h-8 rounded-lg flex items-center justify-center text-base transition-colors"
+        style="color:var(--text-secondary)"
+        :title="isDark ? '切换浅色' : '切换深色'">
+        {{ isDark ? '☀️' : '🌙' }}
+      </button>
+      <button @click="refreshIps" class="text-sm transition-colors"
+        style="color:var(--text-faint)" title="刷新 IP">↻</button>
     </header>
 
     <!-- Body -->
     <div class="flex flex-1 overflow-hidden">
 
       <!-- Sidebar -->
-      <nav class="flex flex-col gap-1 w-[72px] flex-shrink-0 border-r border-white/5 px-1.5 py-3 bg-[#161b22]">
+      <nav class="flex flex-col gap-1 w-[72px] flex-shrink-0 px-1.5 py-3"
+        style="background:var(--bg-surface);border-right:1px solid var(--border)">
         <button v-for="(t, idx) in (['send','receive','devices','search','sync'] as Tab[])" :key="t"
           @click="tab = t"
           :title="`${t === 'send' ? '发送' : t === 'receive' ? '接收' : t === 'devices' ? '设备' : t === 'search' ? '搜索' : '同步'} (${idx+1})`"
-          :class="['flex flex-col items-center gap-1 py-2.5 rounded-xl text-xs transition-all duration-150 w-full',
-            tab === t ? 'bg-cyan-500/15 text-cyan-300' : 'text-gray-500 hover:text-gray-200 hover:bg-white/5']">
+          :style="tab === t
+            ? 'background:var(--accent-bg);color:var(--accent)'
+            : 'color:var(--text-muted)'"
+          class="flex flex-col items-center gap-1 py-2.5 rounded-xl text-xs transition-all duration-150 w-full hover:opacity-80">
           <span class="text-[15px] leading-none">{{ t==='send'?'📤':t==='receive'?'📥':t==='devices'?'🔍':t==='search'?'📂':'🔄' }}</span>
           <span class="text-[10px] mt-0.5">{{ t==='send'?'发送':t==='receive'?'接收':t==='devices'?'设备':t==='search'?'搜索':'同步' }}</span>
-          <span class="text-[9px] text-gray-700 leading-none">{{ idx+1 }}</span>
-          <span v-if="t==='receive' && recvPhase==='transferring'" class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse mt-0.5"></span>
+          <span class="text-[9px] leading-none" style="color:var(--text-faint)">{{ idx+1 }}</span>
+          <span v-if="t==='receive' && recvPhase==='transferring'"
+            class="w-1.5 h-1.5 rounded-full animate-pulse mt-0.5"
+            style="background:var(--accent)"></span>
         </button>
       </nav>
 
       <!-- Main -->
-      <main class="flex-1 flex flex-col p-5 gap-4 overflow-hidden bg-[#0d1117]">
+      <main class="flex-1 flex flex-col p-5 gap-4 overflow-hidden" style="background:var(--bg-base)">
 
         <!-- SEND TAB -->
         <template v-if="tab === 'send'">
           <div class="flex-1 flex flex-col gap-4">
 
-            <!-- File picker drop zone -->
+            <!-- Drop zone -->
             <div @dragover.prevent="dragOver=true" @dragleave="dragOver=false" @drop.prevent="onDrop"
-              :class="['border-2 border-dashed rounded-2xl p-6 text-center transition-all cursor-pointer flex-shrink-0',
-                dragOver ? 'border-cyan-400 bg-cyan-950/30' : 'border-gray-700/60 hover:border-gray-500']"
+              :style="dragOver
+                ? 'border-color:var(--accent);background:var(--accent-bg)'
+                : 'border-color:var(--border-input)'"
+              class="border-2 border-dashed rounded-2xl p-6 text-center transition-all cursor-pointer flex-shrink-0"
               @click="pickFile">
               <div class="text-3xl mb-1">📦</div>
-              <p class="text-gray-300 text-sm">拖拽文件 / 文件夹，或点击选择</p>
+              <p class="text-sm" style="color:var(--text-secondary)">拖拽文件 / 文件夹，或点击选择</p>
             </div>
+
             <div class="flex gap-2 flex-shrink-0">
-              <button @click="pickFile"   class="px-3 py-1.5 bg-gray-800/80 hover:bg-gray-700 rounded-lg text-sm transition-colors">📄 文件</button>
-              <button @click="pickFolder" class="px-3 py-1.5 bg-gray-800/80 hover:bg-gray-700 rounded-lg text-sm transition-colors">📁 文件夹</button>
+              <button @click="pickFile"
+                class="px-3 py-1.5 rounded-lg text-sm transition-colors"
+                style="background:var(--bg-muted);color:var(--text-secondary)">📄 文件</button>
+              <button @click="pickFolder"
+                class="px-3 py-1.5 rounded-lg text-sm transition-colors"
+                style="background:var(--bg-muted);color:var(--text-secondary)">📁 文件夹</button>
             </div>
 
             <!-- Selected file -->
-            <div v-if="selectedPath" class="bg-gray-900/80 rounded-xl p-3 flex items-center gap-3 ring-1 ring-white/5 flex-shrink-0">
-              <span class="text-cyan-400">📎</span>
-              <span class="text-sm text-gray-300 truncate flex-1" :title="selectedPath">{{ selectedPath }}</span>
-              <button @click="selectedPath=''" class="text-gray-600 hover:text-red-400 text-xs flex-shrink-0">✕</button>
+            <div v-if="selectedPath"
+              class="rounded-xl p-3 flex items-center gap-3 flex-shrink-0"
+              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+              <span style="color:var(--accent)">📎</span>
+              <span class="text-sm truncate flex-1" style="color:var(--text-secondary)" :title="selectedPath">{{ selectedPath }}</span>
+              <button @click="selectedPath=''" class="text-xs flex-shrink-0"
+                style="color:var(--text-muted)">✕</button>
             </div>
 
             <!-- Transfer progress -->
-            <div v-if="sendPhase === 'transferring'" class="bg-gray-900/80 rounded-xl p-4 ring-1 ring-white/5 flex-shrink-0">
+            <div v-if="sendPhase === 'transferring'"
+              class="rounded-xl p-4 flex-shrink-0"
+              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
               <div class="flex items-center justify-between mb-2">
-                <span class="text-sm text-gray-300 truncate">发送中 → <span class="text-cyan-300">{{ sendPeer }}</span></span>
+                <span class="text-sm truncate" style="color:var(--text-secondary)">
+                  发送中 → <span :style="`color:var(--accent)`">{{ sendPeer }}</span>
+                </span>
                 <div class="flex items-center gap-2 flex-shrink-0">
-                  <span v-if="sendEta" class="text-xs text-gray-500">剩 {{ sendEta }}</span>
-                  <span class="text-sm text-cyan-300">{{ sendSpeed }}</span>
+                  <span v-if="sendEta" class="text-xs" style="color:var(--text-muted)">剩 {{ sendEta }}</span>
+                  <span class="text-sm" :style="`color:var(--accent)`">{{ sendSpeed }}</span>
                 </div>
               </div>
-              <!-- Indeterminate bar for directory (total unknown) -->
-              <div class="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
+              <div class="w-full rounded-full h-2 overflow-hidden" style="background:var(--bg-muted)">
                 <div v-if="sendIndeterminate"
-                  class="h-2 rounded-full bg-cyan-500 animate-[slide_1.5s_ease-in-out_infinite]"
-                  style="width:40%"></div>
-                <div v-else class="bg-cyan-500 h-2 rounded-full transition-all duration-300"
+                  class="h-2 rounded-full animate-[slide_1.5s_ease-in-out_infinite]"
+                  style="width:40%;background:var(--accent)"></div>
+                <div v-else class="h-2 rounded-full transition-all duration-300"
+                  style="background:var(--accent)"
                   :style="{ width: (sendPct ?? 0) + '%' }"></div>
               </div>
-              <div class="flex justify-between mt-1 text-xs text-gray-500">
+              <div class="flex justify-between mt-1 text-xs" style="color:var(--text-muted)">
                 <span>{{ fmtBytes(sendProgress.bytes_done) }}</span>
                 <span>{{ sendIndeterminate ? '计算中…' : (sendPct !== null ? sendPct + '%' : '…') }}</span>
               </div>
             </div>
 
-            <!-- Send done (auto-dismisses after 4s) -->
-            <div v-else-if="sendPhase === 'done'" class="bg-green-900/20 rounded-xl p-3 ring-1 ring-green-500/20 flex items-center gap-3 flex-shrink-0">
+            <!-- Send done -->
+            <div v-else-if="sendPhase === 'done'"
+              class="rounded-xl p-3 flex items-center gap-3 flex-shrink-0"
+              style="background:rgba(34,197,94,0.08);box-shadow:0 0 0 1px rgba(34,197,94,0.2)">
               <span class="text-2xl">✅</span>
               <div class="flex-1 min-w-0">
-                <span class="text-green-300 text-sm">发送完成！{{ fmtBytes(sendProgress.bytes_done) }}</span>
-                <p class="text-xs text-gray-500 truncate">{{ selectedName }}</p>
+                <span class="text-sm" style="color:#86efac">发送完成！{{ fmtBytes(sendProgress.bytes_done) }}</span>
+                <p class="text-xs truncate" style="color:var(--text-muted)">{{ selectedName }}</p>
               </div>
-              <button @click="resetSend" class="ml-auto text-xs text-gray-500 hover:text-gray-300 flex-shrink-0">关闭</button>
+              <button @click="resetSend" class="ml-auto text-xs flex-shrink-0"
+                style="color:var(--text-muted)">关闭</button>
             </div>
-            <div v-else-if="sendPhase === 'error'" class="bg-red-900/20 rounded-xl p-3 ring-1 ring-red-500/20 flex items-center gap-3 flex-shrink-0">
+
+            <!-- Send error -->
+            <div v-else-if="sendPhase === 'error'"
+              class="rounded-xl p-3 flex items-center gap-3 flex-shrink-0"
+              style="background:rgba(239,68,68,0.08);box-shadow:0 0 0 1px rgba(239,68,68,0.2)">
               <span class="text-2xl">❌</span>
-              <span class="text-red-400 text-sm truncate flex-1" :title="sendError">{{ sendError }}</span>
-              <button @click="resetSend" class="ml-auto text-xs text-gray-500 hover:text-gray-300 flex-shrink-0">关闭</button>
+              <span class="text-sm truncate flex-1" style="color:#fca5a5" :title="sendError">{{ sendError }}</span>
+              <button @click="resetSend" class="ml-auto text-xs flex-shrink-0"
+                style="color:var(--text-muted)">关闭</button>
             </div>
 
             <!-- Device list -->
             <div class="flex-1 min-h-0 flex flex-col gap-2">
               <div class="flex items-center justify-between flex-shrink-0">
-                <p class="text-xs text-gray-500">选择目标设备发送</p>
-                <button @click="startScan" :class="['text-xs px-2 py-1 rounded-lg transition-colors', scanning ? 'text-cyan-400 animate-pulse' : 'text-gray-500 hover:text-gray-300 bg-gray-800/60']">
+                <p class="text-xs" style="color:var(--text-muted)">选择目标设备发送</p>
+                <button @click="startScan"
+                  :style="scanning ? `color:var(--accent)` : `color:var(--text-muted);background:var(--bg-muted)`"
+                  :class="['text-xs px-2 py-1 rounded-lg transition-colors', scanning ? 'animate-pulse' : '']">
                   {{ scanning ? '扫描中…' : '🔄 刷新' }}
                 </button>
               </div>
-              <div v-if="peersOnly.length === 0" class="text-center text-gray-600 py-8 text-sm">
+              <div v-if="peersOnly.length === 0" class="text-center py-8 text-sm" style="color:var(--text-faint)">
                 {{ scanning ? '正在扫描局域网…' : '未发现设备 — 点击刷新' }}
               </div>
               <div v-for="dev in peersOnly" :key="dev.name"
                 @click="selectedPath && sendToDevice(dev)"
-                :class="['rounded-xl p-3.5 flex items-center gap-3 ring-1 ring-white/5 transition-all',
-                  selectedPath
-                    ? 'bg-gray-900/80 hover:bg-cyan-900/30 hover:ring-cyan-500/30 cursor-pointer'
-                    : 'bg-gray-900/40 opacity-50 cursor-not-allowed']">
-                <div class="w-2.5 h-2.5 rounded-full bg-green-400 flex-shrink-0"></div>
+                :style="selectedPath
+                  ? `background:var(--bg-card);box-shadow:0 0 0 1px var(--border);cursor:pointer`
+                  : `background:var(--bg-card);opacity:0.45;cursor:not-allowed`"
+                class="rounded-xl p-3.5 flex items-center gap-3 transition-all">
+                <div class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background:#4ade80"></div>
                 <div class="flex-1 min-w-0">
-                  <p class="text-sm font-medium text-gray-200">{{ shortName(dev.name) }}</p>
-                  <p class="text-xs text-gray-500">{{ dev.addr }}
-                    <span v-if="dev.lastSeen" class="ml-1 text-gray-700">· {{ fmtLastSeen(dev.lastSeen) }}</span>
+                  <p class="text-sm font-medium" style="color:var(--text-primary)">{{ shortName(dev.name) }}</p>
+                  <p class="text-xs" style="color:var(--text-muted)">{{ dev.addr }}
+                    <span v-if="dev.lastSeen" class="ml-1" style="color:var(--text-faint)">· {{ fmtLastSeen(dev.lastSeen) }}</span>
                   </p>
                 </div>
-                <span v-if="selectedPath" class="text-xs text-cyan-400 flex-shrink-0">发送 →</span>
+                <span v-if="selectedPath" class="text-xs flex-shrink-0" style="color:var(--accent)">发送 →</span>
               </div>
-              <p v-if="!selectedPath && peersOnly.length > 0" class="text-xs text-gray-600 text-center">请先选择要发送的文件</p>
+              <p v-if="!selectedPath && peersOnly.length > 0" class="text-xs text-center" style="color:var(--text-faint)">请先选择要发送的文件</p>
             </div>
 
           </div>
@@ -516,65 +554,79 @@ function highlightSegments(line: string, ranges: [number,number][]) {
         <!-- RECEIVE TAB -->
         <template v-else-if="tab === 'receive'">
           <div class="flex-1 flex flex-col gap-4 min-h-0">
-            <p class="text-xs text-gray-500 flex-shrink-0">自动接收 — 有人向你发送文件时会在此显示</p>
+            <p class="text-xs flex-shrink-0" style="color:var(--text-muted)">自动接收 — 有人向你发送文件时会在此显示</p>
 
-            <div v-if="recvPhase === 'transferring'" class="bg-gray-900/80 rounded-xl p-4 ring-1 ring-cyan-500/20 flex-shrink-0">
+            <div v-if="recvPhase === 'transferring'"
+              class="rounded-xl p-4 flex-shrink-0"
+              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--accent-ring)">
               <div class="flex items-center justify-between mb-2">
-                <span class="text-sm text-gray-300">接收中 ← <span class="text-cyan-300">{{ recvPeer }}</span></span>
+                <span class="text-sm" style="color:var(--text-secondary)">
+                  接收中 ← <span :style="`color:var(--accent)`">{{ recvPeer }}</span>
+                </span>
                 <div class="flex items-center gap-2 flex-shrink-0">
-                  <span v-if="recvEta" class="text-xs text-gray-500">剩 {{ recvEta }}</span>
-                  <span class="text-sm text-cyan-300">{{ recvSpeed }}</span>
+                  <span v-if="recvEta" class="text-xs" style="color:var(--text-muted)">剩 {{ recvEta }}</span>
+                  <span class="text-sm" :style="`color:var(--accent)`">{{ recvSpeed }}</span>
                 </div>
               </div>
-              <div class="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
+              <div class="w-full rounded-full h-2 overflow-hidden" style="background:var(--bg-muted)">
                 <div v-if="recvIndeterminate"
-                  class="h-2 rounded-full bg-cyan-500 animate-[slide_1.5s_ease-in-out_infinite]"
-                  style="width:40%"></div>
-                <div v-else class="bg-cyan-500 h-2 rounded-full transition-all duration-300"
+                  class="h-2 rounded-full animate-[slide_1.5s_ease-in-out_infinite]"
+                  style="width:40%;background:var(--accent)"></div>
+                <div v-else class="h-2 rounded-full transition-all duration-300"
+                  style="background:var(--accent)"
                   :style="{ width: (recvPct ?? 0) + '%' }"></div>
               </div>
-              <div class="flex justify-between mt-1 text-xs text-gray-500">
+              <div class="flex justify-between mt-1 text-xs" style="color:var(--text-muted)">
                 <span>{{ fmtBytes(recvProgress.bytes_done) }}</span>
                 <span>{{ recvIndeterminate ? '计算中…' : (recvPct !== null ? recvPct + '%' : '…') }}</span>
               </div>
             </div>
 
-            <div v-else-if="recvPhase === 'done'" class="bg-green-900/20 rounded-xl p-3 ring-1 ring-green-500/20 flex items-center gap-3 flex-shrink-0">
+            <div v-else-if="recvPhase === 'done'"
+              class="rounded-xl p-3 flex items-center gap-3 flex-shrink-0"
+              style="background:rgba(34,197,94,0.08);box-shadow:0 0 0 1px rgba(34,197,94,0.2)">
               <span class="text-2xl">✅</span>
               <div class="flex-1 min-w-0">
-                <p class="text-green-300 text-sm">接收完成！{{ fmtBytes(recvProgress.bytes_done) }}</p>
-                <button @click="revealInFolder(savedPath)" class="text-xs text-cyan-400 hover:text-cyan-300 truncate block max-w-full text-left mt-0.5" :title="savedPath">
+                <p class="text-sm" style="color:#86efac">接收完成！{{ fmtBytes(recvProgress.bytes_done) }}</p>
+                <button @click="revealInFolder(savedPath)"
+                  class="text-xs truncate block max-w-full text-left mt-0.5 hover:underline"
+                  style="color:var(--accent)" :title="savedPath">
                   📂 {{ savedPath }}
                 </button>
               </div>
-              <button @click="resetRecv" class="text-xs text-gray-500 hover:text-gray-300 flex-shrink-0">关闭</button>
+              <button @click="resetRecv" class="text-xs flex-shrink-0" style="color:var(--text-muted)">关闭</button>
             </div>
 
-            <div v-else-if="recvPhase === 'error'" class="bg-red-900/20 rounded-xl p-3 ring-1 ring-red-500/20 flex items-center gap-3 flex-shrink-0">
+            <div v-else-if="recvPhase === 'error'"
+              class="rounded-xl p-3 flex items-center gap-3 flex-shrink-0"
+              style="background:rgba(239,68,68,0.08);box-shadow:0 0 0 1px rgba(239,68,68,0.2)">
               <span class="text-2xl">❌</span>
-              <span class="text-red-400 text-sm truncate flex-1">{{ recvError }}</span>
-              <button @click="resetRecv" class="text-xs text-gray-500 hover:text-gray-300 flex-shrink-0">关闭</button>
+              <span class="text-sm truncate flex-1" style="color:#fca5a5">{{ recvError }}</span>
+              <button @click="resetRecv" class="text-xs flex-shrink-0" style="color:var(--text-muted)">关闭</button>
             </div>
 
-            <div v-else class="flex flex-col items-center justify-center py-10 text-gray-600 flex-shrink-0">
+            <div v-else class="flex flex-col items-center justify-center py-10 flex-shrink-0" style="color:var(--text-faint)">
               <div class="text-4xl mb-2">📥</div>
               <p class="text-sm">等待接收…</p>
               <p class="text-xs mt-1">文件将保存到下载目录</p>
             </div>
 
-            <!-- History: clickable to reveal in folder -->
+            <!-- History -->
             <div v-if="recvHistory.length > 0" class="flex-1 min-h-0 overflow-y-auto space-y-1">
-              <p class="text-xs text-gray-600 mb-2">接收历史</p>
+              <p class="text-xs mb-2" style="color:var(--text-faint)">接收历史</p>
               <div v-for="(h, i) in recvHistory" :key="i"
-                class="bg-gray-900/60 rounded-lg p-2.5 flex items-center gap-2 text-xs group">
-                <span class="text-green-400 flex-shrink-0">✓</span>
+                class="rounded-lg p-2.5 flex items-center gap-2 text-xs group"
+                style="background:var(--bg-card)">
+                <span class="flex-shrink-0" style="color:#4ade80">✓</span>
                 <button @click="revealInFolder(h.path)"
-                  class="text-gray-400 truncate flex-1 text-left hover:text-cyan-300 transition-colors"
-                  :title="h.path">
+                  class="truncate flex-1 text-left transition-colors hover:underline"
+                  style="color:var(--text-secondary)" :title="h.path">
                   {{ h.path.split(/[/\\]/).pop() }}
                 </button>
-                <span class="text-gray-600 flex-shrink-0">{{ fmtBytes(h.bytes) }}</span>
-                <button @click="revealInFolder(h.path)" class="text-gray-700 hover:text-cyan-400 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0" title="打开所在目录">📂</button>
+                <span class="flex-shrink-0" style="color:var(--text-faint)">{{ fmtBytes(h.bytes) }}</span>
+                <button @click="revealInFolder(h.path)"
+                  class="opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
+                  style="color:var(--accent)" title="打开所在目录">📂</button>
               </div>
             </div>
           </div>
@@ -584,19 +636,22 @@ function highlightSegments(line: string, ranges: [number,number][]) {
         <template v-else-if="tab === 'devices'">
           <div class="flex-1 flex flex-col gap-4 max-w-lg mx-auto w-full">
             <div class="flex items-center justify-between">
-              <h2 class="text-gray-300 font-medium text-sm">局域网设备</h2>
-              <button @click="startScan" :class="['px-3 py-1.5 rounded-lg text-xs transition-colors', scanning ? 'text-cyan-400 animate-pulse bg-gray-800/60' : 'bg-gray-800/80 hover:bg-gray-700']">
+              <h2 class="font-medium text-sm" style="color:var(--text-secondary)">局域网设备</h2>
+              <button @click="startScan"
+                :style="scanning ? `color:var(--accent);background:var(--bg-muted)` : `background:var(--bg-muted);color:var(--text-secondary)`"
+                :class="['px-3 py-1.5 rounded-lg text-xs transition-colors', scanning ? 'animate-pulse' : '']">
                 {{ scanning ? '扫描中…' : '🔄 扫描' }}
               </button>
             </div>
-            <div v-if="devices.length === 0" class="text-center text-gray-600 py-12 text-sm">未发现设备 — 点击扫描</div>
+            <div v-if="devices.length === 0" class="text-center py-12 text-sm" style="color:var(--text-faint)">未发现设备 — 点击扫描</div>
             <div v-for="dev in devices" :key="dev.name"
-              class="bg-gray-900/80 rounded-xl p-3.5 flex items-center gap-4 ring-1 ring-white/5">
-              <div class="w-3 h-3 rounded-full flex-shrink-0 bg-green-400"></div>
+              class="rounded-xl p-3.5 flex items-center gap-4"
+              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+              <div class="w-3 h-3 rounded-full flex-shrink-0" style="background:#4ade80"></div>
               <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-gray-200 truncate">{{ shortName(dev.name) }}</p>
-                <p class="text-xs text-gray-500">{{ dev.addr }}
-                  <span v-if="dev.lastSeen" class="ml-1 text-gray-700">· {{ fmtLastSeen(dev.lastSeen) }}</span>
+                <p class="text-sm font-medium truncate" style="color:var(--text-primary)">{{ shortName(dev.name) }}</p>
+                <p class="text-xs" style="color:var(--text-muted)">{{ dev.addr }}
+                  <span v-if="dev.lastSeen" class="ml-1" style="color:var(--text-faint)">· {{ fmtLastSeen(dev.lastSeen) }}</span>
                 </p>
               </div>
             </div>
@@ -606,70 +661,81 @@ function highlightSegments(line: string, ranges: [number,number][]) {
         <!-- SEARCH TAB -->
         <template v-else-if="tab === 'search'">
           <div class="flex-1 flex flex-col gap-3 min-h-0">
-            <!-- Controls row -->
+            <!-- Controls -->
             <div class="flex items-center gap-2 flex-shrink-0 flex-wrap">
               <div class="flex items-center gap-1 flex-shrink-0">
                 <input v-model="searchPath" placeholder="搜索路径" :title="searchPath"
-                  class="w-44 bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:border-cyan-500 transition-colors" />
-                <button @click="pickSearchPath" class="px-2 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs transition-colors" title="选择目录">📂</button>
+                  class="w-44 rounded-lg px-2 py-1.5 text-xs focus:outline-none transition-colors"
+                  style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+                <button @click="pickSearchPath"
+                  class="px-2 py-1.5 rounded-lg text-xs transition-colors"
+                  style="background:var(--bg-muted);color:var(--text-secondary)" title="选择目录">📂</button>
               </div>
-              <select v-model="searchMode" class="bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-xs focus:outline-none flex-shrink-0">
+              <select v-model="searchMode"
+                class="rounded-lg px-2 py-1.5 text-xs focus:outline-none flex-shrink-0"
+                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)">
                 <option value="filename">🗂 文件名</option>
                 <option value="text">📄 文本</option>
               </select>
               <input v-model="searchPattern" @keyup.enter="doSearch" placeholder="搜索内容…"
-                class="flex-1 min-w-[120px] bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500 transition-colors" />
-              <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer flex-shrink-0">
+                class="flex-1 min-w-[120px] rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
+                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+              <label class="flex items-center gap-1 text-xs cursor-pointer flex-shrink-0" style="color:var(--text-secondary)">
                 <input type="checkbox" v-model="searchIgnoreCase" class="accent-cyan-500" />忽略大小写
               </label>
-              <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer flex-shrink-0">
+              <label class="flex items-center gap-1 text-xs cursor-pointer flex-shrink-0" style="color:var(--text-secondary)">
                 <input type="checkbox" v-model="searchFixed" class="accent-cyan-500" />纯文本
               </label>
               <button v-if="!searchRunning" @click="doSearch"
-                class="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-xs font-medium transition-colors flex-shrink-0">🔍 搜索</button>
+                class="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex-shrink-0 text-white"
+                style="background:var(--accent)">🔍 搜索</button>
               <button v-else @click="stopSearch"
-                class="px-3 py-1.5 bg-red-700 hover:bg-red-600 rounded-lg text-xs transition-colors flex-shrink-0">⏹ 取消</button>
+                class="px-3 py-1.5 rounded-lg text-xs transition-colors flex-shrink-0 text-white"
+                style="background:#b91c1c">⏹ 取消</button>
             </div>
             <!-- Status + filter -->
             <div class="flex items-center gap-2 flex-shrink-0">
-              <span class="text-xs text-gray-500 flex-1">{{ searchStatus }}</span>
+              <span class="text-xs flex-1" style="color:var(--text-muted)">{{ searchStatus }}</span>
               <input v-if="searchResults.length > 0" :value="searchFilter"
                 @input="onSearchFilterInput(($event.target as HTMLInputElement).value)"
                 placeholder="过滤结果…"
-                class="w-36 bg-gray-900 border border-gray-700 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-cyan-500 transition-colors" />
+                class="w-36 rounded-lg px-2 py-1 text-xs focus:outline-none transition-colors"
+                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
             </div>
             <!-- Results -->
             <div class="flex-1 overflow-y-auto space-y-1 pr-1 min-h-0">
-              <div v-if="filteredResults.length === 0 && !searchRunning" class="text-center text-gray-600 py-16 text-sm">
+              <div v-if="filteredResults.length === 0 && !searchRunning"
+                class="text-center py-16 text-sm" style="color:var(--text-faint)">
                 {{ searchResults.length === 0 ? '输入内容后按回车搜索' : '无匹配结果' }}
               </div>
-              <div v-for="r in filteredResults" :key="r.path" class="bg-gray-900/80 rounded-xl p-3 ring-1 ring-white/5 group">
+              <div v-for="r in filteredResults" :key="r.path"
+                class="rounded-xl p-3 group"
+                style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
                 <div class="flex items-center gap-2 mb-1">
                   <span class="flex-shrink-0">{{ r.icon }}</span>
-                  <!-- Clickable path: opens containing folder -->
                   <button @click="revealInFolder(r.path)"
-                    class="text-xs text-cyan-300 font-mono truncate flex-1 text-left hover:text-cyan-200 hover:underline transition-colors"
-                    :title="r.path">{{ r.path }}</button>
-                  <span class="text-xs text-gray-600 flex-shrink-0">{{ r.matches.length }} 处</span>
+                    class="text-xs font-mono truncate flex-1 text-left hover:underline transition-colors"
+                    style="color:var(--accent)" :title="r.path">{{ r.path }}</button>
+                  <span class="text-xs flex-shrink-0" style="color:var(--text-faint)">{{ r.matches.length }} 处</span>
                   <button @click="revealInFolder(r.path)"
-                    class="text-gray-700 hover:text-cyan-400 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0 text-xs"
-                    title="打开所在目录">📂</button>
+                    class="opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0 text-xs"
+                    style="color:var(--accent)" title="打开所在目录">📂</button>
                 </div>
                 <div v-if="searchMode === 'filename'" class="font-mono text-xs mt-0.5">
                   <template v-for="seg in cachedHighlight(r.path, r.matches[0].line_num, r.matches[0].line, r.matches[0].ranges)" :key="seg.text">
-                    <span :class="seg.hl ? 'bg-yellow-400/30 text-yellow-200 rounded px-0.5' : 'text-gray-400'">{{ seg.text }}</span>
+                    <span :style="seg.hl ? 'background:rgba(250,204,21,0.25);color:#fde68a;border-radius:2px;padding:0 2px' : `color:var(--text-secondary)`">{{ seg.text }}</span>
                   </template>
                 </div>
                 <div v-else class="space-y-0.5 mt-1">
                   <div v-for="(m, mi) in r.matches.slice(0, 5)" :key="mi" class="flex gap-2 font-mono text-xs">
-                    <span class="text-green-500 w-8 text-right flex-shrink-0">{{ m.line_num }}:</span>
+                    <span class="w-8 text-right flex-shrink-0" style="color:#4ade80">{{ m.line_num }}:</span>
                     <span class="truncate">
                       <template v-for="seg in cachedHighlight(r.path, m.line_num, m.line, m.ranges)" :key="seg.text">
-                        <span :class="seg.hl ? 'bg-yellow-400/30 text-yellow-200 rounded px-0.5' : 'text-gray-300'">{{ seg.text }}</span>
+                        <span :style="seg.hl ? 'background:rgba(250,204,21,0.25);color:#fde68a;border-radius:2px;padding:0 2px' : `color:var(--text-secondary)`">{{ seg.text }}</span>
                       </template>
                     </span>
                   </div>
-                  <div v-if="r.matches.length > 5" class="text-xs text-gray-600 pl-10">…另外 {{ r.matches.length - 5 }} 处</div>
+                  <div v-if="r.matches.length > 5" class="text-xs pl-10" style="color:var(--text-faint)">…另外 {{ r.matches.length - 5 }} 处</div>
                 </div>
               </div>
             </div>
@@ -680,43 +746,55 @@ function highlightSegments(line: string, ranges: [number,number][]) {
         <template v-else-if="tab === 'sync'">
           <div class="flex-1 flex flex-col gap-4 min-h-0 max-w-xl mx-auto w-full">
             <!-- Status bar -->
-            <div class="flex items-center gap-3 bg-gray-900 rounded-xl px-4 py-2 text-xs flex-shrink-0">
-              <span :class="syncStatus.is_running ? 'text-yellow-400 animate-pulse' : 'text-green-400'">
+            <div class="flex items-center gap-3 rounded-xl px-4 py-2 text-xs flex-shrink-0"
+              style="background:var(--bg-card)">
+              <span :style="syncStatus.is_running ? 'color:#facc15' : 'color:#4ade80'"
+                :class="syncStatus.is_running ? 'animate-pulse' : ''">
                 {{ syncStatus.is_running ? '⏳ 同步中…' : '✅ 空闲' }}
               </span>
-              <span class="text-gray-600">上次: {{ syncStatus.last_sync ?? '从未同步' }}</span>
-              <span class="text-gray-600">共 {{ syncStatus.total_files }} 个文件 / {{ syncStatus.total_bytes }}</span>
-              <span v-if="syncStatus.is_watching" class="ml-auto text-cyan-400">👁 监听中</span>
+              <span style="color:var(--text-faint)">上次: {{ syncStatus.last_sync ?? '从未同步' }}</span>
+              <span style="color:var(--text-faint)">共 {{ syncStatus.total_files }} 个文件 / {{ syncStatus.total_bytes }}</span>
+              <span v-if="syncStatus.is_watching" class="ml-auto" style="color:var(--accent)">👁 监听中</span>
             </div>
             <!-- Config -->
             <div class="space-y-3 flex-shrink-0">
               <div class="flex gap-2 items-center">
-                <span class="text-xs text-gray-500 w-8 flex-shrink-0">源</span>
+                <span class="text-xs w-8 flex-shrink-0" style="color:var(--text-muted)">源</span>
                 <input v-model="syncConfig.src" placeholder="源目录路径" :title="syncConfig.src"
-                  class="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500 transition-colors" />
-                <button @click="pickSyncSrc" class="px-2 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs transition-colors flex-shrink-0">📂</button>
+                  class="flex-1 rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
+                  style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+                <button @click="pickSyncSrc"
+                  class="px-2 py-1.5 rounded-lg text-xs transition-colors flex-shrink-0"
+                  style="background:var(--bg-muted);color:var(--text-secondary)">📂</button>
               </div>
               <div class="flex gap-2 items-center">
-                <span class="text-xs text-gray-500 w-8 flex-shrink-0">目标</span>
+                <span class="text-xs w-8 flex-shrink-0" style="color:var(--text-muted)">目标</span>
                 <input v-model="syncConfig.dst" placeholder="目标目录路径" :title="syncConfig.dst"
-                  class="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-cyan-500 transition-colors" />
-                <button @click="pickSyncDst" class="px-2 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs transition-colors flex-shrink-0">📂</button>
+                  class="flex-1 rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
+                  style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+                <button @click="pickSyncDst"
+                  class="px-2 py-1.5 rounded-lg text-xs transition-colors flex-shrink-0"
+                  style="background:var(--bg-muted);color:var(--text-secondary)">📂</button>
               </div>
-              <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+              <label class="flex items-center gap-2 text-xs cursor-pointer" style="color:var(--text-secondary)">
                 <input type="checkbox" v-model="syncConfig.delete_removed" class="accent-cyan-500" />删除已移除的文件
               </label>
               <div class="space-y-1">
-                <p class="text-xs text-gray-500">排除规则</p>
+                <p class="text-xs" style="color:var(--text-muted)">排除规则</p>
                 <div class="flex gap-2">
                   <input v-model="syncExcludeInput" @keyup.enter="addExclude" placeholder="*.tmp 或 node_modules"
-                    class="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1 text-xs focus:outline-none focus:border-cyan-500 transition-colors" />
-                  <button @click="addExclude" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded text-xs transition-colors">+</button>
+                    class="flex-1 rounded-lg px-3 py-1 text-xs focus:outline-none transition-colors"
+                    style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+                  <button @click="addExclude"
+                    class="px-2 py-1 rounded text-xs transition-colors"
+                    style="background:var(--bg-muted);color:var(--text-secondary)">+</button>
                 </div>
                 <div class="flex flex-wrap gap-1 mt-1">
                   <span v-for="(ex, i) in syncConfig.excludes" :key="i"
-                    class="flex items-center gap-1 bg-gray-800 text-gray-400 text-xs px-2 py-0.5 rounded-full">
+                    class="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full"
+                    style="background:var(--bg-muted);color:var(--text-secondary)">
                     {{ ex }}
-                    <button @click="removeExclude(i)" class="text-gray-600 hover:text-red-400 leading-none">×</button>
+                    <button @click="removeExclude(i)" class="leading-none" style="color:var(--text-muted)">×</button>
                   </span>
                 </div>
               </div>
@@ -724,21 +802,27 @@ function highlightSegments(line: string, ranges: [number,number][]) {
             <!-- Actions -->
             <div class="flex gap-2 flex-shrink-0">
               <button @click="saveAndSync" :disabled="syncStatus.is_running"
-                :class="['flex-1 py-2 rounded-lg text-sm font-medium transition-colors',
-                  syncStatus.is_running ? 'bg-gray-800 text-gray-600 cursor-not-allowed' : 'bg-cyan-600 hover:bg-cyan-500 text-white']">
+                :style="syncStatus.is_running
+                  ? `background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed`
+                  : `background:var(--accent);color:#fff`"
+                class="flex-1 py-2 rounded-lg text-sm font-medium transition-colors">
                 {{ syncStatus.is_running ? '同步中…' : '🔄 立即同步' }}
               </button>
               <button @click="toggleWatch"
-                :class="['px-4 py-2 rounded-lg text-sm transition-colors',
-                  syncStatus.is_watching ? 'bg-yellow-700 hover:bg-yellow-600 text-white' : 'bg-gray-800 hover:bg-gray-700 text-gray-300']">
+                :style="syncStatus.is_watching
+                  ? 'background:#92400e;color:#fff'
+                  : `background:var(--bg-muted);color:var(--text-secondary)`"
+                class="px-4 py-2 rounded-lg text-sm transition-colors">
                 {{ syncStatus.is_watching ? '⏹ 停止监听' : '👁 实时监听' }}
               </button>
             </div>
             <!-- Log -->
-            <div class="flex-1 overflow-y-auto bg-gray-900 rounded-xl p-3 font-mono text-xs space-y-0.5 min-h-0">
-              <div v-if="syncLog.length === 0" class="text-gray-600 text-center py-4">日志将在此显示</div>
+            <div class="flex-1 overflow-y-auto rounded-xl p-3 font-mono text-xs space-y-0.5 min-h-0"
+              style="background:var(--bg-card)">
+              <div v-if="syncLog.length === 0" class="text-center py-4" style="color:var(--text-faint)">日志将在此显示</div>
               <div v-for="(line, i) in syncLog" :key="i"
-                :class="['leading-5', line.startsWith('❌') ? 'text-red-400' : line.startsWith('🗑') ? 'text-yellow-500' : 'text-gray-400']">
+                :style="line.startsWith('❌') ? 'color:#f87171' : line.startsWith('🗑') ? 'color:#facc15' : `color:var(--text-secondary)`"
+                class="leading-5">
                 {{ line }}
               </div>
             </div>
@@ -748,7 +832,8 @@ function highlightSegments(line: string, ranges: [number,number][]) {
       </main>
     </div>
 
-    <footer class="text-center text-[11px] text-gray-700 py-1.5 border-t border-white/5 bg-[#161b22]">
+    <footer class="text-center text-[11px] py-1.5"
+      style="color:var(--text-faint);border-top:1px solid var(--border);background:var(--bg-surface)">
       rust-air v0.3 · E2EE · mDNS · SHA-256 · 快捷键 1-5 切换标签
     </footer>
   </div>
