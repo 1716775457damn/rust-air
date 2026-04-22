@@ -16,7 +16,15 @@ use std::{
     sync::mpsc::Sender,
     time::Instant,
 };
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
+
+/// NFD → NFC: macOS HFS+ stores paths in NFD; compose to NFC for correct display.
+#[inline]
+fn nfc(s: &str) -> String {
+    if s.is_ascii() { return s.to_owned(); }
+    s.nfc().collect()
+}
 
 // ── Public event type ─────────────────────────────────────────────────────────
 
@@ -163,7 +171,7 @@ pub fn sync_file(
     tx: &Sender<SyncEvent>,
 ) {
     let rel_path = match abs.strip_prefix(src) { Ok(r) => r, Err(_) => return };
-    let rel = rel_path.to_string_lossy().replace('\\', "/");
+    let rel = nfc(&rel_path.to_string_lossy().replace('\\', "/"));
     if excludes.matches(&rel) { return; }
 
     let dst_path = dst.join(rel_path);
@@ -304,7 +312,7 @@ fn scan_needed(
         if !entry.file_type().is_file() { continue; }
         let abs = entry.path();
         let rel = match abs.strip_prefix(src) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Ok(r) => nfc(&r.to_string_lossy().replace('\\', "/")),
             Err(_) => continue,
         };
         scanned += 1;

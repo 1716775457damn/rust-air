@@ -1,4 +1,4 @@
-use encoding_rs::GBK;
+use encoding_rs::{BIG5, GBK, UTF_16BE, UTF_16LE};
 use ignore::WalkBuilder;
 use memmap2::Mmap;
 use regex::RegexBuilder;
@@ -13,6 +13,7 @@ use std::{
     thread,
 };
 use tauri::{AppHandle, Emitter, State};
+use unicode_normalization::UnicodeNormalization;
 
 const MAX_RESULTS: usize = 2000;
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
@@ -189,13 +190,15 @@ pub fn cancel_search(state: State<'_, SearchState>) {
 
 fn search_filename(path: &Path, re: &regex::Regex) -> Option<FileResult> {
     let name = path.file_name()?.to_string_lossy();
-    let ranges = byte_ranges_to_char_ranges(name.as_ref(), re);
+    // NFC-normalise before matching so macOS NFD filenames aren't missed
+    let name_nfc: String = if name.is_ascii() { name.into_owned() } else { name.nfc().collect() };
+    let ranges = byte_ranges_to_char_ranges(&name_nfc, re);
     if ranges.is_empty() { return None; }
     let display = normalize_path(path);
     Some(FileResult {
         icon: file_icon(&display).to_string(),
         path: display,
-        matches: vec![MatchLine { line_num: 0, line: name.into_owned(), ranges }],
+        matches: vec![MatchLine { line_num: 0, line: name_nfc, ranges }],
     })
 }
 
@@ -260,10 +263,11 @@ fn byte_ranges_to_char_ranges(line: &str, re: &regex::Regex) -> Vec<(usize, usiz
     ranges
 }
 
-/// Normalise path separators to forward-slash for cross-platform display.
+/// Normalise path separators to forward-slash and apply NFC for macOS HFS+ paths.
 #[inline]
 fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let s = path.to_string_lossy().replace('\\', "/");
+    if s.is_ascii() { s } else { s.nfc().collect() }
 }
 
 /// Truncate a line to `MAX_LINE_LEN` chars, appending `…`.
@@ -275,24 +279,54 @@ fn truncate_line(line: &str) -> String {
     format!("{}…", &line[..end])
 }
 
-/// Heuristic binary detection on the first chunk.
-/// Treats the file as binary if it contains null bytes OR if more than 30% of
-/// sampled bytes are non-printable non-whitespace ASCII (common in compiled files).
+/// Detect binary. UTF-16 files have a BOM and many null bytes — exempt them.
 #[inline]
 fn is_binary(data: &[u8]) -> bool {
     let sample = &data[..data.len().min(BINARY_CHECK_LEN)];
+    // UTF-16 LE/BE BOM — text, not binary
+    if sample.len() >= 2
+        && ((sample[0] == 0xFF && sample[1] == 0xFE)
+         || (sample[0] == 0xFE && sample[1] == 0xFF))
+    {
+        return false;
+    }
     if sample.contains(&0) { return true; }
     let non_text = sample.iter().filter(|&&b| b < 0x09 || (b > 0x0d && b < 0x20) || b == 0x7f).count();
-    non_text * 10 > sample.len() * 3  // > 30%
+    non_text * 10 > sample.len() * 3
 }
 
-/// Decode bytes as UTF-8; fall back to GBK. Avoids double-copy by borrowing
-/// the input slice directly when it is valid UTF-8.
+/// Decode bytes: UTF-16 BOM → UTF-16, UTF-8 BOM → UTF-8, UTF-8 → borrow,
+/// then Big5 vs GBK competition (fewer replacement chars wins).
 fn decode_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
-    match std::str::from_utf8(bytes) {
-        Ok(s)  => std::borrow::Cow::Borrowed(s),
-        Err(_) => std::borrow::Cow::Owned(GBK.decode(bytes).0.into_owned()),
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let (cow, _, _) = UTF_16LE.decode(bytes);
+        return std::borrow::Cow::Owned(cow.into_owned());
     }
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let (cow, _, _) = UTF_16BE.decode(bytes);
+        return std::borrow::Cow::Owned(cow.into_owned());
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        return match std::str::from_utf8(&bytes[3..]) {
+            Ok(s)  => std::borrow::Cow::Borrowed(s),
+            Err(_) => std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes[3..]).into_owned()),
+        };
+    }
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let (big5_cow, _, big5_err) = BIG5.decode(bytes);
+    let (gbk_cow,  _, gbk_err)  = GBK.decode(bytes);
+    if !big5_err && gbk_err  { return std::borrow::Cow::Owned(big5_cow.into_owned()); }
+    if !gbk_err  && big5_err { return std::borrow::Cow::Owned(gbk_cow.into_owned()); }
+    let big5_bad = big5_cow.chars().filter(|&c| c == '\u{FFFD}').count();
+    let gbk_bad  = gbk_cow.chars().filter(|&c| c == '\u{FFFD}').count();
+    #[cfg(target_os = "macos")]
+    let prefer_big5 = big5_bad <= gbk_bad;
+    #[cfg(not(target_os = "macos"))]
+    let prefer_big5 = big5_bad < gbk_bad;
+    if prefer_big5 { std::borrow::Cow::Owned(big5_cow.into_owned()) }
+    else           { std::borrow::Cow::Owned(gbk_cow.into_owned()) }
 }
 
 fn file_icon(path: &str) -> &'static str {

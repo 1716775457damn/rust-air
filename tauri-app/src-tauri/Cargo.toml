@@ -34,3 +34,4 @@ notify             = "6"
 hex                = "0.4"
 arboard            = "3"
 image              = { version = "0.25", default-features = false, features = ["png"] }
+unicode-normalization = "0.1"
