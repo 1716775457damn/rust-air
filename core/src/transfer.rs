@@ -342,7 +342,8 @@ pub async fn send_clipboard(
     on_progress: impl Fn(TransferEvent) + Send + 'static,
 ) -> Result<()> {
     let key = random_key();
-    let data = text.as_bytes().to_vec();
+    // Borrow bytes directly — no clone of the clipboard content.
+    let data = text.as_bytes();
     let total_size = data.len() as u64;
 
     let (mut rx, mut tx) = stream.into_split();
@@ -374,21 +375,15 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
-/// Find a non-colliding path by atomically probing with create_new.
+/// Find a non-colliding path using existence checks — no temp file creation.
 fn unique_path(path: PathBuf) -> PathBuf {
-    if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
-        let _ = std::fs::remove_file(&path);
-        return path;
-    }
+    if !path.exists() { return path; }
     let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
     let ext  = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let dir  = path.parent().unwrap_or(std::path::Path::new("."));
     for i in 1u32.. {
         let candidate = dir.join(format!("{stem} ({i}){ext}"));
-        if std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate).is_ok() {
-            let _ = std::fs::remove_file(&candidate);
-            return candidate;
-        }
+        if !candidate.exists() { return candidate; }
     }
     path
 }

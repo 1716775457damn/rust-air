@@ -152,17 +152,19 @@ pub fn full_sync(
 }
 
 /// Sync a single file (called from the watcher on change events).
+/// Accepts a pre-built `ExcludeSet` so callers that process a batch of files
+/// don't rebuild it on every call.
 pub fn sync_file(
     abs: &Path,
     src: &Path,
     dst: &Path,
     store: &mut SyncStore,
-    excludes: &[String],
+    excludes: &ExcludeSet,
     tx: &Sender<SyncEvent>,
 ) {
     let rel_path = match abs.strip_prefix(src) { Ok(r) => r, Err(_) => return };
     let rel = rel_path.to_string_lossy().replace('\\', "/");
-    if ExcludeSet::new(excludes).matches(&rel) { return; }
+    if excludes.matches(&rel) { return; }
 
     let dst_path = dst.join(rel_path);
 
@@ -219,11 +221,12 @@ pub fn start_watcher(
 
     std::thread::spawn(move || {
         loop {
-            // Exit when watcher is dropped (stop_tx dropped → recv returns Err).
-            if stop_rx.try_recv() == Err(std::sync::mpsc::TryRecvError::Disconnected) {
-                return;
+            // Block for up to DEBOUNCE_MS waiting for a stop signal.
+            // This replaces the 100ms busy-poll with a true sleep-until-event.
+            match stop_rx.recv_timeout(Duration::from_millis(DEBOUNCE_MS)) {
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            std::thread::sleep(Duration::from_millis(100));
             let mut map = pending_flush.lock().unwrap();
             let ready: Vec<PathBuf> = map.iter()
                 .filter(|(_, t)| t.elapsed() >= Duration::from_millis(DEBOUNCE_MS))
@@ -384,7 +387,7 @@ fn atomic_copy(
     }
 }
 
-struct ExcludeSet {
+pub struct ExcludeSet {
     exact: HashSet<String>,
     exts:  HashSet<String>,
 }

@@ -159,9 +159,11 @@ pub fn start_watch(state: State<'_, SyncState>, app: AppHandle) -> Result<(), St
             }
         });
         let mut store = SyncStore::load();
+        // Build ExcludeSet once outside the loop — not per-file
+        let ex = rust_air_core::sync_vault::ExcludeSet::new(&excludes);
         while let Ok(paths) = rx.recv() {
             for abs in paths {
-                rust_air_core::sync_vault::sync_file(&abs, &src, &dst, &mut store, &excludes, &ev_tx);
+                rust_air_core::sync_vault::sync_file(&abs, &src, &dst, &mut store, &ex, &ev_tx);
             }
             store.flush_if_needed();
         }

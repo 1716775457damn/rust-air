@@ -10,5 +10,6 @@ pub mod transfer;
 
 pub use proto::{DeviceInfo, DeviceStatus, TransferEvent};
 pub use sync_vault::{SyncConfig, SyncEvent, SyncStore, full_sync, start_watcher, fmt_bytes, default_excludes};
+pub use sync_vault::ExcludeSet;
 pub use clipboard_history::{ClipContent, ClipEntry, HistoryStore};
 pub use transfer::{send_clipboard};
