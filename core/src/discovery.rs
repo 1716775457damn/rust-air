@@ -159,8 +159,6 @@ fn is_link_local_v4(addr: &str) -> bool { addr.starts_with("169.254.") }
 /// Uses multiple UDP routing-trick targets to discover addresses on different
 /// interfaces (e.g. Wi-Fi + Ethernet simultaneously active).
 pub fn lan_ipv4_addrs() -> Vec<String> {
-    // Probe several well-known destinations to trigger routing decisions
-    // on each active interface. No packets are actually sent.
     const PROBES: &[&str] = &[
         "8.8.8.8:80",
         "1.1.1.1:80",
@@ -169,7 +167,7 @@ pub fn lan_ipv4_addrs() -> Vec<String> {
         "172.16.0.1:80",
     ];
 
-    let mut seen = std::collections::HashSet::new();
+    let mut seen  = std::collections::HashSet::new();
     let mut addrs: Vec<String> = Vec::new();
 
     for probe in PROBES {
@@ -184,6 +182,10 @@ pub fn lan_ipv4_addrs() -> Vec<String> {
                 }
             }
         }
+        // Early exit: once we have an address from the first probe we can
+        // skip remaining probes on single-interface machines (the common case).
+        // We still continue for multi-interface machines until all probes are done.
+        if addrs.len() >= 4 { break; }
     }
 
     addrs

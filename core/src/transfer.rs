@@ -225,7 +225,12 @@ pub async fn receive_to_disk(
 
         Kind::Clipboard => {
             let mut dec = Decryptor::new(&key, rx);
-            let mut buf = Vec::new();
+            // Pre-allocate if total_size is known to avoid repeated realloc
+            let mut buf = if total_size > 0 {
+                Vec::with_capacity(total_size as usize)
+            } else {
+                Vec::new()
+            };
             while let Some(chunk) = dec.read_chunk().await? {
                 buf.extend_from_slice(&chunk);
             }

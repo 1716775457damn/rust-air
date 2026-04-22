@@ -85,7 +85,8 @@ fn compress_entries(writer: os_pipe::PipeWriter, path: &Path, entries: Vec<(walk
     });
 
     // Pre-read small files in parallel; metadata already cached.
-    let preloaded: Vec<(std::path::PathBuf, Vec<u8>, std::fs::Metadata)> = {
+    // Sort by path after parallel collection to ensure deterministic tar order.
+    let mut preloaded: Vec<(std::path::PathBuf, Vec<u8>, std::fs::Metadata)> = {
         use rayon::prelude::*;
         small
             .into_par_iter()
@@ -95,6 +96,7 @@ fn compress_entries(writer: os_pipe::PipeWriter, path: &Path, entries: Vec<(walk
             })
             .collect()
     };
+    preloaded.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (e, meta) in &large {
         let rel = e.path().strip_prefix(path).unwrap_or(e.path());
