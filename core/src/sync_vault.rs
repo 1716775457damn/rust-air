@@ -401,16 +401,15 @@ pub struct ExcludeSet {
 }
 
 impl ExcludeSet {
-    fn new(excludes: &[String]) -> Self {
+    pub fn new(excludes: &[String]) -> Self {
         Self {
             exact: excludes.iter().filter(|p| !p.starts_with("*.")).cloned().collect(),
             exts:  excludes.iter().filter_map(|p| p.strip_prefix("*.").map(|s| s.to_string())).collect(),
         }
     }
-    fn matches(&self, rel: &str) -> bool {
+    pub fn matches(&self, rel: &str) -> bool {
         rel.split('/').any(|seg| {
             if self.exact.contains(seg) { return true; }
-            // Extract extension from segment and check the set.
             if let Some(dot) = seg.rfind('.') {
                 if dot > 0 { return self.exts.contains(&seg[dot + 1..]); }
             }
