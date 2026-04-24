@@ -245,20 +245,22 @@ fn byte_ranges_to_char_ranges(line: &str, re: &regex::Regex) -> Vec<(usize, usiz
     if byte_matches.is_empty() { return vec![]; }
 
     let mut ranges = Vec::with_capacity(byte_matches.len());
-    let mut mi = 0usize;          // index into byte_matches
-    let mut char_idx = 0usize;    // current char position
+    let mut mi = 0usize;       // index into byte_matches
+    let mut char_idx = 0usize; // char position of current byte_idx
 
     for (byte_idx, ch) in line.char_indices() {
+        // A single byte_idx may be the start of multiple zero-width matches;
+        // drain all of them before advancing char_idx.
         while mi < byte_matches.len() && byte_matches[mi].start() == byte_idx {
             let m = &byte_matches[mi];
             let start_char = char_idx;
-            let end_char   = start_char + line[m.start()..m.end()].chars().count();
+            // Count chars in the matched byte slice to get end_char.
+            let end_char = start_char + line[m.start()..m.end()].chars().count();
             ranges.push((start_char, end_char));
             mi += 1;
         }
         if mi >= byte_matches.len() { break; }
-        char_idx += 1;
-        let _ = ch;
+        char_idx += ch.len_utf8().min(1); // advance by 1 char regardless of byte width
     }
     ranges
 }
@@ -317,8 +319,11 @@ fn decode_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     }
     let (big5_cow, _, big5_err) = BIG5.decode(bytes);
     let (gbk_cow,  _, gbk_err)  = GBK.decode(bytes);
+    // Fast path: if exactly one decoder had no errors, use it without scanning chars.
     if !big5_err && gbk_err  { return std::borrow::Cow::Owned(big5_cow.into_owned()); }
     if !gbk_err  && big5_err { return std::borrow::Cow::Owned(gbk_cow.into_owned()); }
+    // Both succeeded or both failed: count replacement chars to pick the better one.
+    // Use bytes of the owned strings to avoid a second decode.
     let big5_bad = big5_cow.chars().filter(|&c| c == '\u{FFFD}').count();
     let gbk_bad  = gbk_cow.chars().filter(|&c| c == '\u{FFFD}').count();
     #[cfg(target_os = "macos")]

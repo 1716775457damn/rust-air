@@ -1,6 +1,6 @@
 [package]
 name    = "rust-air-core"
-version = "0.2.0"
+version = "0.3.31"
 edition = "2021"
 
 [lib]
@@ -25,7 +25,8 @@ os_pipe = "1"
 rayon   = "1"
 
 # Discovery (mDNS-SD replaces UDP broadcast)
-mdns-sd = "0.19"
+mdns-sd   = "0.19"
+if-addrs  = "0.13"
 
 # Progress
 indicatif = "0.17"

@@ -15,7 +15,11 @@ interface SyncConfig { src: string; dst: string; delete_removed: boolean; exclud
 interface SyncStatus { last_sync: string | null; total_files: number; total_bytes: string; is_running: boolean; is_watching: boolean }
 interface SyncEventPayload { kind: string; rel?: string; bytes?: number; err?: string; scanned?: number; total?: number; total_files?: number; total_bytes?: number }
 
-type Tab   = "send" | "receive" | "devices" | "search" | "sync";
+interface UpdateInfo { version: string; url: string; size: number; release_notes: string }
+interface UpdateProgress { downloaded: number; total: number; done: boolean }
+interface UpdateSettings { auto_check: boolean; auto_install: boolean }
+
+type Tab   = "send" | "receive" | "devices" | "search" | "sync" | "settings";
 type Phase = "idle" | "transferring" | "done" | "error";
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -80,6 +84,12 @@ const syncExcludeInput = ref("");
 const localIps  = ref<string[]>([]);
 const primaryIp = computed(() => localIps.value[0] ?? "");
 const ipCopied  = ref(false);
+
+// Update
+const updateInfo     = ref<UpdateInfo | null>(null);
+const updateProgress = ref<UpdateProgress | null>(null);
+const updateChecking = ref(false);
+const updateSettings = ref<UpdateSettings>({ auto_check: true, auto_install: false });
 
 const unlisten = ref<UnlistenFn[]>([]);
 
@@ -214,12 +224,20 @@ onMounted(async () => {
         searchStatus.value = `错误: ${ev.msg}`;
       }
     }),
+    await listen<UpdateInfo>("update-available", (e) => {
+      updateInfo.value = e.payload;
+    }),
+    await listen<UpdateProgress>("update-progress", (e) => {
+      updateProgress.value = e.payload;
+    }),
   );
 
   syncConfig.value = await invoke<SyncConfig>("get_sync_config");
   syncStatus.value = await invoke<SyncStatus>("get_sync_status");
   const defaultEx  = await invoke<string[]>("get_default_excludes");
   if (syncConfig.value.excludes.length === 0) syncConfig.value.excludes = defaultEx;
+
+  updateSettings.value = await invoke<UpdateSettings>("get_update_settings");
 
   startScan();
 });
@@ -331,6 +349,36 @@ function addExclude() {
 }
 function removeExclude(i: number) { syncConfig.value.excludes.splice(i, 1); }
 
+// ── Update ───────────────────────────────────────────────────────────────────
+
+async function manualCheckUpdate() {
+  updateChecking.value = true;
+  try {
+    const info = await invoke<UpdateInfo | null>("check_update");
+    if (info) updateInfo.value = info;
+    else alert("已是最新版本 ✅");
+  } catch (e: any) {
+    alert(`检查更新失败: ${e}`);
+  } finally {
+    updateChecking.value = false;
+  }
+}
+
+async function startInstall() {
+  if (!updateInfo.value) return;
+  updateProgress.value = { downloaded: 0, total: updateInfo.value.size, done: false };
+  try {
+    await invoke("download_and_install", { url: updateInfo.value.url, size: updateInfo.value.size });
+  } catch (e: any) {
+    updateProgress.value = null;
+    alert(`更新失败: ${e}`);
+  }
+}
+
+async function saveUpdateSettings() {
+  await invoke("save_update_settings", { settings: updateSettings.value });
+}
+
 // ── IP ────────────────────────────────────────────────────────────────────────
 
 async function copyIp() {
@@ -406,7 +454,34 @@ function highlightSegments(line: string, ranges: [number,number][]) {
       </button>
       <button @click="refreshIps" class="text-sm transition-colors"
         style="color:var(--text-faint)" title="刷新 IP">↻</button>
+      <button @click="tab = 'settings'" class="w-8 h-8 rounded-lg flex items-center justify-center text-base transition-colors"
+        :style="tab === 'settings' ? 'color:var(--accent)' : 'color:var(--text-secondary)'"
+        title="设置">⚙️</button>
     </header>
+
+    <!-- Update banner -->
+    <div v-if="updateInfo && !updateProgress"
+      class="flex items-center gap-3 px-5 py-2 text-sm flex-shrink-0"
+      style="background:rgba(34,197,94,0.1);border-bottom:1px solid rgba(34,197,94,0.25)">
+      <span style="color:#4ade80">🚀 发现新版本 {{ updateInfo.version }}</span>
+      <span class="flex-1 text-xs truncate" style="color:var(--text-muted)">{{ updateInfo.release_notes.split('\n')[0] }}</span>
+      <button @click="startInstall"
+        class="px-3 py-1 rounded-lg text-xs font-medium text-white flex-shrink-0"
+        style="background:#16a34a">立即更新</button>
+      <button @click="updateInfo = null" class="text-xs flex-shrink-0" style="color:var(--text-muted)">忽略</button>
+    </div>
+
+    <!-- Download progress bar -->
+    <div v-if="updateProgress && !updateProgress.done"
+      class="flex items-center gap-3 px-5 py-2 text-xs flex-shrink-0"
+      style="background:rgba(6,182,212,0.08);border-bottom:1px solid rgba(6,182,212,0.2)">
+      <span style="color:var(--accent)">⬇️ 下载更新中…</span>
+      <div class="flex-1 rounded-full h-1.5 overflow-hidden" style="background:var(--bg-muted)">
+        <div class="h-1.5 rounded-full transition-all duration-200" style="background:var(--accent)"
+          :style="{ width: updateProgress.total ? Math.round(updateProgress.downloaded/updateProgress.total*100)+'%' : '0%' }"></div>
+      </div>
+      <span style="color:var(--text-muted)">{{ fmtBytes(updateProgress.downloaded) }} / {{ fmtBytes(updateProgress.total) }}</span>
+    </div>
 
     <!-- Body -->
     <div class="flex flex-1 overflow-hidden">
@@ -427,6 +502,15 @@ function highlightSegments(line: string, ranges: [number,number][]) {
           <span v-if="t==='receive' && recvPhase==='transferring'"
             class="w-1.5 h-1.5 rounded-full animate-pulse mt-0.5"
             style="background:var(--accent)"></span>
+        </button>
+        <div class="flex-1"></div>
+        <button @click="tab = 'settings'"
+          :style="tab === 'settings' ? 'background:var(--accent-bg);color:var(--accent)' : 'color:var(--text-muted)'"
+          class="flex flex-col items-center gap-1 py-2.5 rounded-xl text-xs transition-all duration-150 w-full hover:opacity-80"
+          title="设置">
+          <span class="text-[15px] leading-none">⚙️</span>
+          <span class="text-[10px] mt-0.5">设置</span>
+          <span v-if="updateInfo" class="w-1.5 h-1.5 rounded-full mt-0.5" style="background:#4ade80"></span>
         </button>
       </nav>
 
@@ -829,12 +913,81 @@ function highlightSegments(line: string, ranges: [number,number][]) {
           </div>
         </template>
 
+        <!-- SETTINGS TAB -->
+        <template v-else-if="tab === 'settings'">
+          <div class="flex-1 flex flex-col gap-5 max-w-md mx-auto w-full">
+            <h2 class="font-medium text-sm flex-shrink-0" style="color:var(--text-secondary)">⚙️ 设置</h2>
+
+            <!-- Update section -->
+            <div class="rounded-xl p-4 space-y-3 flex-shrink-0"
+              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+              <p class="text-xs font-medium" style="color:var(--text-secondary)">🚀 自动更新</p>
+
+              <label class="flex items-center justify-between text-xs cursor-pointer"
+                style="color:var(--text-secondary)">
+                <span>启动时自动检查更新</span>
+                <input type="checkbox" v-model="updateSettings.auto_check"
+                  @change="saveUpdateSettings" class="accent-cyan-500" />
+              </label>
+
+              <label class="flex items-center justify-between text-xs cursor-pointer"
+                style="color:var(--text-secondary)">
+                <span>发现新版本后自动在后台下载并安装</span>
+                <input type="checkbox" v-model="updateSettings.auto_install"
+                  @change="saveUpdateSettings" class="accent-cyan-500" />
+              </label>
+
+              <!-- Current version + check button -->
+              <div class="flex items-center justify-between pt-1">
+                <span class="text-xs" style="color:var(--text-faint)">当前版本: v{{ '0.3.31' }}</span>
+                <button @click="manualCheckUpdate" :disabled="updateChecking"
+                  :style="updateChecking
+                    ? 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'
+                    : 'background:var(--accent);color:#fff'"
+                  class="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors">
+                  {{ updateChecking ? '检查中…' : '立即检查' }}
+                </button>
+              </div>
+
+              <!-- Update available card -->
+              <div v-if="updateInfo"
+                class="rounded-lg p-3 space-y-2"
+                style="background:rgba(34,197,94,0.08);box-shadow:0 0 0 1px rgba(34,197,94,0.2)">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-medium" style="color:#4ade80">🚀 新版本 {{ updateInfo.version }}</span>
+                  <button @click="startInstall" :disabled="!!updateProgress"
+                    :style="updateProgress
+                      ? 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'
+                      : 'background:#16a34a;color:#fff'"
+                    class="px-3 py-1 rounded-lg text-xs font-medium transition-colors">
+                    {{ updateProgress ? '下载中…' : '立即安装' }}
+                  </button>
+                </div>
+                <p v-if="updateInfo.release_notes" class="text-xs leading-relaxed"
+                  style="color:var(--text-muted)">{{ updateInfo.release_notes.split('\n').slice(0,3).join(' · ') }}</p>
+                <!-- Download progress -->
+                <div v-if="updateProgress && !updateProgress.done" class="space-y-1">
+                  <div class="w-full rounded-full h-1.5 overflow-hidden" style="background:var(--bg-muted)">
+                    <div class="h-1.5 rounded-full transition-all duration-200" style="background:#4ade80"
+                      :style="{ width: updateProgress.total ? Math.round(updateProgress.downloaded/updateProgress.total*100)+'%' : '0%' }"></div>
+                  </div>
+                  <div class="flex justify-between text-xs" style="color:var(--text-faint)">
+                    <span>{{ fmtBytes(updateProgress.downloaded) }}</span>
+                    <span>{{ fmtBytes(updateProgress.total) }}</span>
+                  </div>
+                </div>
+                <p v-if="updateProgress?.done" class="text-xs" style="color:#4ade80">✅ 下载完成，安装程序已启动</p>
+              </div>
+            </div>
+          </div>
+        </template>
+
       </main>
     </div>
 
     <footer class="text-center text-[11px] py-1.5"
       style="color:var(--text-faint);border-top:1px solid var(--border);background:var(--bg-surface)">
-      rust-air v0.3 · E2EE · mDNS · SHA-256 · 快捷键 1-5 切换标签
+      rust-air v0.3 · E2EE · mDNS · SHA-256 · 自动更新 · 快捷键 1-5 切换标签
     </footer>
   </div>
 </template>

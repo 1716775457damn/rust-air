@@ -98,6 +98,19 @@ fn compress_entries(writer: os_pipe::PipeWriter, path: &Path, entries: Vec<(walk
     };
     preloaded.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // Write small files first: they're already in memory, so the pipe fills
+    // quickly and the receiver can start decompressing without waiting for
+    // large-file I/O. Large files follow sequentially.
+    for (abs_path, data, meta) in &preloaded {
+        let rel = abs_path.strip_prefix(path).unwrap_or(abs_path);
+        let tar_path = std::path::Path::new(entry_name).join(rel);
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata(meta);
+        header.set_size(data.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, &tar_path, data.as_slice())?;
+    }
+
     for (e, meta) in &large {
         let rel = e.path().strip_prefix(path).unwrap_or(e.path());
         let tar_path = std::path::Path::new(entry_name).join(rel);
@@ -116,16 +129,6 @@ fn compress_entries(writer: os_pipe::PipeWriter, path: &Path, entries: Vec<(walk
             header.set_cksum();
             tar.append_data(&mut header, &tar_path, &mut buf_f)?;
         }
-    }
-
-    for (abs_path, data, meta) in &preloaded {
-        let rel = abs_path.strip_prefix(path).unwrap_or(abs_path);
-        let tar_path = std::path::Path::new(entry_name).join(rel);
-        let mut header = tar::Header::new_gnu();
-        header.set_metadata(meta);
-        header.set_size(data.len() as u64);
-        header.set_cksum();
-        tar.append_data(&mut header, &tar_path, data.as_slice())?;
     }
 
     tar.into_inner()?.finish()?;

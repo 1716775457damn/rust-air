@@ -156,36 +156,42 @@ fn best_addr(info: &ResolvedService) -> Option<String> {
 fn is_link_local_v4(addr: &str) -> bool { addr.starts_with("169.254.") }
 
 /// Return all non-loopback, non-link-local IPv4 addresses on this machine.
-/// Uses multiple UDP routing-trick targets to discover addresses on different
-/// interfaces (e.g. Wi-Fi + Ethernet simultaneously active).
+/// Uses if-addrs for reliable interface enumeration (works on Win11 without
+/// requiring a default route to the public internet).
+/// Falls back to the routing-trick if if-addrs returns nothing.
 pub fn lan_ipv4_addrs() -> Vec<String> {
-    const PROBES: &[&str] = &[
-        "8.8.8.8:80",
-        "1.1.1.1:80",
-        "192.168.1.1:80",
-        "10.0.0.1:80",
-        "172.16.0.1:80",
-    ];
-
-    let mut seen  = std::collections::HashSet::new();
     let mut addrs: Vec<String> = Vec::new();
 
-    for probe in PROBES {
-        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            if sock.connect(probe).is_ok() {
-                if let Ok(local) = sock.local_addr() {
-                    let ip = local.ip();
-                    let s  = ip.to_string();
-                    if !s.starts_with("127.") && !s.starts_with("169.254.") && seen.insert(s.clone()) {
-                        addrs.push(s);
+    // Primary: enumerate all interfaces via OS API.
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if iface.is_loopback() { continue; }
+            if let if_addrs::IfAddr::V4(ref v4) = iface.addr {
+                let s = v4.ip.to_string();
+                if s.starts_with("169.254.") { continue; } // link-local
+                if !addrs.contains(&s) { addrs.push(s); }
+            }
+        }
+    }
+
+    // Fallback: routing trick (may fail on machines without a default route).
+    if addrs.is_empty() {
+        const PROBES: &[&str] = &[
+            "8.8.8.8:80", "1.1.1.1:80", "192.168.1.1:80", "10.0.0.1:80",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for probe in PROBES {
+            if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if sock.connect(probe).is_ok() {
+                    if let Ok(local) = sock.local_addr() {
+                        let s = local.ip().to_string();
+                        if !s.starts_with("127.") && !s.starts_with("169.254.") && seen.insert(s.clone()) {
+                            addrs.push(s);
+                        }
                     }
                 }
             }
         }
-        // Early exit: once we have an address from the first probe we can
-        // skip remaining probes on single-interface machines (the common case).
-        // We still continue for multi-interface machines until all probes are done.
-        if addrs.len() >= 4 { break; }
     }
 
     addrs
@@ -207,11 +213,14 @@ fn routing_trick_ip() -> Option<String> {
 }
 
 
-/// A 4-hex-char suffix unique to this machine, derived from its primary IP.
+/// A 4-hex-char suffix unique to this machine, derived from its primary LAN IP.
+/// Uses lan_ipv4_addrs() so it works even without a default route to the internet.
 /// Ensures two machines with the same hostname don't collide on mDNS.
 fn machine_suffix() -> String {
-    let ip = routing_trick_ip().unwrap_or_else(|| "127.0.0.1".to_string());
-    // Hash the IP string to get a stable 4-char hex suffix
+    let ip = lan_ipv4_addrs()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     let mut h: u32 = 0x811c9dc5;
     for b in ip.bytes() {
         h ^= b as u32;

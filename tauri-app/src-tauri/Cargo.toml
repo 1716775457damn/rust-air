@@ -1,6 +1,6 @@
 [package]
 name        = "tauri-app"
-version     = "0.2.0"
+version     = "0.3.31"
 description = "rust-air — LAN file transfer"
 authors     = ["you"]
 edition     = "2021"
@@ -35,3 +35,4 @@ hex                = "0.4"
 arboard            = "3"
 image              = { version = "0.25", default-features = false, features = ["png"] }
 unicode-normalization = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

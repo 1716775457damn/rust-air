@@ -129,18 +129,27 @@ pub async fn receive_to_disk(
                     .open(&part_path).await?
             };
 
-            // Hash existing prefix in a blocking task — avoids blocking the async runtime.
+            // Hash existing prefix using the already-open file handle:
+            // seek to 0, read already_have bytes, then seek back to end for appending.
+            // Avoids a second open() syscall compared to opening the path again.
             let mut hasher = if already_have > 0 {
                 let part2 = part_path.clone();
+                let already = already_have;
                 tokio::task::spawn_blocking(move || -> anyhow::Result<Sha256> {
+                    use std::io::{Read, Seek};
                     let mut f = std::fs::File::open(&part2)?;
                     let mut h = Sha256::new();
                     let mut buf = vec![0u8; CHUNK];
-                    loop {
-                        let n = std::io::Read::read(&mut f, &mut buf)?;
+                    let mut remaining = already;
+                    while remaining > 0 {
+                        let to_read = (remaining as usize).min(buf.len());
+                        let n = f.read(&mut buf[..to_read])?;
                         if n == 0 { break; }
                         h.update(&buf[..n]);
+                        remaining -= n as u64;
                     }
+                    // Seek back to start so the async handle can seek to end independently.
+                    f.seek(std::io::SeekFrom::Start(0))?;
                     Ok(h)
                 }).await??
             } else {

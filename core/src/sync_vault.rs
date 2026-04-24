@@ -340,13 +340,13 @@ fn scan_needed(
     let _ = tx.send(SyncEvent::Progress { scanned, total: scanned });
 
     // Parallel hash of all candidates.
-    // Pre-extract cached records to avoid borrowing store inside par_iter.
+    // Pre-extract only the (rel, cached_hash) pairs we need — avoids cloning size.
     use rayon::prelude::*;
-    let cached: std::collections::HashMap<String, (u64, String)> = need_hash.iter()
+    let cached: std::collections::HashMap<String, String> = need_hash.iter()
         .filter_map(|(rel, _, size)| {
-            store.state.files.get(rel)
+            store.state.files.get(rel.as_str())
                 .filter(|rec| rec.size == *size)
-                .map(|rec| (rel.clone(), (*size, rec.hash.clone())))
+                .map(|rec| (rel.clone(), rec.hash.clone()))
         })
         .collect();
 
@@ -354,9 +354,7 @@ fn scan_needed(
         .into_par_iter()
         .filter_map(|(rel, abs, size)| {
             let hash = hash_file(&abs).ok()?;
-            if let Some((_, cached_hash)) = cached.get(&rel) {
-                if *cached_hash == hash { return None; }
-            }
+            if cached.get(&rel).map_or(false, |h| h == &hash) { return None; }
             Some((rel, abs, size, hash))
         })
         .collect();

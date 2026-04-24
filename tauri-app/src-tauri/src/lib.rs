@@ -2,8 +2,10 @@ mod commands;
 mod sync_commands;
 mod search_commands;
 mod clip_history_commands;
+mod update_commands;
 
 use std::sync::Arc;
+use tauri::Emitter;
 use tauri_plugin_dialog;
 use tauri_plugin_opener;
 
@@ -22,6 +24,27 @@ pub fn run() {
         .manage(history_state)          // Arc<HistoryState> implements Deref<Target=HistoryState>
         .setup(move |app| {
             clip_history_commands::start_clip_monitor(app.handle().clone(), history_for_monitor);
+            // Auto-update check on startup
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let settings = update_commands::UpdateSettings::load();
+                if !settings.auto_check { return; }
+                // Small delay so the window is visible before any banner appears
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                match update_commands::check_update().await {
+                    Ok(Some(info)) => {
+                        if settings.auto_install {
+                            // Silent background install
+                            let _ = update_commands::download_and_install(
+                                info.url, info.size, app_handle
+                            ).await;
+                        } else {
+                            app_handle.emit("update-available", &info).ok();
+                        }
+                    }
+                    _ => {}
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -56,6 +79,11 @@ pub fn run() {
             clip_history_commands::flush_history,
             clip_history_commands::tick_history,
             clip_history_commands::get_history_paused,
+            // Auto-update
+            update_commands::get_update_settings,
+            update_commands::save_update_settings,
+            update_commands::check_update,
+            update_commands::download_and_install,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
