@@ -1,0 +1,62 @@
+name: Cleanup caches
+
+on:
+  pull_request:
+    types:
+      - closed
+  schedule:
+    # Run every Monday at 02:00 UTC — cleans up caches older than 7 days
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+jobs:
+  cleanup-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete caches for closed PR
+        run: |
+          echo "Fetching cache keys for PR #${{ github.event.pull_request.number }}"
+          cacheKeysForPR=$(gh cache list --ref $BRANCH --limit 100 --json id --jq '.[].id')
+          set +e
+          echo "Deleting caches..."
+          for cacheKey in $cacheKeysForPR; do
+            gh cache delete $cacheKey
+          done
+          echo "Done"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: refs/pull/${{ github.event.pull_request.number }}/merge
+
+  cleanup-stale:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete caches older than 7 days
+        run: |
+          CUTOFF=$(date -d '7 days ago' --utc +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deleting caches created before $CUTOFF"
+
+          stale=$(gh cache list --limit 100 --json id,createdAt \
+            --jq --arg cutoff "$CUTOFF" \
+            '[.[] | select(.createdAt < $cutoff)] | .[].id')
+
+          if [ -z "$stale" ]; then
+            echo "No stale caches found."
+            exit 0
+          fi
+
+          set +e
+          for id in $stale; do
+            echo "Deleting cache $id"
+            gh cache delete "$id"
+          done
+          echo "Done"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
