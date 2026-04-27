@@ -170,10 +170,12 @@ pub async fn receive_to_disk(
                 hasher.update(&chunk);
                 f.write_all(&chunk).await?;
                 done += chunk.len() as u64;
+                let recycle_buf = chunk;
                 if last_emit.elapsed().as_millis() >= 50 {
                     emit_progress(&on_progress, done, total_size, &start, false);
                     last_emit = Instant::now();
                 }
+                dec.recycle(recycle_buf);
             }
             f.flush().await?;
             drop(f);
@@ -194,30 +196,31 @@ pub async fn receive_to_disk(
         }
 
         Kind::Archive => {
-            let (pipe_reader, pipe_writer) = os_pipe::pipe()?;
+            let (unpack_reader, mut unpack_writer) = tokio::io::duplex(4 * CHUNK);
             let dest2 = dest.to_path_buf();
             let unpack = tokio::task::spawn_blocking(move || {
-                archive::unpack_archive_sync(pipe_reader, &dest2)
+                let sync_reader = tokio_util::io::SyncIoBridge::new(unpack_reader);
+                archive::unpack_archive_sync(sync_reader, &dest2)
             });
 
             let mut dec = Decryptor::new(&key, rx);
-            let mut sync_w = pipe_writer;
             let mut hasher = Sha256::new();
             let mut done: u64 = 0;
             let start = Instant::now();
             let mut last_emit = start;
 
             while let Some(chunk) = dec.read_chunk().await? {
-                use std::io::Write;
                 hasher.update(&chunk);
-                sync_w.write_all(&chunk)?;
+                unpack_writer.write_all(&chunk).await?;
                 done += chunk.len() as u64;
+                let recycle_buf = chunk;
                 if last_emit.elapsed().as_millis() >= 50 {
                     emit_progress(&on_progress, done, total_size, &start, false);
                     last_emit = Instant::now();
                 }
+                dec.recycle(recycle_buf);
             }
-            drop(sync_w);
+            drop(unpack_writer);
             unpack.await??;
 
             let expected_sha = dec.read_trailing().await?;
@@ -228,7 +231,7 @@ pub async fn receive_to_disk(
                 }
             }
 
-            emit_progress(&on_progress, done, total_size, &start, true);
+            emit_progress(&on_progress, total_size, total_size, &start, true);
             Ok(dest.to_path_buf())
         }
 

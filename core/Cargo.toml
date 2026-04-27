@@ -49,3 +49,6 @@ walkdir = "2"
 # HTTP + QR (for --qr flag)
 axum   = "0.7"
 qrcode = "0.14"
+
+[dev-dependencies]
+tokio = { workspace = true }

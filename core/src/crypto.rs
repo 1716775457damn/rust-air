@@ -83,6 +83,8 @@ pub struct Decryptor<R> {
     counter:   u64,
     /// Reusable ciphertext buffer — decrypted in-place, ownership transferred to caller.
     data_buf:  Vec<u8>,
+    /// Spare buffer returned by caller via `recycle()` — avoids per-frame allocation.
+    spare_buf: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> Decryptor<R> {
@@ -92,6 +94,7 @@ impl<R: AsyncRead + Unpin> Decryptor<R> {
             inner,
             counter:  0,
             data_buf: Vec::with_capacity(CHUNK),
+            spare_buf: Vec::with_capacity(CHUNK),
         }
     }
 
@@ -103,6 +106,8 @@ impl<R: AsyncRead + Unpin> Decryptor<R> {
 
     /// Read and authenticate one frame. Returns `None` on end-of-stream sentinel.
     /// Tag and ciphertext are read into separate fixed buffers — zero shift, zero copy.
+    /// Uses double-buffering: decrypts in `data_buf`, swaps ownership to caller,
+    /// and reuses the previously-returned buffer on the next call.
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         let mut len_buf = [0u8; 4];
         self.inner.read_exact(&mut len_buf).await?;
@@ -127,10 +132,18 @@ impl<R: AsyncRead + Unpin> Decryptor<R> {
             ))?;
         self.counter += 1;
 
-        // Transfer ownership of the plaintext buffer; replace with a fresh one.
-        let mut out = std::mem::replace(&mut self.data_buf, Vec::with_capacity(CHUNK));
+        // Swap buffers: give caller the decrypted data, take back the spare.
+        let mut out = std::mem::replace(&mut self.data_buf, std::mem::take(&mut self.spare_buf));
         out.truncate(len);
         Ok(Some(out))
+    }
+
+    /// Return a previously-received chunk buffer for reuse.
+    /// Call this after processing each chunk to avoid per-frame allocation.
+    #[inline]
+    pub fn recycle(&mut self, mut buf: Vec<u8>) {
+        buf.clear();
+        self.spare_buf = buf;
     }
 }
 
