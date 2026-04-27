@@ -939,7 +939,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
 
               <!-- Current version + check button -->
               <div class="flex items-center justify-between pt-1">
-                <span class="text-xs" style="color:var(--text-faint)">当前版本: v{{ '0.3.31' }}</span>
+                <span class="text-xs" style="color:var(--text-faint)">当前版本: v{{ '0.3.32' }}</span>
                 <button @click="manualCheckUpdate" :disabled="updateChecking"
                   :style="updateChecking
                     ? 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'
