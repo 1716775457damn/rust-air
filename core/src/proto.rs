@@ -55,9 +55,38 @@ pub enum DeviceStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferEvent {
-    pub bytes_done:    u64,
-    pub total_bytes:   u64,
-    pub bytes_per_sec: u64,
-    pub done:          bool,
-    pub error:         Option<String>,
+    pub bytes_done:      u64,
+    pub total_bytes:     u64,
+    pub bytes_per_sec:   u64,
+    pub done:            bool,
+    pub error:           Option<String>,
+    /// Whether this transfer is in resume mode.
+    pub resumed:         bool,
+    /// Number of bytes skipped via resume.
+    pub resume_offset:   u64,
+    /// Reconnection status (only present during reconnect attempts).
+    pub reconnect_info:  Option<ReconnectInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconnectInfo {
+    /// Current reconnect attempt (1-based).
+    pub attempt:      u32,
+    /// Maximum number of reconnect attempts.
+    pub max_attempts: u32,
+}
+
+/// Transfer session metadata, persisted as JSON for resume validation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionManifest {
+    /// Name of the file or directory being transferred.
+    pub name:        String,
+    /// Total transfer size in bytes.
+    pub total_size:  u64,
+    /// Transfer type (File / Archive / Clipboard).
+    pub kind:        Kind,
+    /// Sender address "ip:port".
+    pub sender_addr: String,
+    /// Creation timestamp (Unix epoch seconds).
+    pub created_at:  u64,
 }

@@ -1,6 +1,6 @@
 [package]
 name        = "tauri-app"
-version     = "0.3.34"
+version     = "0.3.35"
 description = "rust-air — LAN file transfer"
 authors     = ["you"]
 edition     = "2021"
@@ -8,6 +8,10 @@ edition     = "2021"
 [lib]
 name       = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["desktop"]
+desktop = ["rust-air-core/desktop", "arboard", "notify", "ignore", "memmap2", "num_cpus", "encoding_rs", "image"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -19,6 +23,7 @@ tauri-plugin-dialog = "2"
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 tokio              = { version = "1", features = ["full"] }
+tokio-util         = { workspace = true }
 anyhow             = "1"
 base64             = "0.22"
 rand               = "0.8"
@@ -26,13 +31,15 @@ rust-air-core      = { path = "../../core" }
 dirs               = "5"
 local-ip-address   = "0.6"
 regex              = "1"
-ignore             = "0.4"
-memmap2            = "0.9"
-num_cpus           = "1"
-encoding_rs        = "0.8"
-notify             = "6"
 hex                = "0.4"
-arboard            = "3"
-image              = { version = "0.25", default-features = false, features = ["png"] }
 unicode-normalization = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Desktop-only (optional)
+arboard            = { version = "3", optional = true }
+notify             = { version = "6", optional = true }
+ignore             = { version = "0.4", optional = true }
+memmap2            = { version = "0.9", optional = true }
+num_cpus           = { version = "1", optional = true }
+encoding_rs        = { version = "0.8", optional = true }
+image              = { version = "0.25", default-features = false, features = ["png"], optional = true }

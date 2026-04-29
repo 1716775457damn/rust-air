@@ -3,11 +3,12 @@ import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { platform } from "@tauri-apps/plugin-os";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface Device { name: string; addr: string; status: "Idle" | "Busy"; lastSeen?: number }
-interface TransferEvent { bytes_done: number; total_bytes: number; bytes_per_sec: number; done: boolean }
+interface TransferEvent { bytes_done: number; total_bytes: number; bytes_per_sec: number; done: boolean; resumed?: boolean; resume_offset?: number; reconnect_info?: { attempt: number; max_attempts: number }; error?: string }
 interface MatchLine { line_num: number; line: string; ranges: [number,number][] }
 interface FileResult { path: string; icon: string; matches: MatchLine[] }
 interface SearchEvent { kind: string; path?: string; icon?: string; matches?: MatchLine[]; ms?: number; total?: number; msg?: string }
@@ -21,12 +22,22 @@ interface UpdateSettings { auto_check: boolean; auto_install: boolean }
 
 interface TodoItem { id: number; title: string; date: string; completed: boolean }
 
+// Shared clipboard sync types (Task 10.1)
+interface SyncGroupConfig { enabled: boolean; peers: SyncPeer[] }
+interface SyncPeer { device_name: string; addr: string; last_seen: number; online: boolean }
+interface ClipSyncError { kind: string; message: string; device?: string }
+interface ClipSyncReceived { source_device: string; content_type: string }
+interface ClipEntryView { id: number; kind: string; preview: string; stats: string; time_str: string; pinned: boolean; char_count: number; image_b64?: string; source_device?: string }
+
 type Tab   = "send" | "receive" | "devices" | "search" | "sync" | "todo" | "settings";
 type Phase = "idle" | "transferring" | "done" | "error";
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 const tab = ref<Tab>("send");
+
+// Platform detection (Android build support)
+const isAndroid = ref(false);
 
 // Theme
 const isDark = ref(true);
@@ -52,6 +63,9 @@ const recvProgress = ref<TransferEvent>({ bytes_done: 0, total_bytes: 0, bytes_p
 const recvPeer     = ref("");
 const savedPath    = ref("");
 const recvHistory  = ref<{peer: string; path: string; bytes: number}[]>([]);
+const recvReconnecting = ref(false);
+const recvReconnectAttempt = ref(0);
+const recvReconnectMax = ref(5);
 
 // Devices
 const devices  = ref<Device[]>([]);
@@ -104,6 +118,20 @@ const calendarMonth  = ref(new Date().getMonth() + 1);
 const todos          = ref<TodoItem[]>([]);
 const todoDates      = ref<string[]>([]);
 const newTodoTitle   = ref("");
+
+// Clipboard Sync (Task 10.1)
+const clipSyncEnabled = ref(false);
+const syncGroupConfig = ref<SyncGroupConfig>({ enabled: false, peers: [] });
+const clipEntries     = ref<ClipEntryView[]>([]);
+
+// Toast notifications (Task 10.4)
+const toasts = ref<{ id: number; kind: string; message: string; device?: string }[]>([]);
+let toastId = 0;
+function showToast(kind: string, message: string, device?: string) {
+  const id = ++toastId;
+  toasts.value.push({ id, kind, message, device });
+  setTimeout(() => { toasts.value = toasts.value.filter(t => t.id !== id); }, 3000);
+}
 
 const unlisten = ref<UnlistenFn[]>([]);
 
@@ -208,6 +236,12 @@ onMounted(async () => {
   const saved = localStorage.getItem("theme");
   if (saved === "light") { isDark.value = false; document.documentElement.classList.add("light"); }
 
+  // Platform detection
+  try {
+    const p = await platform();
+    isAndroid.value = (p === "android");
+  } catch (_) { /* fallback: assume desktop */ }
+
   myPort.value    = await invoke<number>("start_listener");
   localIps.value  = await invoke<string[]>("get_local_ips");
 
@@ -233,7 +267,16 @@ onMounted(async () => {
       recvPhase.value = "transferring";
       tab.value = "receive";
     }),
-    await listen<TransferEvent>("recv-progress", (e) => { recvProgress.value = e.payload; }),
+    await listen<TransferEvent>("recv-progress", (e) => {
+      recvProgress.value = e.payload;
+      if (e.payload.reconnect_info) {
+        recvReconnecting.value = true;
+        recvReconnectAttempt.value = e.payload.reconnect_info.attempt;
+        recvReconnectMax.value = e.payload.reconnect_info.max_attempts;
+      } else {
+        recvReconnecting.value = false;
+      }
+    }),
     await listen<string>("recv-done", (e) => {
       savedPath.value = e.payload ?? "";
       recvHistory.value.unshift({ peer: recvPeer.value, path: savedPath.value, bytes: recvProgress.value.bytes_done });
@@ -289,14 +332,39 @@ onMounted(async () => {
     await listen<UpdateProgress>("update-progress", (e) => {
       updateProgress.value = e.payload;
     }),
+
+    // Clipboard sync events (Task 10.1 & 10.4)
+    await listen<ClipEntryView[]>("clip-update", (e) => {
+      clipEntries.value = e.payload;
+    }),
+    await listen<ClipSyncError>("clip-sync-error", (e) => {
+      const err = e.payload;
+      const kindLabel = err.kind === "size_limit" ? "大小超限"
+        : err.kind === "transfer_failed" ? "传输失败"
+        : err.kind === "checksum_failed" ? "校验失败"
+        : err.kind;
+      showToast(err.kind, `${kindLabel}: ${err.message}`, err.device ?? undefined);
+    }),
+    await listen<ClipSyncReceived>("clip-sync-received", (e) => {
+      showToast("sync_received", `已接收来自 ${e.payload.source_device} 的剪贴板内容`);
+    }),
   );
 
-  syncConfig.value = await invoke<SyncConfig>("get_sync_config");
-  syncStatus.value = await invoke<SyncStatus>("get_sync_status");
-  const defaultEx  = await invoke<string[]>("get_default_excludes");
-  if (syncConfig.value.excludes.length === 0) syncConfig.value.excludes = defaultEx;
+  // Desktop-only: load sync config, status, excludes, and update settings
+  if (!isAndroid.value) {
+    syncConfig.value = await invoke<SyncConfig>("get_sync_config");
+    syncStatus.value = await invoke<SyncStatus>("get_sync_status");
+    const defaultEx  = await invoke<string[]>("get_default_excludes");
+    if (syncConfig.value.excludes.length === 0) syncConfig.value.excludes = defaultEx;
 
-  updateSettings.value = await invoke<UpdateSettings>("get_update_settings");
+    updateSettings.value = await invoke<UpdateSettings>("get_update_settings");
+  }
+
+  // Load clipboard sync state (Task 10.1)
+  try {
+    syncGroupConfig.value = await invoke<SyncGroupConfig>("get_sync_group");
+    clipSyncEnabled.value = syncGroupConfig.value.enabled;
+  } catch (_) { /* sync commands may not be registered yet */ }
 
   // Load initial todo data
   await loadTodos(selectedDate.value);
@@ -344,9 +412,18 @@ function resetSend() {
   sendProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
 }
 
+async function retrySend() {
+  sendPhase.value = "transferring"; sendError.value = "";
+  sendProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
+  try {
+    await invoke("retry_send");
+  } catch (e: any) { sendError.value = String(e); sendPhase.value = "error"; }
+}
+
 function resetRecv() {
   recvPhase.value = "idle"; recvPeer.value = ""; recvError.value = ""; savedPath.value = "";
   recvProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
+  recvReconnecting.value = false; recvReconnectAttempt.value = 0;
 }
 
 // ── Devices ───────────────────────────────────────────────────────────────────
@@ -442,6 +519,31 @@ async function saveUpdateSettings() {
   await invoke("save_update_settings", { settings: updateSettings.value });
 }
 
+// ── Clipboard Sync IPC (Task 10.2) ──────────────────────────────────────────
+
+async function toggleClipSync(enabled: boolean) {
+  clipSyncEnabled.value = enabled;
+  try {
+    await invoke("set_clip_sync_enabled", { enabled });
+    syncGroupConfig.value = await invoke<SyncGroupConfig>("get_sync_group");
+  } catch (e: any) { console.error("toggleClipSync:", e); }
+}
+
+function isPeerInSyncGroup(deviceName: string): boolean {
+  return syncGroupConfig.value.peers.some(p => p.device_name === deviceName);
+}
+
+async function toggleSyncPeer(dev: Device) {
+  try {
+    if (isPeerInSyncGroup(dev.name)) {
+      await invoke("remove_sync_peer", { deviceName: dev.name });
+    } else {
+      await invoke("add_sync_peer", { deviceName: dev.name, addr: dev.addr });
+    }
+    syncGroupConfig.value = await invoke<SyncGroupConfig>("get_sync_group");
+  } catch (e: any) { console.error("toggleSyncPeer:", e); }
+}
+
 // ── Todo IPC ─────────────────────────────────────────────────────────────────
 
 async function loadTodos(date: string) {
@@ -488,7 +590,11 @@ watch([calendarYear, calendarMonth], ([y, m]) => loadTodoDates(y, m));
 
 async function copyIp() {
   const addr = primaryIp.value; if (!addr) return;
-  await invoke("write_clipboard", { text: addr }).catch(() => navigator.clipboard?.writeText(addr).catch(() => {}));
+  if (isAndroid.value) {
+    await navigator.clipboard?.writeText(addr).catch(() => {});
+  } else {
+    await invoke("write_clipboard", { text: addr }).catch(() => navigator.clipboard?.writeText(addr).catch(() => {}));
+  }
   ipCopied.value = true; setTimeout(() => { ipCopied.value = false; }, 1500);
 }
 async function refreshIps() { localIps.value = await invoke<string[]>("get_local_ips"); }
@@ -594,7 +700,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
       <!-- Sidebar -->
       <nav class="flex flex-col gap-1 w-[72px] flex-shrink-0 px-1.5 py-3"
         style="background:var(--bg-surface);border-right:1px solid var(--border)">
-        <button v-for="(t, idx) in (['send','receive','devices','search','sync','todo'] as Tab[])" :key="t"
+        <button v-for="(t, idx) in (isAndroid ? (['send','receive','devices','todo'] as Tab[]) : (['send','receive','devices','search','sync','todo'] as Tab[]))" :key="t"
           @click="tab = t"
           :title="`${t === 'send' ? '发送' : t === 'receive' ? '接收' : t === 'devices' ? '设备' : t === 'search' ? '搜索' : t === 'sync' ? '同步' : '待办'} (${idx+1})`"
           :style="tab === t
@@ -702,7 +808,10 @@ function highlightSegments(line: string, ranges: [number,number][]) {
               style="background:rgba(239,68,68,0.08);box-shadow:0 0 0 1px rgba(239,68,68,0.2)">
               <span class="text-2xl">❌</span>
               <span class="text-sm truncate flex-1" style="color:#fca5a5" :title="sendError">{{ sendError }}</span>
-              <button @click="resetSend" class="ml-auto text-xs flex-shrink-0"
+              <button @click="retrySend"
+                class="px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-colors"
+                style="background:var(--accent-bg);color:var(--accent)">重试</button>
+              <button @click="resetSend" class="ml-1 text-xs flex-shrink-0"
                 style="color:var(--text-muted)">关闭</button>
             </div>
 
@@ -748,6 +857,20 @@ function highlightSegments(line: string, ranges: [number,number][]) {
             <div v-if="recvPhase === 'transferring'"
               class="rounded-xl p-4 flex-shrink-0"
               style="background:var(--bg-card);box-shadow:0 0 0 1px var(--accent-ring)">
+              <!-- Reconnect banner -->
+              <div v-if="recvReconnecting"
+                class="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg text-xs"
+                style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25)">
+                <span class="animate-pulse">🔄</span>
+                <span style="color:#fbbf24">重连中 (第 {{ recvReconnectAttempt }} 次 / 共 {{ recvReconnectMax }} 次)</span>
+              </div>
+              <!-- Resume indicator -->
+              <div v-if="recvProgress.resumed && recvProgress.resume_offset && !recvReconnecting"
+                class="flex items-center gap-2 mb-2 text-xs"
+                style="color:var(--accent)">
+                <span>⏩</span>
+                <span>续传中 — 已跳过 {{ fmtBytes(recvProgress.resume_offset) }}</span>
+              </div>
               <div class="flex items-center justify-between mb-2">
                 <span class="text-sm" style="color:var(--text-secondary)">
                   接收中 ← <span :style="`color:var(--accent)`">{{ recvPeer }}</span>
@@ -818,6 +941,30 @@ function highlightSegments(line: string, ranges: [number,number][]) {
                   style="color:var(--accent)" title="打开所在目录">📂</button>
               </div>
             </div>
+
+            <!-- Clipboard History (Task 10.3) -->
+            <div v-if="clipEntries.length > 0" class="flex-1 min-h-0 flex flex-col">
+              <p class="text-xs mb-2 flex-shrink-0" style="color:var(--text-faint)">剪贴板历史</p>
+              <div class="flex-1 min-h-0 overflow-y-auto space-y-1">
+                <div v-for="entry in clipEntries" :key="entry.id"
+                  class="rounded-lg p-2.5 flex items-center gap-2 text-xs group"
+                  style="background:var(--bg-card)">
+                  <span class="flex-shrink-0">{{ entry.kind === 'image' ? '🖼️' : '📝' }}</span>
+                  <div class="flex-1 min-w-0">
+                    <p class="truncate" style="color:var(--text-secondary)" :title="entry.preview">{{ entry.preview }}</p>
+                    <div class="flex items-center gap-2 mt-0.5">
+                      <span style="color:var(--text-faint)">{{ entry.time_str }}</span>
+                      <span style="color:var(--text-faint)">{{ entry.stats }}</span>
+                      <span v-if="entry.source_device" class="px-1.5 py-0.5 rounded-full text-[10px]"
+                        style="background:var(--accent-bg);color:var(--accent)">
+                        来自 {{ entry.source_device }}
+                      </span>
+                    </div>
+                  </div>
+                  <span v-if="entry.pinned" class="flex-shrink-0" title="已固定">📌</span>
+                </div>
+              </div>
+            </div>
           </div>
         </template>
 
@@ -832,17 +979,47 @@ function highlightSegments(line: string, ranges: [number,number][]) {
                 {{ scanning ? '扫描中…' : '🔄 扫描' }}
               </button>
             </div>
+
+            <!-- Clipboard sync global toggle (Task 10.2) -->
+            <div class="rounded-xl p-3 flex items-center justify-between"
+              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+              <div class="flex items-center gap-2">
+                <span class="text-sm">📋</span>
+                <span class="text-xs" style="color:var(--text-secondary)">共享剪贴板</span>
+              </div>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" :checked="clipSyncEnabled" @change="toggleClipSync(!clipSyncEnabled)" class="sr-only peer" />
+                <div class="w-9 h-5 rounded-full peer transition-colors duration-200"
+                  :style="clipSyncEnabled ? 'background:var(--accent)' : 'background:var(--border-input)'">
+                  <div class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full transition-transform duration-200 bg-white"
+                    :style="clipSyncEnabled ? 'transform:translateX(16px)' : ''"></div>
+                </div>
+              </label>
+            </div>
+
             <div v-if="devices.length === 0" class="text-center py-12 text-sm" style="color:var(--text-faint)">未发现设备 — 点击扫描</div>
             <div v-for="dev in devices" :key="dev.name"
               class="rounded-xl p-3.5 flex items-center gap-4"
               style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
               <div class="w-3 h-3 rounded-full flex-shrink-0" style="background:#4ade80"></div>
               <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium truncate" style="color:var(--text-primary)">{{ shortName(dev.name) }}</p>
+                <div class="flex items-center gap-1.5">
+                  <p class="text-sm font-medium truncate" style="color:var(--text-primary)">{{ shortName(dev.name) }}</p>
+                  <span v-if="isPeerInSyncGroup(dev.name)" class="text-xs" title="已共享剪贴板">📋</span>
+                </div>
                 <p class="text-xs" style="color:var(--text-muted)">{{ dev.addr }}
                   <span v-if="dev.lastSeen" class="ml-1" style="color:var(--text-faint)">· {{ fmtLastSeen(dev.lastSeen) }}</span>
                 </p>
               </div>
+              <!-- Sync peer toggle button (Task 10.2) -->
+              <button @click.stop="toggleSyncPeer(dev)"
+                :title="isPeerInSyncGroup(dev.name) ? '取消共享剪贴板' : '共享剪贴板'"
+                :style="isPeerInSyncGroup(dev.name)
+                  ? 'background:var(--accent-bg);color:var(--accent);box-shadow:0 0 0 1px var(--accent-ring)'
+                  : 'background:var(--bg-muted);color:var(--text-muted)'"
+                class="px-2.5 py-1.5 rounded-lg text-xs transition-all flex-shrink-0">
+                {{ isPeerInSyncGroup(dev.name) ? '📋 已共享' : '📋 共享' }}
+              </button>
             </div>
           </div>
         </template>
@@ -1109,6 +1286,31 @@ function highlightSegments(line: string, ranges: [number,number][]) {
           <div class="flex-1 flex flex-col gap-5 max-w-md mx-auto w-full">
             <h2 class="font-medium text-sm flex-shrink-0" style="color:var(--text-secondary)">⚙️ 设置</h2>
 
+            <!-- Clipboard sync section (Task 10.2) -->
+            <div class="rounded-xl p-4 space-y-3 flex-shrink-0"
+              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+              <p class="text-xs font-medium" style="color:var(--text-secondary)">📋 共享剪贴板</p>
+
+              <label class="flex items-center justify-between text-xs cursor-pointer"
+                style="color:var(--text-secondary)">
+                <span>启用剪贴板同步</span>
+                <input type="checkbox" :checked="clipSyncEnabled"
+                  @change="toggleClipSync(!clipSyncEnabled)" class="accent-cyan-500" />
+              </label>
+
+              <div v-if="syncGroupConfig.peers.length > 0" class="space-y-1 pt-1">
+                <p class="text-xs" style="color:var(--text-faint)">同步设备 ({{ syncGroupConfig.peers.length }})</p>
+                <div v-for="peer in syncGroupConfig.peers" :key="peer.device_name"
+                  class="flex items-center gap-2 text-xs py-1">
+                  <div class="w-2 h-2 rounded-full flex-shrink-0"
+                    :style="peer.online ? 'background:#4ade80' : 'background:var(--text-faint)'"></div>
+                  <span class="flex-1 truncate" style="color:var(--text-secondary)">{{ shortName(peer.device_name) }}</span>
+                  <span class="text-[10px]" style="color:var(--text-faint)">{{ peer.online ? '在线' : '离线' }}</span>
+                </div>
+              </div>
+              <p v-else class="text-xs" style="color:var(--text-faint)">在"设备"页面中添加共享设备</p>
+            </div>
+
             <!-- Update section -->
             <div class="rounded-xl p-4 space-y-3 flex-shrink-0"
               style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
@@ -1180,6 +1382,23 @@ function highlightSegments(line: string, ranges: [number,number][]) {
       style="color:var(--text-faint);border-top:1px solid var(--border);background:var(--bg-surface)">
       rust-air v0.3 · E2EE · mDNS · SHA-256 · 自动更新 · 快捷键 1-6 切换标签
     </footer>
+
+    <!-- Toast notifications (Task 10.4) -->
+    <div class="fixed top-16 right-4 z-50 flex flex-col gap-2 pointer-events-none" style="max-width:320px">
+      <transition-group name="toast">
+        <div v-for="t in toasts" :key="t.id"
+          class="rounded-xl px-4 py-3 text-xs shadow-lg pointer-events-auto flex items-start gap-2"
+          :style="t.kind === 'sync_received'
+            ? 'background:rgba(34,197,94,0.15);box-shadow:0 0 0 1px rgba(34,197,94,0.3);color:#86efac'
+            : 'background:rgba(239,68,68,0.15);box-shadow:0 0 0 1px rgba(239,68,68,0.3);color:#fca5a5'">
+          <span class="flex-shrink-0 text-sm">{{ t.kind === 'sync_received' ? '📋' : t.kind === 'size_limit' ? '📏' : t.kind === 'checksum_failed' ? '🔒' : '⚠️' }}</span>
+          <div class="flex-1 min-w-0">
+            <p class="leading-relaxed">{{ t.message }}</p>
+            <p v-if="t.device" class="mt-0.5" style="opacity:0.7">{{ t.device }}</p>
+          </div>
+        </div>
+      </transition-group>
+    </div>
   </div>
 </template>
 
@@ -1189,4 +1408,11 @@ function highlightSegments(line: string, ranges: [number,number][]) {
   50%  { transform: translateX(150%); }
   100% { transform: translateX(150%); }
 }
+
+/* Toast transitions (Task 10.4) */
+.toast-enter-active { transition: all 0.3s ease-out; }
+.toast-leave-active { transition: all 0.3s ease-in; }
+.toast-enter-from   { opacity: 0; transform: translateX(40px); }
+.toast-leave-to     { opacity: 0; transform: translateX(40px); }
+.toast-move         { transition: transform 0.3s ease; }
 </style>

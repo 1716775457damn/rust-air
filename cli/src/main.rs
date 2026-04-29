@@ -112,7 +112,7 @@ async fn cmd_send_clip(to: String) -> Result<()> {
     println!("🔗 Connecting to {to}…");
     let stream = TcpStream::connect(&to).await?;
     println!("🔒 E2EE ChaCha20-Poly1305 + SHA-256 verify\n");
-    transfer::send_clipboard(stream, &text, noop_progress).await?;
+    transfer::send_clipboard(stream, &text, "clipboard", noop_progress).await?;
     println!("\n✅ Clipboard sent!");
     Ok(())
 }
@@ -135,7 +135,7 @@ async fn cmd_receive(out: PathBuf) -> Result<()> {
         let out2 = out.clone();
         tokio::spawn(async move {
             match transfer::receive_to_disk(stream, &out2, noop_progress).await {
-                Ok(p)  => println!("\n✅ Saved to: {}", p.display()),
+                Ok(outcome) => println!("\n✅ Saved to: {}", outcome.path().display()),
                 Err(e) => eprintln!("\n❌ Error: {e}"),
             }
         });

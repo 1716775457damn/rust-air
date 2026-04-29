@@ -36,6 +36,9 @@ pub struct ClipEntry {
     pub time_str:   String,
     #[serde(skip)]
     pub text_lc:    String,
+    /// 来源设备名称（None 表示本地复制）
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_device: Option<String>,
 }
 
 impl ClipEntry {
@@ -48,7 +51,7 @@ impl ClipEntry {
         };
         let now      = Local::now();
         let time_str = now.format("%H:%M").to_string();
-        Self { id, content, time: now, pinned: false, preview, stats, char_count, time_str, text_lc }
+        Self { id, content, time: now, pinned: false, preview, stats, char_count, time_str, text_lc, source_device: None }
     }
 
     pub fn rebuild_time_str(&mut self, today: chrono::NaiveDate) {
@@ -260,7 +263,7 @@ pub fn start_monitor(tx: std::sync::mpsc::Sender<ClipContent>) {
 }
 
 /// Fast non-cryptographic hash for image change detection (samples every Nth byte).
-fn fnv1a(data: &[u8]) -> u64 {
+pub fn fnv1a(data: &[u8]) -> u64 {
     let step = (data.len() / 512).max(1);
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in data.iter().step_by(step) {

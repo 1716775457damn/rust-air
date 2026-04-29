@@ -1,10 +1,17 @@
 [package]
 name    = "rust-air-core"
-version = "0.3.34"
+version = "0.3.35"
 edition = "2021"
 
 [lib]
 name = "rust_air_core"
+
+[[example]]
+name = "clip_test"
+required-features = ["desktop"]
+
+[features]
+desktop = ["arboard", "notify", "mdns-sd", "if-addrs", "axum", "qrcode", "indicatif", "image"]
 
 [dependencies]
 tokio      = { workspace = true }
@@ -19,37 +26,30 @@ rand             = "0.8"
 base64           = "0.22"
 sha2             = "0.10"
 
-# Archive
+# Archive (always available — pure Rust, works on all platforms)
 tar     = "0.4"
 zstd    = "0.13"
 os_pipe = "1"
+walkdir = "2"
 rayon   = "1"
 
-# Discovery (mDNS-SD replaces UDP broadcast)
-mdns-sd   = "0.19"
-if-addrs  = "0.13"
-
-# Progress
-indicatif = "0.17"
-
-# Clipboard
-# arboard kept only for clipboard read/write in CLI send-clip command
-arboard = "3"
-
-# Shared utilities (used by sync_vault)
+# Shared utilities
 serde_json = "1"
 chrono     = { version = "0.4", features = ["serde"] }
 dirs       = "5"
 unicode-normalization = "0.1"
+hex        = "0.4"
 
-# Sync vault
-notify  = "6"
-hex     = "0.4"
-walkdir = "2"
-
-# HTTP + QR (for --qr flag)
-axum   = "0.7"
-qrcode = "0.14"
+# Desktop-only (optional)
+arboard   = { version = "3", optional = true }
+image     = { version = "0.25", default-features = false, features = ["png"], optional = true }
+notify    = { version = "6", optional = true }
+mdns-sd   = { version = "0.19", optional = true }
+if-addrs  = { version = "0.13", optional = true }
+axum      = { version = "0.7", optional = true }
+qrcode    = { version = "0.14", optional = true }
+indicatif = { version = "0.17", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+proptest = "1"

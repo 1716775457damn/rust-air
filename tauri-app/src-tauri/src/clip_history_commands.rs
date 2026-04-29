@@ -1,4 +1,5 @@
 use rust_air_core::{ClipContent, ClipEntry, HistoryStore};
+use rust_air_core::clipboard_sync::ClipboardSyncService;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
@@ -28,6 +29,8 @@ pub struct ClipEntryView {
     pub char_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_b64:  Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_device: Option<String>,
 }
 
 impl From<&ClipEntry> for ClipEntryView {
@@ -50,13 +53,19 @@ impl From<&ClipEntry> for ClipEntryView {
             id: e.id, kind, preview: e.preview.clone(), stats: e.stats.clone(),
             time_str: e.time_str.clone(), pinned: e.pinned,
             char_count: e.char_count, image_b64,
+            source_device: e.source_device.clone(),
         }
     }
 }
 
 /// Start a background thread that polls clipboard and emits "clip-update" events directly.
 /// No channel, no invoke — push-based.
-pub fn start_clip_monitor(app: AppHandle, state: std::sync::Arc<HistoryState>) {
+/// When clipboard sync is enabled, new content is broadcast to online peers.
+pub fn start_clip_monitor(
+    app: AppHandle,
+    state: std::sync::Arc<HistoryState>,
+    sync_service: std::sync::Arc<ClipboardSyncService>,
+) {
     std::thread::spawn(move || {
         // Wait for clipboard to be available
         let mut cb = None;
@@ -69,6 +78,12 @@ pub fn start_clip_monitor(app: AppHandle, state: std::sync::Arc<HistoryState>) {
         let mut last_text = String::new();
         let mut last_img_hash = 0u64;
 
+        // Build a tokio runtime for async broadcast calls.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok();
+
         // Delay initial emit so frontend listen() has time to register
         std::thread::sleep(std::time::Duration::from_millis(1000));
 
@@ -78,6 +93,8 @@ pub fn start_clip_monitor(app: AppHandle, state: std::sync::Arc<HistoryState>) {
             let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
             let _ = app.emit("clip-update", &entries);
         }
+
+        let device_name = rust_air_core::discovery::safe_device_name();
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -107,6 +124,31 @@ pub fn start_clip_monitor(app: AppHandle, state: std::sync::Arc<HistoryState>) {
             } else { None };
 
             if let Some(content) = new_content {
+                // Attempt clipboard sync broadcast (non-blocking, failures don't affect history)
+                if sync_service.should_broadcast(&content) {
+                    if let Some(ref rt) = rt {
+                        let svc = sync_service.clone();
+                        let c = content.clone();
+                        let dn = device_name.clone();
+                        let app2 = app.clone();
+                        rt.block_on(async {
+                            let results = svc.broadcast(&c, &dn).await;
+                            for r in &results {
+                                if !r.success {
+                                    if let Some(ref err) = r.error {
+                                        let sync_err = rust_air_core::clipboard_sync::ClipSyncError {
+                                            kind: "transfer_failed".to_string(),
+                                            message: err.clone(),
+                                            device: Some(r.device_name.clone()),
+                                        };
+                                        let _ = app2.emit("clip-sync-error", &sync_err);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+
                 let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
                 if !paused { store.push(content); }
                 store.flush_if_needed();

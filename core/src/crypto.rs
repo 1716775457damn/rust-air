@@ -38,6 +38,12 @@ impl<W: AsyncWrite + Unpin> Encryptor<W> {
         }
     }
 
+    /// Set the initial frame counter for resume. Must be called before the
+    /// first `write_chunk()` call so that nonces align with the original stream.
+    pub fn set_counter(&mut self, counter: u64) {
+        self.counter = counter;
+    }
+
     /// Encrypt `plaintext` and write `[len][tag][ciphertext]` in a single syscall.
     /// Reuses an internal buffer to avoid per-chunk heap allocation.
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
@@ -96,6 +102,12 @@ impl<R: AsyncRead + Unpin> Decryptor<R> {
             data_buf: Vec::with_capacity(CHUNK),
             spare_buf: Vec::with_capacity(CHUNK),
         }
+    }
+
+    /// Set the initial frame counter for resume. Must be called before the
+    /// first `read_chunk()` call so that nonces align with the original stream.
+    pub fn set_counter(&mut self, counter: u64) {
+        self.counter = counter;
     }
 
     pub async fn read_trailing(&mut self) -> Result<[u8; 32]> {

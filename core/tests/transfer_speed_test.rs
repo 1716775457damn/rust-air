@@ -61,9 +61,9 @@ async fn test_file_transfer_2mb_loopback() {
     send_task.await.unwrap();
 
     // Verify: received file exists and content matches
-    assert!(received_path.exists(), "received file should exist");
+    assert!(received_path.path().exists(), "received file should exist");
     let original = fs::read(&src_file).unwrap();
-    let received = fs::read(&received_path).unwrap();
+    let received = fs::read(received_path.path()).unwrap();
     assert_eq!(
         original.len(),
         received.len(),
@@ -103,9 +103,9 @@ async fn test_file_transfer_4mb_loopback() {
 
     send_task.await.unwrap();
 
-    assert!(received_path.exists(), "received file should exist");
+    assert!(received_path.path().exists(), "received file should exist");
     let original = fs::read(&src_file).unwrap();
-    let received = fs::read(&received_path).unwrap();
+    let received = fs::read(received_path.path()).unwrap();
     assert_eq!(original.len(), received.len(), "file sizes should match");
     assert_eq!(original, received, "file content should be byte-identical");
 
