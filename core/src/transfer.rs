@@ -21,6 +21,7 @@ use crate::{
 use anyhow::Result;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use socket2::SockRef;
 use std::{path::{Path, PathBuf}, sync::Arc, time::Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
@@ -33,7 +34,7 @@ use walkdir::DirEntry as WalkDirEntry;
 pub async fn send_path(
     stream: TcpStream,
     path: &Path,
-    on_progress: impl Fn(TransferEvent) + Send + 'static,
+    on_progress: impl Fn(TransferEvent) + Send + Sync + 'static,
 ) -> Result<()> {
     let key = random_key();
     let meta = tokio::fs::metadata(path).await?;
@@ -51,6 +52,7 @@ pub async fn send_path(
         dir_entries = None;
     }
 
+    tune_socket(&stream);
     let (mut rx, mut tx) = stream.into_split();
     send_header(&mut tx, &key, kind, &name, total_size).await?;
 
@@ -80,7 +82,7 @@ pub async fn send_path(
             }
             // f is now positioned at resume_offset — no seek needed.
         }
-        stream_encrypted_hash(&mut f, &mut enc, resume_offset, total_size, on_progress, full_hasher).await?
+        stream_encrypted_hash_pipeline(f, &mut enc, resume_offset, total_size, on_progress, full_hasher).await?
     };
 
     // v4 protocol: EOF sentinel first, then SHA-256 checksum.
@@ -97,6 +99,7 @@ pub async fn receive_to_disk(
     dest: &Path,
     on_progress: impl Fn(TransferEvent) + Send + 'static,
 ) -> Result<PathBuf> {
+    tune_socket(&stream);
     let (mut rx, mut tx) = stream.into_split();
     let (key, kind, name, total_size) = recv_header(&mut rx).await?;
 
@@ -159,7 +162,18 @@ pub async fn receive_to_disk(
             // Seek to end for appending, wrap in BufWriter.
             let mut file = file;
             file.seek(std::io::SeekFrom::End(0)).await?;
-            let mut f = BufWriter::with_capacity(4 * CHUNK, file);
+            let f = BufWriter::with_capacity(4 * CHUNK, file);
+
+            // Pipeline: decrypt + hash in main task, disk writes in spawned task.
+            let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+            let write_task = tokio::spawn(async move {
+                let mut f = f;
+                while let Some(chunk) = write_rx.recv().await {
+                    f.write_all(&chunk).await?;
+                }
+                f.flush().await?;
+                Ok::<_, anyhow::Error>(())
+            });
 
             let mut dec = Decryptor::new(&key, rx);
             let mut done = already_have;
@@ -168,17 +182,16 @@ pub async fn receive_to_disk(
 
             while let Some(chunk) = dec.read_chunk().await? {
                 hasher.update(&chunk);
-                f.write_all(&chunk).await?;
                 done += chunk.len() as u64;
-                let recycle_buf = chunk;
-                if last_emit.elapsed().as_millis() >= 50 {
+                write_tx.send(chunk).await
+                    .map_err(|_| anyhow::anyhow!("write task failed"))?;
+                if last_emit.elapsed().as_millis() >= 100 {
                     emit_progress(&on_progress, done, total_size, &start, false);
                     last_emit = Instant::now();
                 }
-                dec.recycle(recycle_buf);
             }
-            f.flush().await?;
-            drop(f);
+            drop(write_tx);
+            write_task.await??;
 
             let expected_sha = dec.read_trailing().await?;
             if expected_sha != [0u8; 32] {
@@ -214,7 +227,7 @@ pub async fn receive_to_disk(
                 unpack_writer.write_all(&chunk).await?;
                 done += chunk.len() as u64;
                 let recycle_buf = chunk;
-                if last_emit.elapsed().as_millis() >= 50 {
+                if last_emit.elapsed().as_millis() >= 100 {
                     emit_progress(&on_progress, done, total_size, &start, false);
                     last_emit = Instant::now();
                 }
@@ -342,11 +355,73 @@ async fn stream_encrypted_hash<R: AsyncRead + Unpin>(
         hasher.update(&buf[..filled]);
         enc.write_chunk(&buf[..filled]).await?;
         done += filled as u64;
-        if last_emit.elapsed().as_millis() >= 50 {
+        if last_emit.elapsed().as_millis() >= 100 {
             emit_progress(&on_progress, done, total, &start, false);
             last_emit = Instant::now();
         }
     }
+    Ok(hasher.finalize().into())
+}
+
+/// Stream `reader` through `enc` using a pipeline: file reading runs in a
+/// separate spawned task, communicating chunks via a bounded channel to the
+/// encrypt+hash task. This overlaps I/O with encryption for higher throughput.
+async fn stream_encrypted_hash_pipeline<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    enc: &mut Encryptor<impl AsyncWriteExt + Unpin>,
+    initial: u64,
+    total: u64,
+    on_progress: Arc<impl Fn(TransferEvent) + Send + Sync>,
+    mut hasher: Sha256,
+) -> Result<[u8; 32]> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>>>(2);
+
+    // Read task: independently spawned, fills CHUNK-sized buffers and sends them.
+    let read_task = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            let mut buf = vec![0u8; CHUNK];
+            let mut filled = 0;
+            while filled < buf.len() {
+                match reader.read(&mut buf[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        let _ = tx.send(Err(e.into())).await;
+                        return;
+                    }
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            buf.truncate(filled);
+            if tx.send(Ok(buf)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Encrypt task: receives from channel, hashes sequentially, then encrypts.
+    let mut done = initial;
+    let start = Instant::now();
+    let mut last_emit = start;
+    while let Some(result) = rx.recv().await {
+        let chunk = result?;
+        hasher.update(&chunk);
+        enc.write_chunk(&chunk).await?;
+        done += chunk.len() as u64;
+        if last_emit.elapsed().as_millis() >= 100 {
+            emit_progress(&on_progress, done, total, &start, false);
+            last_emit = Instant::now();
+        }
+    }
+
+    // Capture read task panic.
+    read_task
+        .await
+        .map_err(|e| anyhow::anyhow!("read task panicked: {e}"))?;
+
     Ok(hasher.finalize().into())
 }
 
@@ -409,6 +484,22 @@ fn random_key() -> [u8; 32] {
     let mut k = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut k);
     k
+}
+
+/// Tune TCP socket for high-throughput transfers: disable Nagle, enlarge buffers.
+/// Failures are non-fatal — we just warn and continue with OS defaults.
+fn tune_socket(stream: &TcpStream) {
+    let sock = SockRef::from(stream);
+    if let Err(e) = stream.set_nodelay(true) {
+        eprintln!("warn: TCP_NODELAY failed: {e}");
+    }
+    let buf_size = 2 * 1024 * 1024; // 2MB
+    if let Err(e) = sock.set_send_buffer_size(buf_size) {
+        eprintln!("warn: SO_SNDBUF failed: {e}");
+    }
+    if let Err(e) = sock.set_recv_buffer_size(buf_size) {
+        eprintln!("warn: SO_RCVBUF failed: {e}");
+    }
 }
 
 #[inline]

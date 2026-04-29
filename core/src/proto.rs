@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAGIC: &[u8; 4] = b"RAR4";
 pub const MDNS_SERVICE: &str = "_rustair._tcp.local.";
-pub const CHUNK: usize = 256 * 1024; // 256 KB: better throughput on fast LANs
+pub const CHUNK: usize = 1024 * 1024; // 1 MB: better throughput on fast LANs
 pub const MAX_NAME_LEN: usize = 512;
 
 #[repr(u8)]
