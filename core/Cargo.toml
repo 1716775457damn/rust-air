@@ -6,10 +6,6 @@ edition = "2021"
 [lib]
 name = "rust_air_core"
 
-[[example]]
-name = "clip_test"
-required-features = ["desktop"]
-
 [features]
 desktop = ["arboard", "notify", "mdns-sd", "if-addrs", "axum", "qrcode", "indicatif", "image"]
 
