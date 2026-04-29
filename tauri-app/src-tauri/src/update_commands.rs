@@ -207,15 +207,33 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
 fn launch_installer(path: &PathBuf) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        // msi: msiexec /i <path> /qb — shows minimal progress UI, no reboot prompt
-        // exe: run directly
+        // Use a small delay script so the app process fully exits before
+        // the installer starts — avoids file-lock conflicts on Windows.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext.eq_ignore_ascii_case("msi") {
-            std::process::Command::new("msiexec")
-                .args(["/i", &path.to_string_lossy(), "/qb"])
+            // msiexec /i <path> /qb REINSTALLMODE=omus
+            // The REINSTALLMODE ensures all files are overwritten even if
+            // the version looks the same to Windows Installer.
+            // We use cmd /C with a ping delay to let the app exit first.
+            let msi_path = path.to_string_lossy().to_string();
+            std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    &format!(
+                        "ping -n 2 127.0.0.1 >nul && msiexec /i \"{}\" /qb REINSTALLMODE=omus",
+                        msi_path
+                    ),
+                ])
                 .spawn()?;
         } else {
-            std::process::Command::new(path).spawn()?;
+            // exe installer: also delay slightly
+            let exe_path = path.to_string_lossy().to_string();
+            std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    &format!("ping -n 2 127.0.0.1 >nul && \"{}\"", exe_path),
+                ])
+                .spawn()?;
         }
     }
     #[cfg(target_os = "macos")]
