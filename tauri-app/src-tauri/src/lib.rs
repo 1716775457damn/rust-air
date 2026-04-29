@@ -3,8 +3,9 @@ mod sync_commands;
 mod search_commands;
 mod clip_history_commands;
 mod update_commands;
+mod todo_commands;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri_plugin_dialog;
 use tauri_plugin_opener;
@@ -22,6 +23,7 @@ pub fn run() {
         .manage(sync_commands::SyncState::new())
         .manage(search_commands::SearchState::new())
         .manage(history_state)          // Arc<HistoryState> implements Deref<Target=HistoryState>
+        .manage(Mutex::new(todo_commands::TodoStore::new()))
         .setup(move |app| {
             clip_history_commands::start_clip_monitor(app.handle().clone(), history_for_monitor);
 
@@ -88,6 +90,12 @@ pub fn run() {
             update_commands::save_update_settings,
             update_commands::check_update,
             update_commands::download_and_install,
+            // Todo
+            todo_commands::get_todos,
+            todo_commands::add_todo,
+            todo_commands::toggle_todo,
+            todo_commands::delete_todo,
+            todo_commands::get_todo_dates,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

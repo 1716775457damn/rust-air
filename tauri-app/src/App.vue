@@ -19,7 +19,9 @@ interface UpdateInfo { version: string; url: string; size: number; release_notes
 interface UpdateProgress { downloaded: number; total: number; done: boolean }
 interface UpdateSettings { auto_check: boolean; auto_install: boolean }
 
-type Tab   = "send" | "receive" | "devices" | "search" | "sync" | "settings";
+interface TodoItem { id: number; title: string; date: string; completed: boolean }
+
+type Tab   = "send" | "receive" | "devices" | "search" | "sync" | "todo" | "settings";
 type Phase = "idle" | "transferring" | "done" | "error";
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -91,6 +93,18 @@ const updateProgress = ref<UpdateProgress | null>(null);
 const updateChecking = ref(false);
 const updateSettings = ref<UpdateSettings>({ auto_check: true, auto_install: false });
 
+// Todo
+function todayStr(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+const selectedDate   = ref<string>(todayStr());
+const calendarYear   = ref(new Date().getFullYear());
+const calendarMonth  = ref(new Date().getMonth() + 1);
+const todos          = ref<TodoItem[]>([]);
+const todoDates      = ref<string[]>([]);
+const newTodoTitle   = ref("");
+
 const unlisten = ref<UnlistenFn[]>([]);
 
 // ── Computed ──────────────────────────────────────────────────────────────────
@@ -141,6 +155,51 @@ function cachedHighlight(path: string, lineNum: number, line: string, ranges: [n
   return hlCache.get(key)!;
 }
 watch(searchResults, () => hlCache.clear());
+
+// ── Calendar computed ─────────────────────────────────────────────────────────
+
+interface CalendarDay { day: number; current: boolean; dateStr: string }
+
+const calendarDays = computed<CalendarDay[]>(() => {
+  const y = calendarYear.value;
+  const m = calendarMonth.value;
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const firstDow = new Date(y, m - 1, 1).getDay(); // 0=Sun
+  const prevMonthDays = new Date(y, m - 1, 0).getDate();
+  const grid: CalendarDay[] = [];
+
+  // Previous month trailing days
+  for (let i = firstDow - 1; i >= 0; i--) {
+    const d = prevMonthDays - i;
+    const pm = m === 1 ? 12 : m - 1;
+    const py = m === 1 ? y - 1 : y;
+    grid.push({ day: d, current: false, dateStr: `${py}-${String(pm).padStart(2,'0')}-${String(d).padStart(2,'0')}` });
+  }
+
+  // Current month days
+  for (let d = 1; d <= daysInMonth; d++) {
+    grid.push({ day: d, current: true, dateStr: `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}` });
+  }
+
+  // Next month leading days to fill 6×7 grid
+  const remaining = 42 - grid.length;
+  const nm = m === 12 ? 1 : m + 1;
+  const ny = m === 12 ? y + 1 : y;
+  for (let d = 1; d <= remaining; d++) {
+    grid.push({ day: d, current: false, dateStr: `${ny}-${String(nm).padStart(2,'0')}-${String(d).padStart(2,'0')}` });
+  }
+
+  return grid;
+});
+
+function prevMonth() {
+  if (calendarMonth.value === 1) { calendarMonth.value = 12; calendarYear.value--; }
+  else { calendarMonth.value--; }
+}
+function nextMonth() {
+  if (calendarMonth.value === 12) { calendarMonth.value = 1; calendarYear.value++; }
+  else { calendarMonth.value++; }
+}
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -239,6 +298,10 @@ onMounted(async () => {
 
   updateSettings.value = await invoke<UpdateSettings>("get_update_settings");
 
+  // Load initial todo data
+  await loadTodos(selectedDate.value);
+  await loadTodoDates(calendarYear.value, calendarMonth.value);
+
   startScan();
 });
 
@@ -250,7 +313,7 @@ onUnmounted(async () => {
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────────
 
-const TAB_KEYS: Record<string, Tab> = { "1": "send", "2": "receive", "3": "devices", "4": "search", "5": "sync" };
+const TAB_KEYS: Record<string, Tab> = { "1": "send", "2": "receive", "3": "devices", "4": "search", "5": "sync", "6": "todo" };
 function onKeyDown(e: KeyboardEvent) {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
   if (TAB_KEYS[e.key]) { tab.value = TAB_KEYS[e.key]; e.preventDefault(); }
@@ -379,6 +442,48 @@ async function saveUpdateSettings() {
   await invoke("save_update_settings", { settings: updateSettings.value });
 }
 
+// ── Todo IPC ─────────────────────────────────────────────────────────────────
+
+async function loadTodos(date: string) {
+  try { todos.value = await invoke<TodoItem[]>("get_todos", { date }); }
+  catch (e: any) { console.error("loadTodos:", e); }
+}
+
+async function loadTodoDates(year: number, month: number) {
+  try { todoDates.value = await invoke<string[]>("get_todo_dates", { year, month }); }
+  catch (e: any) { console.error("loadTodoDates:", e); }
+}
+
+async function addTodo() {
+  const title = newTodoTitle.value.trim();
+  if (!title) return;
+  try {
+    await invoke<TodoItem>("add_todo", { title, date: selectedDate.value });
+    newTodoTitle.value = "";
+    await loadTodos(selectedDate.value);
+    await loadTodoDates(calendarYear.value, calendarMonth.value);
+  } catch (e: any) { console.error("addTodo:", e); }
+}
+
+async function toggleTodo(id: number) {
+  try {
+    await invoke<TodoItem>("toggle_todo", { id });
+    await loadTodos(selectedDate.value);
+    await loadTodoDates(calendarYear.value, calendarMonth.value);
+  } catch (e: any) { console.error("toggleTodo:", e); }
+}
+
+async function deleteTodo(id: number) {
+  try {
+    await invoke("delete_todo", { id });
+    await loadTodos(selectedDate.value);
+    await loadTodoDates(calendarYear.value, calendarMonth.value);
+  } catch (e: any) { console.error("deleteTodo:", e); }
+}
+
+watch(selectedDate, (d) => loadTodos(d));
+watch([calendarYear, calendarMonth], ([y, m]) => loadTodoDates(y, m));
+
 // ── IP ────────────────────────────────────────────────────────────────────────
 
 async function copyIp() {
@@ -489,15 +594,15 @@ function highlightSegments(line: string, ranges: [number,number][]) {
       <!-- Sidebar -->
       <nav class="flex flex-col gap-1 w-[72px] flex-shrink-0 px-1.5 py-3"
         style="background:var(--bg-surface);border-right:1px solid var(--border)">
-        <button v-for="(t, idx) in (['send','receive','devices','search','sync'] as Tab[])" :key="t"
+        <button v-for="(t, idx) in (['send','receive','devices','search','sync','todo'] as Tab[])" :key="t"
           @click="tab = t"
-          :title="`${t === 'send' ? '发送' : t === 'receive' ? '接收' : t === 'devices' ? '设备' : t === 'search' ? '搜索' : '同步'} (${idx+1})`"
+          :title="`${t === 'send' ? '发送' : t === 'receive' ? '接收' : t === 'devices' ? '设备' : t === 'search' ? '搜索' : t === 'sync' ? '同步' : '待办'} (${idx+1})`"
           :style="tab === t
             ? 'background:var(--accent-bg);color:var(--accent)'
             : 'color:var(--text-muted)'"
           class="flex flex-col items-center gap-1 py-2.5 rounded-xl text-xs transition-all duration-150 w-full hover:opacity-80">
-          <span class="text-[15px] leading-none">{{ t==='send'?'📤':t==='receive'?'📥':t==='devices'?'🔍':t==='search'?'📂':'🔄' }}</span>
-          <span class="text-[10px] mt-0.5">{{ t==='send'?'发送':t==='receive'?'接收':t==='devices'?'设备':t==='search'?'搜索':'同步' }}</span>
+          <span class="text-[15px] leading-none">{{ t==='send'?'📤':t==='receive'?'📥':t==='devices'?'🔍':t==='search'?'📂':t==='sync'?'🔄':'📋' }}</span>
+          <span class="text-[10px] mt-0.5">{{ t==='send'?'发送':t==='receive'?'接收':t==='devices'?'设备':t==='search'?'搜索':t==='sync'?'同步':'待办' }}</span>
           <span class="text-[9px] leading-none" style="color:var(--text-faint)">{{ idx+1 }}</span>
           <span v-if="t==='receive' && recvPhase==='transferring'"
             class="w-1.5 h-1.5 rounded-full animate-pulse mt-0.5"
@@ -913,6 +1018,92 @@ function highlightSegments(line: string, ranges: [number,number][]) {
           </div>
         </template>
 
+        <!-- TODO TAB -->
+        <template v-else-if="tab === 'todo'">
+          <div class="flex-1 flex flex-col gap-4 min-h-0 max-w-xl mx-auto w-full">
+
+            <!-- Calendar -->
+            <div class="rounded-xl p-4 flex-shrink-0"
+              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+              <!-- Month navigation -->
+              <div class="flex items-center justify-between mb-3">
+                <button @click="prevMonth"
+                  class="w-8 h-8 rounded-lg flex items-center justify-center text-sm transition-colors hover:opacity-80"
+                  style="background:var(--bg-muted);color:var(--text-secondary)">‹</button>
+                <span class="text-sm font-medium" style="color:var(--text-primary)">{{ calendarYear }} 年 {{ calendarMonth }} 月</span>
+                <button @click="nextMonth"
+                  class="w-8 h-8 rounded-lg flex items-center justify-center text-sm transition-colors hover:opacity-80"
+                  style="background:var(--bg-muted);color:var(--text-secondary)">›</button>
+              </div>
+              <!-- Weekday headers -->
+              <div class="grid grid-cols-7 text-center mb-1">
+                <span v-for="w in ['日','一','二','三','四','五','六']" :key="w"
+                  class="text-[10px] py-1" style="color:var(--text-muted)">{{ w }}</span>
+              </div>
+              <!-- Date grid -->
+              <div class="grid grid-cols-7 text-center gap-y-0.5">
+                <button v-for="(d, i) in calendarDays" :key="i"
+                  @click="d.current && (selectedDate = d.dateStr)"
+                  :class="[
+                    'relative w-full py-1.5 rounded-lg text-xs transition-all duration-150',
+                    d.current ? 'cursor-pointer hover:opacity-80' : 'cursor-default'
+                  ]"
+                  :style="
+                    d.dateStr === selectedDate
+                      ? 'background:var(--accent-bg);color:var(--accent);font-weight:600'
+                      : d.dateStr === todayStr() && d.current
+                        ? 'color:var(--accent);font-weight:600'
+                        : d.current
+                          ? 'color:var(--text-primary)'
+                          : 'color:var(--text-faint)'
+                  ">
+                  {{ d.day }}
+                  <span v-if="d.current && todoDates.includes(d.dateStr)"
+                    class="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full"
+                    style="background:var(--accent)"></span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Selected date label -->
+            <div class="flex items-center gap-2 flex-shrink-0">
+              <span class="text-xs" style="color:var(--text-muted)">{{ selectedDate }}</span>
+              <button v-if="selectedDate !== todayStr()" @click="selectedDate = todayStr(); calendarYear = new Date().getFullYear(); calendarMonth = new Date().getMonth() + 1"
+                class="text-xs px-2 py-0.5 rounded-lg transition-colors"
+                style="background:var(--bg-muted);color:var(--text-secondary)">回到今天</button>
+            </div>
+
+            <!-- Todo list -->
+            <div class="flex-1 min-h-0 overflow-y-auto space-y-1">
+              <div v-if="todos.length === 0" class="text-center py-8 text-sm" style="color:var(--text-faint)">
+                暂无待办
+              </div>
+              <div v-for="item in todos" :key="item.id"
+                class="rounded-xl p-3 flex items-center gap-3 group"
+                style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+                <input type="checkbox" :checked="item.completed" @change="toggleTodo(item.id)"
+                  class="accent-cyan-500 flex-shrink-0 cursor-pointer" />
+                <span class="flex-1 text-sm truncate"
+                  :style="item.completed
+                    ? 'color:var(--text-faint);text-decoration:line-through'
+                    : 'color:var(--text-primary)'">{{ item.title }}</span>
+                <button @click="deleteTodo(item.id)"
+                  class="text-xs flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                  style="color:var(--text-muted)">✕</button>
+              </div>
+            </div>
+
+            <!-- Add todo input -->
+            <div class="flex gap-2 flex-shrink-0">
+              <input v-model="newTodoTitle" @keyup.enter="addTodo"
+                placeholder="添加待办事项…"
+                class="flex-1 rounded-lg px-3 py-2 text-sm focus:outline-none transition-colors"
+                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+            </div>
+
+          </div>
+        </template>
+
         <!-- SETTINGS TAB -->
         <template v-else-if="tab === 'settings'">
           <div class="flex-1 flex flex-col gap-5 max-w-md mx-auto w-full">
@@ -987,7 +1178,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
 
     <footer class="text-center text-[11px] py-1.5"
       style="color:var(--text-faint);border-top:1px solid var(--border);background:var(--bg-surface)">
-      rust-air v0.3 · E2EE · mDNS · SHA-256 · 自动更新 · 快捷键 1-5 切换标签
+      rust-air v0.3 · E2EE · mDNS · SHA-256 · 自动更新 · 快捷键 1-6 切换标签
     </footer>
   </div>
 </template>
