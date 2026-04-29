@@ -52,6 +52,63 @@ fn settings_path() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?.join("rust-air").join("update-settings.json"))
 }
 
+// ── Cleanup record ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CleanupRecord {
+    installer_path: String,
+}
+
+fn cleanup_record_path() -> Option<PathBuf> {
+    Some(dirs::data_local_dir()?.join("rust-air").join("update-cleanup.json"))
+}
+
+/// Clean up old update installer files left over from previous updates.
+///
+/// Called synchronously during `setup` — before the auto-update check.
+/// Every file-system operation is wrapped in a silent ignore so that a
+/// failure here can never prevent the application from starting.
+pub fn cleanup_old_update_files() {
+    // 1. Read the cleanup record (if any) and try to delete the recorded file.
+    let record_path = match cleanup_record_path() {
+        Some(p) => p,
+        None => return,
+    };
+
+    if let Ok(json) = std::fs::read_to_string(&record_path) {
+        if let Ok(record) = serde_json::from_str::<CleanupRecord>(&json) {
+            let p = PathBuf::from(&record.installer_path);
+            let _ = std::fs::remove_file(&p); // silent
+        }
+    }
+
+    // 2. Scan temp dir for any rust-air installer files that are NOT the
+    //    current version and delete them.
+    let temp = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&temp) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with("rust-air") {
+                continue;
+            }
+            let dominated = name_str.ends_with(".msi") || name_str.ends_with("-setup.exe");
+            if !dominated {
+                continue;
+            }
+            // Skip the installer for the currently running version so we
+            // never delete a file that might still be in use.
+            if name_str.contains(CURRENT_VERSION) {
+                continue;
+            }
+            let _ = std::fs::remove_file(entry.path()); // silent
+        }
+    }
+
+    // 3. Remove the record file itself (best-effort).
+    let _ = std::fs::remove_file(&record_path);
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +183,20 @@ pub async fn download_and_install(
     app:  AppHandle,
 ) -> Result<(), String> {
     let path = download_installer(&url, size, &app).await.map_err(|e| e.to_string())?;
+
+    // Record the installer path so the next launch can clean it up.
+    if let Some(rec_path) = cleanup_record_path() {
+        let record = CleanupRecord {
+            installer_path: path.to_string_lossy().to_string(),
+        };
+        if let Some(d) = rec_path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&record) {
+            let _ = std::fs::write(&rec_path, json);
+        }
+    }
+
     launch_installer(&path).map_err(|e| e.to_string())?;
     app.exit(0);
     Ok(())

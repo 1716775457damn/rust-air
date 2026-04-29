@@ -24,6 +24,10 @@ pub fn run() {
         .manage(history_state)          // Arc<HistoryState> implements Deref<Target=HistoryState>
         .setup(move |app| {
             clip_history_commands::start_clip_monitor(app.handle().clone(), history_for_monitor);
+
+            // Clean up installer files left over from a previous update.
+            update_commands::cleanup_old_update_files();
+
             // Auto-update check on startup
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
