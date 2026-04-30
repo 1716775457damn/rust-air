@@ -271,6 +271,24 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
         }
     }
     file.flush().await?;
+
+    // Verify download completeness — reject truncated files
+    if total > 0 && downloaded != total {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        anyhow::bail!(
+            "download incomplete: got {} bytes, expected {} bytes",
+            downloaded, total
+        );
+    }
+    // Sanity check: MSI files must be at least 1 KB
+    if downloaded < 1024 {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        anyhow::bail!(
+            "downloaded file too small ({} bytes) — likely not a valid installer",
+            downloaded
+        );
+    }
+
     app.emit("update-progress", UpdateProgress { downloaded, total, done: true }).ok();
     Ok(tmp)
 }
