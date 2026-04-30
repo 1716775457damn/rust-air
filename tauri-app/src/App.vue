@@ -29,7 +29,11 @@ interface ClipSyncError { kind: string; message: string; device?: string }
 interface ClipSyncReceived { source_device: string; content_type: string }
 interface ClipEntryView { id: number; kind: string; preview: string; stats: string; time_str: string; pinned: boolean; char_count: number; image_b64?: string; source_device?: string }
 
-type Tab   = "send" | "receive" | "devices" | "search" | "sync" | "todo" | "settings";
+// Shared whiteboard types
+interface WhiteboardItem { id: string; content_type: "Text" | "Image"; text?: string; image_b64?: string; timestamp: number; source_device: string }
+interface WhiteboardError { kind: string; message: string; device?: string }
+
+type Tab   = "send" | "receive" | "devices" | "search" | "sync" | "todo" | "whiteboard" | "settings";
 type Phase = "idle" | "transferring" | "done" | "error";
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -123,6 +127,11 @@ const newTodoTitle   = ref("");
 const clipSyncEnabled = ref(false);
 const syncGroupConfig = ref<SyncGroupConfig>({ enabled: false, peers: [] });
 const clipEntries     = ref<ClipEntryView[]>([]);
+
+// Whiteboard
+const whiteboardItems = ref<WhiteboardItem[]>([]);
+const wbTextInput     = ref("");
+const wbClearConfirm  = ref(false);
 
 // Toast notifications (Task 10.4)
 const toasts = ref<{ id: number; kind: string; message: string; device?: string }[]>([]);
@@ -348,6 +357,15 @@ onMounted(async () => {
     await listen<ClipSyncReceived>("clip-sync-received", (e) => {
       showToast("sync_received", `已接收来自 ${e.payload.source_device} 的剪贴板内容`);
     }),
+
+    // Whiteboard events
+    await listen<WhiteboardItem[]>("whiteboard-update", (e) => {
+      whiteboardItems.value = e.payload;
+    }),
+    await listen<WhiteboardError>("whiteboard-error", (e) => {
+      const err = e.payload;
+      showToast("whiteboard_error", `白板同步: ${err.message}`, err.device ?? undefined);
+    }),
   );
 
   // Desktop-only: load sync config, status, excludes, and update settings
@@ -370,6 +388,13 @@ onMounted(async () => {
   await loadTodos(selectedDate.value);
   await loadTodoDates(calendarYear.value, calendarMonth.value);
 
+  // Load initial whiteboard data and start flush timer
+  if (!isAndroid.value) {
+    try { whiteboardItems.value = await invoke<WhiteboardItem[]>("get_whiteboard_items"); }
+    catch (_) { /* whiteboard commands may not be registered yet */ }
+    setInterval(() => { invoke("flush_whiteboard").catch(() => {}); }, 3000);
+  }
+
   startScan();
 });
 
@@ -381,7 +406,7 @@ onUnmounted(async () => {
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────────
 
-const TAB_KEYS: Record<string, Tab> = { "1": "send", "2": "receive", "3": "devices", "4": "search", "5": "sync", "6": "todo" };
+const TAB_KEYS: Record<string, Tab> = { "1": "send", "2": "receive", "3": "devices", "4": "search", "5": "sync", "6": "todo", "7": "whiteboard" };
 function onKeyDown(e: KeyboardEvent) {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
   if (TAB_KEYS[e.key]) { tab.value = TAB_KEYS[e.key]; e.preventDefault(); }
@@ -586,6 +611,66 @@ async function deleteTodo(id: number) {
 watch(selectedDate, (d) => loadTodos(d));
 watch([calendarYear, calendarMonth], ([y, m]) => loadTodoDates(y, m));
 
+// ── Whiteboard IPC ───────────────────────────────────────────────────────────
+
+async function addWbText() {
+  const text = wbTextInput.value.trim();
+  if (!text) return;
+  try {
+    await invoke<WhiteboardItem>("add_whiteboard_text", { text });
+    wbTextInput.value = "";
+  } catch (e: any) { console.error("addWbText:", e); }
+}
+
+async function addWbImage(b64: string) {
+  try {
+    await invoke<WhiteboardItem>("add_whiteboard_image", { imageB64: b64 });
+  } catch (e: any) { console.error("addWbImage:", e); }
+}
+
+async function deleteWbItem(id: string) {
+  try {
+    await invoke("delete_whiteboard_item", { id });
+  } catch (e: any) { console.error("deleteWbItem:", e); }
+}
+
+async function clearWhiteboard() {
+  try {
+    await invoke("clear_whiteboard");
+    wbClearConfirm.value = false;
+  } catch (e: any) { console.error("clearWhiteboard:", e); }
+}
+
+function onWbPaste(e: ClipboardEvent) {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith("image/")) {
+      e.preventDefault();
+      const blob = item.getAsFile();
+      if (!blob) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        // Strip the data:image/...;base64, prefix
+        const b64 = result.split(",")[1];
+        if (b64) addWbImage(b64);
+      };
+      reader.readAsDataURL(blob);
+      return;
+    }
+  }
+}
+
+function fmtWbTime(ts: number): string {
+  const d = new Date(ts);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const MM = String(d.getMonth() + 1).padStart(2, '0');
+  const DD = String(d.getDate()).padStart(2, '0');
+  return `${MM}-${DD} ${hh}:${mm}`;
+}
+
 // ── IP ────────────────────────────────────────────────────────────────────────
 
 async function copyIp() {
@@ -700,15 +785,15 @@ function highlightSegments(line: string, ranges: [number,number][]) {
       <!-- Sidebar -->
       <nav class="flex flex-col gap-1 w-[72px] flex-shrink-0 px-1.5 py-3"
         style="background:var(--bg-surface);border-right:1px solid var(--border)">
-        <button v-for="(t, idx) in (isAndroid ? (['send','receive','devices','todo'] as Tab[]) : (['send','receive','devices','search','sync','todo'] as Tab[]))" :key="t"
+        <button v-for="(t, idx) in (isAndroid ? (['send','receive','devices','todo'] as Tab[]) : (['send','receive','devices','search','sync','todo','whiteboard'] as Tab[]))" :key="t"
           @click="tab = t"
-          :title="`${t === 'send' ? '发送' : t === 'receive' ? '接收' : t === 'devices' ? '设备' : t === 'search' ? '搜索' : t === 'sync' ? '同步' : '待办'} (${idx+1})`"
+          :title="`${t === 'send' ? '发送' : t === 'receive' ? '接收' : t === 'devices' ? '设备' : t === 'search' ? '搜索' : t === 'sync' ? '同步' : t === 'todo' ? '待办' : '白板'} (${idx+1})`"
           :style="tab === t
             ? 'background:var(--accent-bg);color:var(--accent)'
             : 'color:var(--text-muted)'"
           class="flex flex-col items-center gap-1 py-2.5 rounded-xl text-xs transition-all duration-150 w-full hover:opacity-80">
-          <span class="text-[15px] leading-none">{{ t==='send'?'📤':t==='receive'?'📥':t==='devices'?'🔍':t==='search'?'📂':t==='sync'?'🔄':'📋' }}</span>
-          <span class="text-[10px] mt-0.5">{{ t==='send'?'发送':t==='receive'?'接收':t==='devices'?'设备':t==='search'?'搜索':t==='sync'?'同步':'待办' }}</span>
+          <span class="text-[15px] leading-none">{{ t==='send'?'📤':t==='receive'?'📥':t==='devices'?'🔍':t==='search'?'📂':t==='sync'?'🔄':t==='todo'?'📋':'🖊️' }}</span>
+          <span class="text-[10px] mt-0.5">{{ t==='send'?'发送':t==='receive'?'接收':t==='devices'?'设备':t==='search'?'搜索':t==='sync'?'同步':t==='todo'?'待办':'白板' }}</span>
           <span class="text-[9px] leading-none" style="color:var(--text-faint)">{{ idx+1 }}</span>
           <span v-if="t==='receive' && recvPhase==='transferring'"
             class="w-1.5 h-1.5 rounded-full animate-pulse mt-0.5"
@@ -1281,6 +1366,91 @@ function highlightSegments(line: string, ranges: [number,number][]) {
           </div>
         </template>
 
+        <!-- WHITEBOARD TAB -->
+        <template v-else-if="tab === 'whiteboard'">
+          <div class="flex-1 flex flex-col gap-4 min-h-0 max-w-xl mx-auto w-full">
+
+            <!-- Input area -->
+            <div class="flex gap-2 flex-shrink-0">
+              <input v-model="wbTextInput" @keyup.enter="addWbText" @paste="onWbPaste"
+                placeholder="输入文字或粘贴图片…"
+                class="flex-1 rounded-lg px-3 py-2 text-sm focus:outline-none transition-colors"
+                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+              <button @click="addWbText"
+                :disabled="!wbTextInput.trim()"
+                :style="wbTextInput.trim()
+                  ? 'background:var(--accent);color:#fff'
+                  : 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'"
+                class="px-4 py-2 rounded-lg text-sm font-medium transition-colors flex-shrink-0">
+                添加
+              </button>
+            </div>
+
+            <!-- Clear button -->
+            <div class="flex items-center justify-between flex-shrink-0">
+              <span class="text-xs" style="color:var(--text-muted)">共 {{ whiteboardItems.length }} 条</span>
+              <div v-if="whiteboardItems.length > 0" class="flex items-center gap-2">
+                <template v-if="!wbClearConfirm">
+                  <button @click="wbClearConfirm = true"
+                    class="px-3 py-1 rounded-lg text-xs transition-colors"
+                    style="background:rgba(239,68,68,0.1);color:#f87171">
+                    🗑 清空白板
+                  </button>
+                </template>
+                <template v-else>
+                  <span class="text-xs" style="color:#f87171">确定清空？此操作将同步到所有设备</span>
+                  <button @click="clearWhiteboard"
+                    class="px-3 py-1 rounded-lg text-xs font-medium text-white"
+                    style="background:#dc2626">确定</button>
+                  <button @click="wbClearConfirm = false"
+                    class="px-2 py-1 rounded-lg text-xs"
+                    style="color:var(--text-muted)">取消</button>
+                </template>
+              </div>
+            </div>
+
+            <!-- Item list -->
+            <div class="flex-1 min-h-0 overflow-y-auto space-y-2">
+              <div v-if="whiteboardItems.length === 0" class="text-center py-12 text-sm" style="color:var(--text-faint)">
+                <div class="text-3xl mb-2">🖊️</div>
+                <p>白板为空</p>
+                <p class="text-xs mt-1">输入文字或粘贴图片开始使用</p>
+              </div>
+              <div v-for="item in whiteboardItems" :key="item.id"
+                class="rounded-xl p-3.5 group"
+                style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+                <div class="flex items-start gap-3">
+                  <span class="flex-shrink-0 text-sm mt-0.5">{{ item.content_type === 'Image' ? '🖼️' : '📝' }}</span>
+                  <div class="flex-1 min-w-0">
+                    <!-- Text content -->
+                    <p v-if="item.content_type === 'Text' && item.text"
+                      class="text-sm whitespace-pre-wrap break-words"
+                      style="color:var(--text-primary)">{{ item.text }}</p>
+                    <!-- Image content -->
+                    <img v-if="item.content_type === 'Image' && item.image_b64"
+                      :src="'data:image/png;base64,' + item.image_b64"
+                      class="max-w-full max-h-48 rounded-lg object-contain"
+                      style="background:var(--bg-muted)" />
+                    <!-- Meta -->
+                    <div class="flex items-center gap-2 mt-1.5 text-[11px]" style="color:var(--text-faint)">
+                      <span>{{ fmtWbTime(item.timestamp) }}</span>
+                      <span v-if="item.source_device" class="px-1.5 py-0.5 rounded-full"
+                        style="background:var(--accent-bg);color:var(--accent)">
+                        {{ item.source_device }}
+                      </span>
+                    </div>
+                  </div>
+                  <button @click="deleteWbItem(item.id)"
+                    class="text-xs flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded-lg"
+                    style="color:var(--text-muted)"
+                    title="删除">🗑</button>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </template>
+
         <!-- SETTINGS TAB -->
         <template v-else-if="tab === 'settings'">
           <div class="flex-1 flex flex-col gap-5 max-w-md mx-auto w-full">
@@ -1332,7 +1502,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
 
               <!-- Current version + check button -->
               <div class="flex items-center justify-between pt-1">
-                <span class="text-xs" style="color:var(--text-faint)">当前版本: v{{ '0.3.32' }}</span>
+                <span class="text-xs" style="color:var(--text-faint)">当前版本: v{{ '0.3.38' }}</span>
                 <button @click="manualCheckUpdate" :disabled="updateChecking"
                   :style="updateChecking
                     ? 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'
@@ -1380,7 +1550,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
 
     <footer class="text-center text-[11px] py-1.5"
       style="color:var(--text-faint);border-top:1px solid var(--border);background:var(--bg-surface)">
-      rust-air v0.3 · E2EE · mDNS · SHA-256 · 自动更新 · 快捷键 1-6 切换标签
+      rust-air v0.3 · E2EE · mDNS · SHA-256 · 自动更新 · 快捷键 1-7 切换标签
     </footer>
 
     <!-- Toast notifications (Task 10.4) -->

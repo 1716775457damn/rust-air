@@ -1,6 +1,6 @@
 [package]
 name        = "tauri-app"
-version     = "0.3.37"
+version     = "0.3.38"
 description = "rust-air — LAN file transfer"
 authors     = ["you"]
 edition     = "2021"
@@ -29,6 +29,7 @@ base64             = "0.22"
 rand               = "0.8"
 rust-air-core      = { path = "../../core" }
 dirs               = "5"
+uuid               = { version = "1", features = ["v4"] }
 local-ip-address   = "0.6"
 regex              = "1"
 hex                = "0.4"

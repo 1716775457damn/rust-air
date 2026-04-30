@@ -9,6 +9,8 @@ mod clip_history_commands;
 mod clip_sync_commands;
 #[cfg(feature = "desktop")]
 mod update_commands;
+#[cfg(feature = "desktop")]
+mod whiteboard_commands;
 mod todo_commands;
 
 use std::sync::Mutex;
@@ -45,7 +47,8 @@ pub fn run() {
             .manage(sync_commands::SyncState::new())
             .manage(search_commands::SearchState::new())
             .manage(history_state)
-            .manage(clip_sync_state);
+            .manage(clip_sync_state)
+            .manage(whiteboard_commands::WhiteboardState::new());
 
         builder = builder.setup(move |app| {
             clip_history_commands::start_clip_monitor(
@@ -161,6 +164,14 @@ pub fn run() {
             update_commands::save_update_settings,
             update_commands::check_update,
             update_commands::download_and_install,
+            // Whiteboard
+            whiteboard_commands::get_whiteboard_items,
+            whiteboard_commands::add_whiteboard_text,
+            whiteboard_commands::add_whiteboard_image,
+            whiteboard_commands::delete_whiteboard_item,
+            whiteboard_commands::clear_whiteboard,
+            whiteboard_commands::flush_whiteboard,
+            whiteboard_commands::send_whiteboard_snapshot,
             // Todo
             todo_commands::get_todos,
             todo_commands::add_todo,

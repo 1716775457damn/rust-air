@@ -4129,7 +4129,7 @@ dependencies = [
 
 [[package]]
 name = "rust-air-cli"
-version = "0.3.34"
+version = "0.3.37"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4141,7 +4141,7 @@ dependencies = [
 
 [[package]]
 name = "rust-air-core"
-version = "0.3.34"
+version = "0.3.37"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4169,6 +4169,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-normalization",
+ "uuid",
  "walkdir",
  "zstd",
 ]
@@ -4960,7 +4961,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.3.34"
+version = "0.3.37"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4987,6 +4988,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]

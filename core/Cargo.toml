@@ -1,6 +1,6 @@
 [package]
 name    = "rust-air-core"
-version = "0.3.37"
+version = "0.3.38"
 edition = "2021"
 
 [lib]
@@ -35,6 +35,7 @@ chrono     = { version = "0.4", features = ["serde"] }
 dirs       = "5"
 unicode-normalization = "0.1"
 hex        = "0.4"
+uuid       = { version = "1", features = ["v4", "serde"] }
 
 # Desktop-only (optional)
 arboard   = { version = "3", optional = true }

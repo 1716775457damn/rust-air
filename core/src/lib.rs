@@ -15,6 +15,8 @@ pub mod clipboard_sync;
 pub mod sync_vault;
 #[cfg(feature = "desktop")]
 pub mod http_qr;
+#[cfg(feature = "desktop")]
+pub mod whiteboard;
 
 // ── Discovery: mDNS on desktop, UDP broadcast otherwise ───────────────────────
 #[cfg(feature = "desktop")]

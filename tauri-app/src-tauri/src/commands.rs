@@ -14,7 +14,7 @@ use rust_air_core::ClipEntry;
 use std::{path::PathBuf, sync::Mutex};
 #[cfg(feature = "desktop")]
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{net::{TcpListener, TcpStream}, sync::oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +22,8 @@ use tokio_util::sync::CancellationToken;
 use crate::clip_history_commands::{ClipEntryView, HistoryState};
 #[cfg(feature = "desktop")]
 use crate::clip_sync_commands::ClipSyncState;
+#[cfg(feature = "desktop")]
+use crate::whiteboard_commands::WhiteboardState;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -85,6 +87,7 @@ pub async fn start_listener(
     state: State<'_, AppState>,
     clip_sync: State<'_, ClipSyncState>,
     history: State<'_, Arc<HistoryState>>,
+    _wb_state: State<'_, WhiteboardState>,
     app: AppHandle,
 ) -> Result<u16, String> {
     let listener = TcpListener::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?;
@@ -117,40 +120,64 @@ pub async fn start_listener(
                                 app2.emit("recv-done", p.to_string_lossy().to_string()).ok();
                             }
                             Ok(ReceiveOutcome::Clipboard { name, data, .. }) => {
-                                // Post-process clipboard sync receive
-                                match svc.handle_received(&name, &data) {
-                                    Ok((content, source_device)) => {
-                                        // Add to history with source_device
-                                        let mut store = hs.store.lock().unwrap_or_else(|e| e.into_inner());
-                                        let mut entry = ClipEntry::new(0, content);
-                                        if !source_device.is_empty() {
-                                            entry.source_device = Some(source_device.clone());
-                                        }
-                                        store.push(entry.content.clone());
-                                        // Update the last entry's source_device
-                                        if !source_device.is_empty() {
-                                            let first_unpinned = store.entries.iter().position(|e| !e.pinned).unwrap_or(0);
-                                            if let Some(e) = store.entries.get_mut(first_unpinned) {
-                                                e.source_device = Some(source_device.clone());
+                                // Check if this is a whiteboard sync message
+                                if name.starts_with("wb:") {
+                                    match rust_air_core::whiteboard::handle_received_whiteboard(&name, &data) {
+                                        Ok(msg) => {
+                                            // Access the managed WhiteboardState
+                                            if let Some(wb) = app2.try_state::<WhiteboardState>() {
+                                                let items = {
+                                                    let mut store = wb.store.lock().unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+                                                    rust_air_core::whiteboard::apply_sync_message(&mut store, msg);
+                                                    store.flush_now();
+                                                    store.snapshot()
+                                                };
+                                                let _ = app2.emit("whiteboard-update", &items);
                                             }
                                         }
-                                        store.flush_if_needed();
-                                        let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
-                                        let _ = app2.emit("clip-update", &entries);
-
-                                        // Notify frontend about sync receive
-                                        if !source_device.is_empty() {
-                                            let _ = app2.emit("clip-sync-received", &source_device);
+                                        Err(e) => {
+                                            eprintln!("warn: whiteboard sync receive failed: {e}");
+                                            let wb_err = rust_air_core::whiteboard::WhiteboardError {
+                                                kind: "parse_failed".to_string(),
+                                                message: e.to_string(),
+                                                device: None,
+                                            };
+                                            let _ = app2.emit("whiteboard-error", &wb_err);
                                         }
                                     }
-                                    Err(e) => {
-                                        eprintln!("warn: clipboard sync receive failed: {e}");
-                                        let sync_err = clipboard_sync::ClipSyncError {
-                                            kind: "transfer_failed".to_string(),
-                                            message: e.to_string(),
-                                            device: None,
-                                        };
-                                        let _ = app2.emit("clip-sync-error", &sync_err);
+                                } else {
+                                    // Existing clipboard sync logic
+                                    match svc.handle_received(&name, &data) {
+                                        Ok((content, source_device)) => {
+                                            let mut store = hs.store.lock().unwrap_or_else(|e| e.into_inner());
+                                            let mut entry = ClipEntry::new(0, content);
+                                            if !source_device.is_empty() {
+                                                entry.source_device = Some(source_device.clone());
+                                            }
+                                            store.push(entry.content.clone());
+                                            if !source_device.is_empty() {
+                                                let first_unpinned = store.entries.iter().position(|e| !e.pinned).unwrap_or(0);
+                                                if let Some(e) = store.entries.get_mut(first_unpinned) {
+                                                    e.source_device = Some(source_device.clone());
+                                                }
+                                            }
+                                            store.flush_if_needed();
+                                            let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
+                                            let _ = app2.emit("clip-update", &entries);
+
+                                            if !source_device.is_empty() {
+                                                let _ = app2.emit("clip-sync-received", &source_device);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("warn: clipboard sync receive failed: {e}");
+                                            let sync_err = clipboard_sync::ClipSyncError {
+                                                kind: "transfer_failed".to_string(),
+                                                message: e.to_string(),
+                                                device: None,
+                                            };
+                                            let _ = app2.emit("clip-sync-error", &sync_err);
+                                        }
                                     }
                                 }
                             }
@@ -281,6 +308,7 @@ pub async fn retry_send(
 #[tauri::command]
 pub async fn scan_devices(
     clip_sync: State<'_, ClipSyncState>,
+    _wb_state: State<'_, WhiteboardState>,
     app: AppHandle,
 ) -> Result<(), String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DeviceInfo>(32);
@@ -293,10 +321,21 @@ pub async fn scan_devices(
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(dev)) => {
                     // addr=="" means ServiceRemoved — skip, do NOT break
-                    if dev.addr.is_empty() { continue; }
+                    if dev.addr.is_empty() {
+                        // Remove from whiteboard device list
+                        if let Some(wb) = app.try_state::<WhiteboardState>() {
+                            wb.remove_device(&dev.name);
+                        }
+                        continue;
+                    }
 
                     // Update SyncPeer status if this device is in the sync group
                     svc.update_peer_status(&dev.name, &dev.addr);
+
+                    // Update whiteboard device list for broadcasting
+                    if let Some(wb) = app.try_state::<WhiteboardState>() {
+                        wb.update_device(dev.clone());
+                    }
 
                     app.emit("device-found", &dev).ok();
                 }
