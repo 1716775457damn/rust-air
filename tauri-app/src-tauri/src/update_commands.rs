@@ -249,12 +249,24 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
         url.rsplit('/').next().unwrap_or("rust-air-update.msi")
     );
 
+    // Use xgn.io proxy to accelerate GitHub release downloads (especially for CN users).
+    // Original: https://github.com/user/repo/releases/download/vX/file.msi
+    // Proxied:  https://xgn.io/https://github.com/user/repo/releases/download/vX/file.msi
+    let proxied_url = format!("https://xgn.io/{}", url);
+
     let client = reqwest::Client::builder()
         .user_agent(format!("rust-air/{CURRENT_VERSION}"))
         .timeout(std::time::Duration::from_secs(600))
         .build()?;
 
-    let mut resp = client.get(url).send().await?;
+    // Try proxied URL first, fall back to direct GitHub URL on failure.
+    let mut resp = match client.get(&proxied_url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            eprintln!("info: xgn.io proxy unavailable, falling back to direct download");
+            client.get(url).send().await?
+        }
+    };
     let mut file = tokio::fs::File::create(&tmp).await?;
     let mut downloaded = 0u64;
     let mut last_emit = std::time::Instant::now();

@@ -1,6 +1,6 @@
 [package]
 name    = "rust-air-cli"
-version = "0.3.40"
+version = "0.3.41"
 edition = "2021"
 
 [[bin]]

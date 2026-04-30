@@ -1,6 +1,6 @@
 [package]
 name    = "rust-air-core"
-version = "0.3.40"
+version = "0.3.41"
 edition = "2021"
 
 [lib]
