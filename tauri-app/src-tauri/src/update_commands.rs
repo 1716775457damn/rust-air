@@ -295,33 +295,34 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
 
 fn launch_installer(path: &PathBuf) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
+
+    #[cfg(target_os = "windows")]
     {
-        // Use a small delay script so the app process fully exits before
-        // the installer starts — avoids file-lock conflicts on Windows.
+        // Launch the installer in a fully detached process so it survives
+        // the app exiting. Using `cmd /C start "" ...` creates a new
+        // console window that is independent of the parent process.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext.eq_ignore_ascii_case("msi") {
-            // msiexec /i <path> /qb REINSTALLMODE=omus
-            // The REINSTALLMODE ensures all files are overwritten even if
-            // the version looks the same to Windows Installer.
-            // We use cmd /C with a ping delay to let the app exit first.
             let msi_path = path.to_string_lossy().to_string();
             std::process::Command::new("cmd")
                 .args([
                     "/C",
                     &format!(
-                        "ping -n 2 127.0.0.1 >nul && msiexec /i \"{}\" /qb REINSTALLMODE=omus",
+                        "ping -n 3 127.0.0.1 >nul & start \"\" msiexec /i \"{}\" /qb REINSTALLMODE=omus",
                         msi_path
                     ),
                 ])
+                .creation_flags(0x00000008) // DETACHED_PROCESS
                 .spawn()?;
         } else {
-            // exe installer: also delay slightly
             let exe_path = path.to_string_lossy().to_string();
             std::process::Command::new("cmd")
                 .args([
                     "/C",
-                    &format!("ping -n 2 127.0.0.1 >nul && \"{}\"", exe_path),
+                    &format!("ping -n 3 127.0.0.1 >nul & start \"\" \"{}\"", exe_path),
                 ])
+                .creation_flags(0x00000008) // DETACHED_PROCESS
                 .spawn()?;
         }
     }

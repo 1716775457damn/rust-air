@@ -1,6 +1,6 @@
 [package]
 name        = "tauri-app"
-version     = "0.3.39"
+version     = "0.3.40"
 description = "rust-air — LAN file transfer"
 authors     = ["you"]
 edition     = "2021"
