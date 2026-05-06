@@ -50,3 +50,4 @@ indicatif = { version = "0.17", optional = true }
 [dev-dependencies]
 tokio = { workspace = true }
 proptest = "1"
+tempfile = "3"

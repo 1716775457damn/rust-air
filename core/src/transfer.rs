@@ -24,7 +24,7 @@ use arboard::Clipboard;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use socket2::SockRef;
-use std::{net::SocketAddr, path::{Path, PathBuf}, sync::Arc, time::Instant};
+use std::{path::{Path, PathBuf}, sync::Arc, time::Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -122,7 +122,19 @@ pub async fn send_path(
     let on_progress = Arc::new(on_progress);
 
     let checksum: [u8; 32] = if is_dir {
-        let mut reader = archive::stream_archive_with_entries(path, dir_entries.unwrap())?;
+        // Use parallel archive generation for directories with many files.
+        // Heuristic: use parallel if >= 10 files (typical small-file scenario benefits from parallelism).
+        // For smaller directories or resume scenarios, use the sequential path.
+        let entries = dir_entries.unwrap();
+        let file_count = entries.iter().filter(|(e, _)| e.file_type().is_file()).count();
+        let use_parallel = file_count >= 10 && resume_offset == 0;
+        
+        let mut reader: Box<dyn AsyncRead + Send + Unpin> = if use_parallel {
+            Box::new(archive::stream_archive_parallel(path, entries)?)
+        } else {
+            Box::new(archive::stream_archive_with_entries(path, entries)?)
+        };
+        
         if resume_offset > 0 {
             // Archive resume: regenerate the archive stream but skip the first
             // resume_offset bytes (read and discard). The archive stream is not
@@ -144,7 +156,7 @@ pub async fn send_path(
             // Set encryptor counter to align nonces with the original stream.
             enc.set_counter(resume_offset / CHUNK as u64);
         }
-        stream_encrypted_hash(&mut reader, &mut enc, resume_offset, total_size, on_progress, Sha256::new()).await?
+        stream_encrypted_hash(reader, &mut enc, resume_offset, total_size, on_progress, Sha256::new()).await?
     } else {
         let mut f = tokio::fs::File::open(path).await?;
         let mut full_hasher = Sha256::new();
@@ -311,7 +323,7 @@ pub async fn receive_to_disk(
     }
 }
 
-// ── Receive with auto-reconnect ───────────────────────────────────────────────
+// ── Reconnect helpers ─────────────────────────────────────────────────────────
 
 /// Compute exponential backoff delay for reconnect attempt `n` (1-based).
 /// Returns `2^n` seconds.
@@ -319,39 +331,34 @@ pub fn reconnect_delay_secs(n: u32) -> u64 {
     INITIAL_RETRY_DELAY_SECS.checked_shl(n.saturating_sub(1)).unwrap_or(32)
 }
 
-/// Receive a file/folder with automatic reconnection on TCP failure.
+// ── Send with retry ───────────────────────────────────────────────────────────
+
+/// Send a file or folder with automatic retry on failure.
 ///
-/// When the connection drops mid-transfer, this function retries up to
-/// `MAX_RECONNECT_ATTEMPTS` times with exponential backoff (2s, 4s, 8s, 16s, 32s).
-/// Each reconnect leverages the existing `.part` file and manifest for resume.
+/// First attempt: `TcpStream::connect(addr)` → `send_path(stream, path, on_progress)`.
+/// On failure: retry up to `MAX_RECONNECT_ATTEMPTS` times with exponential backoff
+/// (2s, 4s, 8s, 16s, 32s). The receiver will auto-resume via `.part` + manifest.
 ///
-/// If `initial_stream` is provided, it is used for the first attempt (e.g. from
-/// an accepted listener connection). On failure, subsequent attempts connect to `addr`.
-///
-/// The `cancel_token` allows the caller to abort all reconnect attempts immediately.
-pub async fn receive_with_reconnect(
-    addr: SocketAddr,
-    dest: &Path,
-    cancel_token: CancellationToken,
+/// The `cancel_token` allows the caller to abort retries during backoff waits.
+pub async fn send_path_with_retry(
+    addr: &str,
+    path: &Path,
     on_progress: impl Fn(TransferEvent) + Send + Sync + 'static,
-    initial_stream: Option<TcpStream>,
-) -> Result<ReceiveOutcome> {
+    cancel_token: CancellationToken,
+) -> Result<()> {
     let on_progress = Arc::new(on_progress);
 
-    // First attempt: use initial_stream if provided, otherwise connect.
-    let first_stream = match initial_stream {
-        Some(s) => s,
-        None => TcpStream::connect(addr).await?,
-    };
+    // First attempt.
+    let stream = TcpStream::connect(addr).await?;
     let cb = on_progress.clone();
-    match receive_to_disk(first_stream, dest, move |ev| cb(ev)).await {
-        Ok(outcome) => return Ok(outcome),
+    match send_path(stream, path, move |ev| cb(ev)).await {
+        Ok(()) => return Ok(()),
         Err(first_err) => {
-            eprintln!("transfer failed, will attempt reconnect: {first_err}");
+            eprintln!("send failed, will attempt retry: {first_err}");
         }
     }
 
-    // Reconnect loop with exponential backoff.
+    // Retry loop with exponential backoff.
     for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
         let delay = reconnect_delay_secs(attempt);
 
@@ -373,49 +380,48 @@ pub async fn receive_with_reconnect(
         // Wait with cancellation support.
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                anyhow::bail!("transfer cancelled by user during reconnect");
+                anyhow::bail!("transfer cancelled by user during retry");
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
         }
 
         // Check cancellation before attempting connect.
         if cancel_token.is_cancelled() {
-            anyhow::bail!("transfer cancelled by user during reconnect");
+            anyhow::bail!("transfer cancelled by user during retry");
         }
 
-        // Attempt reconnect.
+        // Attempt reconnect to receiver's listener port.
         let stream = match TcpStream::connect(addr).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} failed: {e}");
+                eprintln!("retry attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} connect failed: {e}");
                 if attempt == MAX_RECONNECT_ATTEMPTS {
-                    // All retries exhausted — report error, preserve .part + manifest.
                     on_progress(TransferEvent {
                         bytes_done: 0,
                         total_bytes: 0,
                         bytes_per_sec: 0,
                         done: false,
                         error: Some(format!(
-                            "all {MAX_RECONNECT_ATTEMPTS} reconnect attempts failed: {e}"
+                            "all {MAX_RECONNECT_ATTEMPTS} retry attempts failed: {e}"
                         )),
                         resumed: false,
                         resume_offset: 0,
                         reconnect_info: None,
                     });
                     anyhow::bail!(
-                        "all {MAX_RECONNECT_ATTEMPTS} reconnect attempts failed: {e}"
+                        "all {MAX_RECONNECT_ATTEMPTS} retry attempts failed: {e}"
                     );
                 }
                 continue;
             }
         };
 
-        // Reconnect succeeded — receive_to_disk will auto-resume via .part + manifest.
+        // Reconnect succeeded — send_path will re-send; receiver auto-resumes via .part + manifest.
         let cb = on_progress.clone();
-        match receive_to_disk(stream, dest, move |ev| cb(ev)).await {
-            Ok(outcome) => return Ok(outcome),
+        match send_path(stream, path, move |ev| cb(ev)).await {
+            Ok(()) => return Ok(()),
             Err(e) => {
-                eprintln!("transfer failed after reconnect attempt {attempt}: {e}");
+                eprintln!("send failed after retry attempt {attempt}: {e}");
                 if attempt == MAX_RECONNECT_ATTEMPTS {
                     on_progress(TransferEvent {
                         bytes_done: 0,
@@ -423,26 +429,31 @@ pub async fn receive_with_reconnect(
                         bytes_per_sec: 0,
                         done: false,
                         error: Some(format!(
-                            "all {MAX_RECONNECT_ATTEMPTS} reconnect attempts failed: {e}"
+                            "all {MAX_RECONNECT_ATTEMPTS} retry attempts failed: {e}"
                         )),
                         resumed: false,
                         resume_offset: 0,
                         reconnect_info: None,
                     });
                     anyhow::bail!(
-                        "all {MAX_RECONNECT_ATTEMPTS} reconnect attempts failed: {e}"
+                        "all {MAX_RECONNECT_ATTEMPTS} retry attempts failed: {e}"
                     );
                 }
             }
         }
     }
 
-    unreachable!("reconnect loop should have returned or bailed")
+    unreachable!("retry loop should have returned or bailed")
 }
 
 // ── Receive branch helpers ─────────────────────────────────────────────────────
 
 /// File receive branch with manifest validation and nonce alignment.
+///
+/// 3-stage pipeline:
+///   Stage 1 (main task): Network read + decrypt via `Decryptor.read_chunk()` + progress
+///   Stage 2 (spawned):   Hash computation — updates SHA-256, forwards chunks to write
+///   Stage 3 (spawned):   Disk write — writes chunks to .part file
 async fn receive_file_branch(
     key: &[u8; 32],
     rx: impl AsyncReadExt + Unpin,
@@ -468,7 +479,7 @@ async fn receive_file_branch(
     };
 
     // Hash existing prefix using the already-open file handle.
-    let mut hasher = if already_have > 0 {
+    let prefix_hasher = if already_have > 0 {
         let part2 = part_path.to_path_buf();
         let already = already_have;
         tokio::task::spawn_blocking(move || -> anyhow::Result<Sha256> {
@@ -496,8 +507,8 @@ async fn receive_file_branch(
     file.seek(std::io::SeekFrom::End(0)).await?;
     let f = BufWriter::with_capacity(4 * CHUNK, file);
 
-    // Pipeline: decrypt + hash in main task, disk writes in spawned task.
-    let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    // Stage 3 (spawned): Disk write — receives chunks and writes to file.
+    let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::proto::PIPELINE_DEPTH);
     let write_task = tokio::spawn(async move {
         let mut f = f;
         while let Some(chunk) = write_rx.recv().await {
@@ -507,6 +518,21 @@ async fn receive_file_branch(
         Ok::<_, anyhow::Error>(())
     });
 
+    // Stage 2 (spawned): Hash computation — receives chunks, updates SHA-256,
+    // forwards to write task. Returns the final hasher for checksum verification.
+    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::proto::PIPELINE_DEPTH);
+    let hash_task = tokio::spawn(async move {
+        let mut hasher = prefix_hasher;
+        while let Some(chunk) = hash_rx.recv().await {
+            hasher.update(&chunk);
+            write_tx.send(chunk).await
+                .map_err(|_| anyhow::anyhow!("write task failed"))?;
+        }
+        // Drop write_tx so write_task sees channel close.
+        Ok::<_, anyhow::Error>(hasher)
+    });
+
+    // Stage 1 (main task): Network read + decrypt + progress reporting.
     let mut dec = Decryptor::new(key, rx);
     // Nonce alignment: set counter to match the frame position for resumed data.
     if already_have > 0 {
@@ -517,16 +543,19 @@ async fn receive_file_branch(
     let mut last_emit = start;
 
     while let Some(chunk) = dec.read_chunk().await? {
-        hasher.update(&chunk);
         done += chunk.len() as u64;
-        write_tx.send(chunk).await
-            .map_err(|_| anyhow::anyhow!("write task failed"))?;
+        hash_tx.send(chunk).await
+            .map_err(|_| anyhow::anyhow!("hash task failed"))?;
         if last_emit.elapsed().as_millis() >= 100 {
             emit_progress_resume(on_progress, done, total_size, &start, false, is_resumed, already_have);
             last_emit = Instant::now();
         }
     }
-    drop(write_tx);
+    // Close hash channel so Stage 2 finishes, which closes write channel for Stage 3.
+    drop(hash_tx);
+
+    // Await both pipeline stages.
+    let hasher = hash_task.await??;
     write_task.await??;
 
     let expected_sha = dec.read_trailing().await?;
@@ -548,6 +577,11 @@ async fn receive_file_branch(
 /// When resuming, data is written to a .part file first, then decompressed after
 /// the complete archive stream is received. Fresh transfers also use .part to
 /// enable future resume on interruption.
+///
+/// 3-stage pipeline:
+///   Stage 1 (main task): Network read + decrypt via `Decryptor.read_chunk()` + progress
+///   Stage 2 (spawned):   Hash computation — updates SHA-256, forwards chunks to write
+///   Stage 3 (spawned):   Disk write — writes chunks to .part file
 async fn receive_archive_branch(
     key: &[u8; 32],
     rx: impl AsyncReadExt + Unpin,
@@ -575,25 +609,8 @@ async fn receive_archive_branch(
 
     let f = BufWriter::with_capacity(4 * CHUNK, part_file);
 
-    // Pipeline: decrypt in main task, disk writes in spawned task.
-    let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
-    let write_task = tokio::spawn(async move {
-        let mut f = f;
-        while let Some(chunk) = write_rx.recv().await {
-            f.write_all(&chunk).await?;
-        }
-        f.flush().await?;
-        Ok::<_, anyhow::Error>(())
-    });
-
-    let mut dec = Decryptor::new(key, rx);
-    // Nonce alignment for resume.
-    if already_have > 0 {
-        dec.set_counter(already_have / CHUNK as u64);
-    }
-
     // Hash the already-received prefix from the .part file for full-stream checksum.
-    let mut hasher = if already_have > 0 {
+    let prefix_hasher = if already_have > 0 {
         let part2 = part_path.to_path_buf();
         let already = already_have;
         tokio::task::spawn_blocking(move || -> anyhow::Result<Sha256> {
@@ -615,21 +632,56 @@ async fn receive_archive_branch(
         Sha256::new()
     };
 
+    // Stage 3 (spawned): Disk write — receives chunks and writes to .part file.
+    let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::proto::PIPELINE_DEPTH);
+    let write_task = tokio::spawn(async move {
+        let mut f = f;
+        while let Some(chunk) = write_rx.recv().await {
+            f.write_all(&chunk).await?;
+        }
+        f.flush().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // Stage 2 (spawned): Hash computation — receives chunks, updates SHA-256,
+    // forwards to write task. Returns the final hasher for checksum verification.
+    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::proto::PIPELINE_DEPTH);
+    let hash_task = tokio::spawn(async move {
+        let mut hasher = prefix_hasher;
+        while let Some(chunk) = hash_rx.recv().await {
+            hasher.update(&chunk);
+            write_tx.send(chunk).await
+                .map_err(|_| anyhow::anyhow!("write task failed"))?;
+        }
+        // Drop write_tx so write_task sees channel close.
+        Ok::<_, anyhow::Error>(hasher)
+    });
+
+    // Stage 1 (main task): Network read + decrypt + progress reporting.
+    let mut dec = Decryptor::new(key, rx);
+    // Nonce alignment for resume.
+    if already_have > 0 {
+        dec.set_counter(already_have / CHUNK as u64);
+    }
+
     let mut done: u64 = already_have;
     let start = Instant::now();
     let mut last_emit = start;
 
     while let Some(chunk) = dec.read_chunk().await? {
-        hasher.update(&chunk);
         done += chunk.len() as u64;
-        write_tx.send(chunk).await
-            .map_err(|_| anyhow::anyhow!("write task failed"))?;
+        hash_tx.send(chunk).await
+            .map_err(|_| anyhow::anyhow!("hash task failed"))?;
         if last_emit.elapsed().as_millis() >= 100 {
             emit_progress_resume(on_progress, done, total_size, &start, false, is_resumed, already_have);
             last_emit = Instant::now();
         }
     }
-    drop(write_tx);
+    // Close hash channel so Stage 2 finishes, which closes write channel for Stage 3.
+    drop(hash_tx);
+
+    // Await both pipeline stages.
+    let hasher = hash_task.await??;
     write_task.await??;
 
     // Verify checksum over the complete archive stream.
@@ -716,38 +768,63 @@ async fn recv_header(
 }
 
 /// Stream `reader` through `enc`, computing SHA-256 on-the-fly.
-/// Fills the buffer with `read` (not read_exact) to handle streams that
-/// return short reads at EOF without erroring.
-async fn stream_encrypted_hash<R: AsyncRead + Unpin>(
-    reader: &mut R,
+/// Uses a 2-stage pipeline: reading runs in a spawned task, while
+/// hash + encrypt + write runs in the main task. This decouples
+/// archive/disk I/O from the hash+encrypt+network-write path.
+async fn stream_encrypted_hash<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
     enc: &mut Encryptor<impl AsyncWriteExt + Unpin>,
     initial: u64,
     total: u64,
     on_progress: Arc<impl Fn(TransferEvent)>,
     mut hasher: Sha256,
 ) -> Result<[u8; 32]> {
-    let mut buf = vec![0u8; CHUNK];
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>>>(crate::proto::PIPELINE_DEPTH);
+
+    // Stage 1 (spawned): Read chunks from the reader and send via channel.
+    let read_task = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            let mut buf = vec![0u8; CHUNK];
+            let mut filled = 0;
+            while filled < buf.len() {
+                match reader.read(&mut buf[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        let _ = tx.send(Err(e.into())).await;
+                        return;
+                    }
+                }
+            }
+            if filled == 0 { break; }
+            buf.truncate(filled);
+            if tx.send(Ok(buf)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Main task: receive chunks, hash, encrypt, write to network.
     let mut done = initial;
     let start = Instant::now();
     let mut last_emit = start;
-    loop {
-        // Fill the buffer as much as possible in one pass.
-        let mut filled = 0;
-        while filled < buf.len() {
-            match reader.read(&mut buf[filled..]).await? {
-                0 => break,
-                n => filled += n,
-            }
-        }
-        if filled == 0 { break; }
-        hasher.update(&buf[..filled]);
-        enc.write_chunk(&buf[..filled]).await?;
-        done += filled as u64;
+    while let Some(result) = rx.recv().await {
+        let chunk = result?;
+        hasher.update(&chunk);
+        enc.write_chunk(&chunk).await?;
+        done += chunk.len() as u64;
         if last_emit.elapsed().as_millis() >= 100 {
             emit_progress(&on_progress, done, total, &start, false);
             last_emit = Instant::now();
         }
     }
+
+    // Capture read task panic.
+    read_task
+        .await
+        .map_err(|e| anyhow::anyhow!("read task panicked: {e}"))?;
+
     Ok(hasher.finalize().into())
 }
 
@@ -762,7 +839,7 @@ async fn stream_encrypted_hash_pipeline<R: AsyncRead + Unpin + Send + 'static>(
     on_progress: Arc<impl Fn(TransferEvent) + Send + Sync>,
     mut hasher: Sha256,
 ) -> Result<[u8; 32]> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>>>(2);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>>>(crate::proto::PIPELINE_DEPTH);
 
     // Read task: independently spawned, fills CHUNK-sized buffers and sends them.
     let read_task = tokio::spawn(async move {
@@ -921,7 +998,7 @@ fn tune_socket(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         eprintln!("warn: TCP_NODELAY failed: {e}");
     }
-    let buf_size = 2 * 1024 * 1024; // 2MB
+    let buf_size = crate::proto::TCP_BUF_SIZE;
     if let Err(e) = sock.set_send_buffer_size(buf_size) {
         eprintln!("warn: SO_SNDBUF failed: {e}");
     }

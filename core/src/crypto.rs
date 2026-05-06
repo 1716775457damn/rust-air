@@ -16,13 +16,13 @@ use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 
 // ── Encryptor ─────────────────────────────────────────────────────────────────
 
 pub struct Encryptor<W> {
     cipher:  ChaCha20Poly1305,
-    inner:   W,
+    inner:   BufWriter<W>,
     counter: u64,
     /// Reusable frame buffer: [4B len][16B tag][ciphertext] — avoids per-chunk allocation.
     frame_buf: Vec<u8>,
@@ -32,7 +32,7 @@ impl<W: AsyncWrite + Unpin> Encryptor<W> {
     pub fn new(key: &[u8; 32], inner: W) -> Self {
         Self {
             cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
-            inner,
+            inner: BufWriter::with_capacity(crate::proto::TCP_BUF_SIZE, inner),
             counter: 0,
             frame_buf: Vec::with_capacity(4 + 16 + CHUNK),
         }
@@ -65,8 +65,30 @@ impl<W: AsyncWrite + Unpin> Encryptor<W> {
         Ok(())
     }
 
+    /// Encrypt `plaintext` and return the encrypted frame as `Vec<u8>`.
+    /// Frame layout: `[4B len][16B tag][ciphertext]`.
+    /// Used by the pipeline to separate encryption from network writes.
+    pub fn encrypt_chunk_to_bytes(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut frame = Vec::with_capacity(4 + 16 + plaintext.len());
+        frame.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0u8; 16]); // tag placeholder
+        frame.extend_from_slice(plaintext);
+
+        let nonce = frame_nonce(self.counter);
+        let ciphertext_start = 4 + 16;
+        let tag = self.cipher
+            .encrypt_in_place_detached(&nonce, b"", &mut frame[ciphertext_start..])
+            .map_err(|e| anyhow::anyhow!("encrypt frame {}: {e}", self.counter))?;
+        frame[4..20].copy_from_slice(tag.as_slice());
+        self.counter += 1;
+
+        Ok(frame)
+    }
+
     /// Write the end-of-stream sentinel (zero-length frame) and flush.
     pub async fn shutdown(&mut self) -> Result<()> {
+        // Flush any buffered data before writing the EOF sentinel
+        self.inner.flush().await?;
         self.inner.write_all(&0u32.to_be_bytes()).await?;
         self.inner.flush().await?;
         Ok(())

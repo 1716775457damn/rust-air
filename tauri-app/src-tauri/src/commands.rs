@@ -15,7 +15,7 @@ use std::{path::PathBuf, sync::Mutex};
 #[cfg(feature = "desktop")]
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::{net::{TcpListener, TcpStream}, sync::oneshot};
+use tokio::{net::TcpListener, sync::oneshot};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "desktop")]
@@ -32,9 +32,6 @@ pub struct AppState {
     svc_handle:  Mutex<Option<ServiceHandle>>,
     /// Cancel token for the current outgoing send task.
     send_cancel: Mutex<Option<oneshot::Sender<()>>>,
-    /// Cancel token for the receive-side reconnect loop.
-    #[allow(dead_code)]
-    recv_cancel: Mutex<Option<CancellationToken>>,
     /// Last send parameters (path, addr) for retry_send.
     last_send_params: Mutex<Option<(String, String)>>,
 }
@@ -44,7 +41,6 @@ impl Default for AppState {
         Self {
             svc_handle:       Mutex::new(None),
             send_cancel:      Mutex::new(None),
-            recv_cancel:      Mutex::new(None),
             last_send_params: Mutex::new(None),
         }
     }
@@ -61,12 +57,6 @@ impl AppState {
         if let Some(tx) = self.send_cancel.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = tx.send(());
         }
-    }
-    #[allow(dead_code)]
-    fn new_recv_cancel(&self) -> CancellationToken {
-        let token = CancellationToken::new();
-        *self.recv_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
-        token
     }
     fn save_send_params(&self, path: &str, addr: &str) {
         *self.last_send_params.lock().unwrap_or_else(|e| e.into_inner()) = Some((path.to_string(), addr.to_string()));
@@ -112,10 +102,9 @@ pub async fn start_listener(
                         app2.emit("recv-peer-connected", peer.to_string()).ok();
                         let out = default_download_dir();
                         let app3 = app2.clone();
-                        let cancel_token = CancellationToken::new();
-                        match transfer::receive_with_reconnect(peer, &out, cancel_token, move |ev| {
+                        match transfer::receive_to_disk(stream, &out, move |ev| {
                             app3.emit("recv-progress", &ev).ok();
-                        }, Some(stream)).await {
+                        }).await {
                             Ok(ReceiveOutcome::File(p)) => {
                                 app2.emit("recv-done", p.to_string_lossy().to_string()).ok();
                             }
@@ -220,9 +209,9 @@ pub async fn start_listener(
                         app2.emit("recv-peer-connected", peer.to_string()).ok();
                         let out = default_download_dir();
                         let app3 = app2.clone();
-                        match transfer::receive_with_reconnect(peer, &out, CancellationToken::new(), move |ev| {
+                        match transfer::receive_to_disk(stream, &out, move |ev| {
                             app3.emit("recv-progress", &ev).ok();
-                        }, Some(stream)).await {
+                        }).await {
                             Ok(ReceiveOutcome::File(p)) => {
                                 app2.emit("recv-done", p.to_string_lossy().to_string()).ok();
                             }
@@ -278,12 +267,11 @@ pub async fn send_to(
 }
 
 async fn do_send(path: PathBuf, addr: String, app: AppHandle) -> anyhow::Result<()> {
-    let stream = TcpStream::connect(&addr).await?;
-    app.emit("send-peer-connected", &addr).ok();
+    let cancel_token = CancellationToken::new();
     let app2 = app.clone();
-    transfer::send_path(stream, &path, move |ev| {
+    transfer::send_path_with_retry(&addr, &path, move |ev| {
         app2.emit("send-progress", &ev).ok();
-    }).await
+    }, cancel_token).await
 }
 
 #[tauri::command]

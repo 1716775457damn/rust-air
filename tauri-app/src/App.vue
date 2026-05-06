@@ -67,9 +67,11 @@ const recvProgress = ref<TransferEvent>({ bytes_done: 0, total_bytes: 0, bytes_p
 const recvPeer     = ref("");
 const savedPath    = ref("");
 const recvHistory  = ref<{peer: string; path: string; bytes: number}[]>([]);
-const recvReconnecting = ref(false);
-const recvReconnectAttempt = ref(0);
-const recvReconnectMax = ref(5);
+
+// Sender-side reconnect state (reconnection is sender-initiated)
+const sendReconnecting = ref(false);
+const sendReconnectAttempt = ref(0);
+const sendReconnectMax = ref(5);
 
 // Devices
 const devices  = ref<Device[]>([]);
@@ -260,6 +262,13 @@ onMounted(async () => {
     await listen<TransferEvent>("send-progress", (e) => {
       sendProgress.value = e.payload;
       sendPhase.value = "transferring";
+      if (e.payload.reconnect_info) {
+        sendReconnecting.value = true;
+        sendReconnectAttempt.value = e.payload.reconnect_info.attempt;
+        sendReconnectMax.value = e.payload.reconnect_info.max_attempts;
+      } else {
+        sendReconnecting.value = false;
+      }
     }),
     await listen<string>("send-peer-connected", (e) => {
       sendPeer.value = e.payload;
@@ -278,13 +287,6 @@ onMounted(async () => {
     }),
     await listen<TransferEvent>("recv-progress", (e) => {
       recvProgress.value = e.payload;
-      if (e.payload.reconnect_info) {
-        recvReconnecting.value = true;
-        recvReconnectAttempt.value = e.payload.reconnect_info.attempt;
-        recvReconnectMax.value = e.payload.reconnect_info.max_attempts;
-      } else {
-        recvReconnecting.value = false;
-      }
     }),
     await listen<string>("recv-done", (e) => {
       savedPath.value = e.payload ?? "";
@@ -435,6 +437,7 @@ function resetSend() {
   invoke("cancel_send").catch(() => {});
   sendPhase.value = "idle"; sendPeer.value = ""; sendError.value = "";
   sendProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
+  sendReconnecting.value = false; sendReconnectAttempt.value = 0;
 }
 
 async function retrySend() {
@@ -448,7 +451,6 @@ async function retrySend() {
 function resetRecv() {
   recvPhase.value = "idle"; recvPeer.value = ""; recvError.value = ""; savedPath.value = "";
   recvProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
-  recvReconnecting.value = false; recvReconnectAttempt.value = 0;
 }
 
 // ── Devices ───────────────────────────────────────────────────────────────────
@@ -851,6 +853,13 @@ function highlightSegments(line: string, ranges: [number,number][]) {
             <div v-if="sendPhase === 'transferring'"
               class="rounded-xl p-4 flex-shrink-0"
               style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
+              <!-- Reconnect banner (sender-initiated) -->
+              <div v-if="sendReconnecting"
+                class="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg text-xs"
+                style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25)">
+                <span class="animate-pulse">🔄</span>
+                <span style="color:#fbbf24">重连中 (第 {{ sendReconnectAttempt }} 次 / 共 {{ sendReconnectMax }} 次)</span>
+              </div>
               <div class="flex items-center justify-between mb-2">
                 <span class="text-sm truncate" style="color:var(--text-secondary)">
                   发送中 → <span :style="`color:var(--accent)`">{{ sendPeer }}</span>
@@ -942,15 +951,8 @@ function highlightSegments(line: string, ranges: [number,number][]) {
             <div v-if="recvPhase === 'transferring'"
               class="rounded-xl p-4 flex-shrink-0"
               style="background:var(--bg-card);box-shadow:0 0 0 1px var(--accent-ring)">
-              <!-- Reconnect banner -->
-              <div v-if="recvReconnecting"
-                class="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg text-xs"
-                style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25)">
-                <span class="animate-pulse">🔄</span>
-                <span style="color:#fbbf24">重连中 (第 {{ recvReconnectAttempt }} 次 / 共 {{ recvReconnectMax }} 次)</span>
-              </div>
               <!-- Resume indicator -->
-              <div v-if="recvProgress.resumed && recvProgress.resume_offset && !recvReconnecting"
+              <div v-if="recvProgress.resumed && recvProgress.resume_offset"
                 class="flex items-center gap-2 mb-2 text-xs"
                 style="color:var(--accent)">
                 <span>⏩</span>
