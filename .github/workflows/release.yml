@@ -96,23 +96,43 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'rust-air ${{ github.ref_name }}'
           releaseBody: |
-            ## rust-air ${{ github.ref_name }} — LAN 极速文件传输
+            ## rust-air ${{ github.ref_name }} — LAN 极速文件传输工具
+
+            一款专注于局域网高速文件传输的开源工具，支持 Windows、macOS、Linux 全平台。
+
+            ### ✨ 核心特性
+
+            - **🚀 极速传输** - 单文件传输速度可达 280+ MB/s，千兆网络满速运行
+            - **📁 智能归档** - 小文件自动并行压缩，1000+ 小文件传输效率提升 10 倍
+            - **🔄 断点续传** - 网络中断自动重连，传输进度不丢失
+            - **🔒 端到端加密** - ChaCha20-Poly1305 加密 + SHA-256 校验，安全无忧
+            - **📡 自动发现** - mDNS 局域网设备自动发现，无需手动输入 IP
+            - **📋 剪贴板同步** - 跨设备文本、图片剪贴板共享
+            - **📝 待办清单** - 内置待办事项与日历视图
 
             ### 📦 下载安装包
 
             | 操作系统 | 文件 | 说明 |
             |---------|------|------|
-            | Windows | `.msi` | 推荐，带安装向导 |
-            | Windows | `.exe` | 免安装便携版 |
-            | macOS (M系列) | `.dmg` | Apple Silicon |
-            | macOS (Intel) | `.dmg` | x86_64 |
-            | Linux | `.deb` | Debian/Ubuntu |
-            | Linux | `.AppImage` | 免安装，所有发行版通用 |
+            | **Windows** | `.msi` | 推荐安装包，带安装向导 |
+            | **Windows** | `.exe` | 免安装便携版 |
+            | **macOS (M1/M2/M3)** | `_aarch64.dmg` | Apple Silicon 芯片 |
+            | **macOS (Intel)** | `_x64.dmg` | Intel 芯片 |
+            | **Linux** | `.deb` | Debian/Ubuntu |
+            | **Linux** | `.AppImage` | 免安装，所有发行版通用 |
+            | **CLI** | `rust-air-cli-*` | 命令行版本 |
 
-            ### 🔒 安全特性
-            - E2EE：ChaCha20-Poly1305 端到端加密
-            - SHA-256 文件完整性校验
-            - mDNS-SD 局域网自动发现，无需手动输入 IP
+            ### 📝 更新日志
+
+            **v0.3.42**
+            - 新增并行归档生成，小文件传输性能大幅提升
+            - 修复断点续传重连问题
+            - 优化传输流水线，提升大文件传输速度
+
+            ### 🔗 相关链接
+
+            - 项目主页: https://github.com/1716775457damn/rust-air
+            - 问题反馈: https://github.com/1716775457damn/rust-air/issues
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.tauri-args }}
