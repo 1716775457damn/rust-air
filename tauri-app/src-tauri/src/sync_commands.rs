@@ -557,6 +557,31 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("subdir/file.txt"));
     }
+
+    #[test]
+    fn test_handle_sync_delete_request_removes_local_file_and_records_tombstone() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("subdir").join("gone.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"delete-me").unwrap();
+
+        let state = SyncState::new();
+        {
+            let mut cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
+            cfg.src = root.path().to_string_lossy().to_string();
+        }
+
+        let req = RemoteSyncDeleteRequest {
+            rel: "subdir/gone.txt".to_string(),
+        };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let rel = handle_sync_delete_request(&bytes, &state).unwrap();
+
+        assert_eq!(rel, "subdir/gone.txt");
+        assert!(!target.exists());
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(store.state.deleted.contains_key("subdir/gone.txt"));
+    }
 }
 
 /// Run a full sync in a background thread.
