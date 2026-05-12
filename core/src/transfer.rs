@@ -348,7 +348,10 @@ pub async fn receive_to_disk(
             // Write to system clipboard (desktop only)
             #[cfg(feature = "desktop")]
             {
-                if name.starts_with("clip:image:") {
+                if name.starts_with("wb:") {
+                    // Whiteboard sync messages reuse the clipboard transport but must not
+                    // overwrite the user's real system clipboard.
+                } else if name.starts_with("clip:image:") {
                     let cursor = std::io::Cursor::new(&buf);
                     let decoder = image::codecs::png::PngDecoder::new(cursor)
                         .map_err(|e| anyhow::anyhow!("PNG decode failed: {e}"))?;

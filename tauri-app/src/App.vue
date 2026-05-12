@@ -468,6 +468,18 @@ async function addWbImage(b64: string) {
   } catch (e: any) { console.error("addWbImage:", e); }
 }
 
+async function copyWbText(text: string) {
+  if (!text) return;
+  try {
+    if (isAndroid.value) {
+      await navigator.clipboard?.writeText(text).catch(() => {});
+    } else {
+      await invoke("write_clipboard", { text }).catch(() => navigator.clipboard?.writeText(text).catch(() => {}));
+    }
+    showToast("whiteboard_copy", "白板文本已复制");
+  } catch (e: any) { console.error("copyWbText:", e); }
+}
+
 async function deleteWbItem(id: string) {
   try {
     await invoke("delete_whiteboard_item", { id });
@@ -1090,11 +1102,21 @@ function updateSyncConfigField(field: string, value: string | boolean) {
                         @keydown.esc.prevent="cancelWbEdit"
                         class="w-full min-h-24 rounded-lg px-3 py-2 text-sm focus:outline-none resize-y"
                         style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)"></textarea>
-                      <p v-else
+                      <div v-else class="space-y-2">
+                        <p
                         @dblclick="startWbEdit(item)"
                         class="text-sm whitespace-pre-wrap break-words cursor-text select-text"
                         title="双击可编辑，文本可直接选择复制"
                         style="color:var(--text-primary);user-select:text">{{ item.text }}</p>
+                        <div class="flex items-center gap-2">
+                          <button @click="copyWbText(item.text)"
+                            class="px-3 py-1 rounded-lg text-xs transition-colors"
+                            style="background:var(--bg-muted);color:var(--text-secondary)">复制</button>
+                          <button @click="startWbEdit(item)"
+                            class="px-3 py-1 rounded-lg text-xs transition-colors"
+                            style="background:var(--accent-bg);color:var(--accent)">编辑</button>
+                        </div>
+                      </div>
                       <div v-if="wbEditingId === item.id" class="flex items-center gap-2">
                         <button @click="saveWbEdit"
                           :disabled="!wbEditingText.trim()"
