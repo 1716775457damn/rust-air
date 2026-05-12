@@ -9,9 +9,11 @@ import { useClipboardSync } from "./composables/useClipboardSync";
 import DevicesPanel from "./components/DevicesPanel.vue";
 import SearchPanel from "./components/SearchPanel.vue";
 import SyncPanel from "./components/SyncPanel.vue";
+import WhiteboardPanel from "./components/WhiteboardPanel.vue";
 import { useSync } from "./composables/useSync";
 import { useTransfer } from "./composables/useTransfer";
 import { useUpdate } from "./composables/useUpdate";
+import { useWhiteboard } from "./composables/useWhiteboard";
 import {
   todayStr,
 } from "./utils/transfer";
@@ -185,11 +187,24 @@ const {
 } = useClipboardSync(showToast);
 
 // Whiteboard
-const whiteboardItems = ref<WhiteboardItem[]>([]);
-const wbTextInput     = ref("");
-const wbClearConfirm  = ref(false);
-const wbEditingId     = ref<string | null>(null);
-const wbEditingText   = ref("");
+const {
+  whiteboardItems,
+  wbTextInput,
+  wbClearConfirm,
+  wbEditingId,
+  wbEditingText,
+  loadInitialWhiteboardState,
+  onWhiteboardUpdate,
+  addWbText,
+  startWbEdit,
+  cancelWbEdit,
+  saveWbEdit,
+  copyWbText,
+  deleteWbItem,
+  clearWhiteboard,
+  onWbPaste,
+  fmtWbTime,
+} = useWhiteboard(() => isAndroid.value, showToast);
 
 // Toast notifications (Task 10.4)
 const toasts = ref<{ id: number; kind: string; message: string; device?: string }[]>([]);
@@ -327,7 +342,7 @@ onMounted(async () => {
 
     // Whiteboard events
     await listen<WhiteboardItem[]>("whiteboard-update", (e) => {
-      whiteboardItems.value = e.payload;
+      onWhiteboardUpdate(e.payload);
     }),
     await listen<WhiteboardError>("whiteboard-error", (e) => {
       const err = e.payload;
@@ -352,7 +367,7 @@ onMounted(async () => {
 
   // Load initial whiteboard data and start flush timer
   if (!isAndroid.value) {
-    try { whiteboardItems.value = await invoke<WhiteboardItem[]>("get_whiteboard_items"); }
+    try { await loadInitialWhiteboardState(); }
     catch (_) { /* whiteboard commands may not be registered yet */ }
     _whiteboardFlushTimer = setInterval(() => { invoke("flush_whiteboard").catch(() => {}); }, 3000);
   }
@@ -430,98 +445,7 @@ async function deleteTodo(id: number) {
 watch(selectedDate, (d) => loadTodos(d));
 watch([calendarYear, calendarMonth], ([y, m]) => loadTodoDates(y, m));
 
-// ── Whiteboard IPC ───────────────────────────────────────────────────────────
-
-async function addWbText() {
-  const text = wbTextInput.value.trim();
-  if (!text) return;
-  try {
-    await invoke<WhiteboardItem>("add_whiteboard_text", { text });
-    wbTextInput.value = "";
-  } catch (e: any) { console.error("addWbText:", e); }
-}
-
-function startWbEdit(item: WhiteboardItem) {
-  if (item.content_type !== 'Text' || !item.text) return;
-  wbEditingId.value = item.id;
-  wbEditingText.value = item.text;
-}
-
-function cancelWbEdit() {
-  wbEditingId.value = null;
-  wbEditingText.value = "";
-}
-
-async function saveWbEdit() {
-  const id = wbEditingId.value;
-  const text = wbEditingText.value.trim();
-  if (!id || !text) return;
-  try {
-    await invoke("update_whiteboard_text", { id, text });
-    cancelWbEdit();
-  } catch (e: any) { console.error("saveWbEdit:", e); }
-}
-
-async function addWbImage(b64: string) {
-  try {
-    await invoke<WhiteboardItem>("add_whiteboard_image", { imageB64: b64 });
-  } catch (e: any) { console.error("addWbImage:", e); }
-}
-
-async function copyWbText(text: string) {
-  if (!text) return;
-  try {
-    if (isAndroid.value) {
-      await navigator.clipboard?.writeText(text).catch(() => {});
-    } else {
-      await invoke("write_clipboard", { text }).catch(() => navigator.clipboard?.writeText(text).catch(() => {}));
-    }
-    showToast("whiteboard_copy", "白板文本已复制");
-  } catch (e: any) { console.error("copyWbText:", e); }
-}
-
-async function deleteWbItem(id: string) {
-  try {
-    await invoke("delete_whiteboard_item", { id });
-  } catch (e: any) { console.error("deleteWbItem:", e); }
-}
-
-async function clearWhiteboard() {
-  try {
-    await invoke("clear_whiteboard");
-    wbClearConfirm.value = false;
-  } catch (e: any) { console.error("clearWhiteboard:", e); }
-}
-
-function onWbPaste(e: ClipboardEvent) {
-  const items = e.clipboardData?.items;
-  if (!items) return;
-  for (const item of items) {
-    if (item.type.startsWith("image/")) {
-      e.preventDefault();
-      const blob = item.getAsFile();
-      if (!blob) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        // Strip the data:image/...;base64, prefix
-        const b64 = result.split(",")[1];
-        if (b64) addWbImage(b64);
-      };
-      reader.readAsDataURL(blob);
-      return;
-    }
-  }
-}
-
-function fmtWbTime(ts: number): string {
-  const d = new Date(ts);
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  const MM = String(d.getMonth() + 1).padStart(2, '0');
-  const DD = String(d.getDate()).padStart(2, '0');
-  return `${MM}-${DD} ${hh}:${mm}`;
-}
+// ── Whiteboard moved to composable ────────────────────────────────────────────
 
 // ── IP moved to devices composable ────────────────────────────────────────────
 
@@ -1040,119 +964,25 @@ function updateSyncConfigField(field: string, value: string | boolean) {
 
         <!-- WHITEBOARD TAB -->
         <template v-else-if="tab === 'whiteboard'">
-          <div class="flex-1 flex flex-col gap-4 min-h-0 max-w-xl mx-auto w-full">
-
-            <!-- Input area -->
-            <div class="flex gap-2 flex-shrink-0">
-              <input v-model="wbTextInput" @keyup.enter="addWbText" @paste="onWbPaste"
-                placeholder="输入文字或粘贴图片…"
-                class="flex-1 rounded-lg px-3 py-2 text-sm focus:outline-none transition-colors"
-                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
-              <button @click="addWbText"
-                :disabled="!wbTextInput.trim()"
-                :style="wbTextInput.trim()
-                  ? 'background:var(--accent);color:#fff'
-                  : 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'"
-                class="px-4 py-2 rounded-lg text-sm font-medium transition-colors flex-shrink-0">
-                添加
-              </button>
-            </div>
-
-            <!-- Clear button -->
-            <div class="flex items-center justify-between flex-shrink-0">
-              <span class="text-xs" style="color:var(--text-muted)">共 {{ whiteboardItems.length }} 条</span>
-              <div v-if="whiteboardItems.length > 0" class="flex items-center gap-2">
-                <template v-if="!wbClearConfirm">
-                  <button @click="wbClearConfirm = true"
-                    class="px-3 py-1 rounded-lg text-xs transition-colors"
-                    style="background:rgba(239,68,68,0.1);color:#f87171">
-                    🗑 清空白板
-                  </button>
-                </template>
-                <template v-else>
-                  <span class="text-xs" style="color:#f87171">确定清空？此操作将同步到所有设备</span>
-                  <button @click="clearWhiteboard"
-                    class="px-3 py-1 rounded-lg text-xs font-medium text-white"
-                    style="background:#dc2626">确定</button>
-                  <button @click="wbClearConfirm = false"
-                    class="px-2 py-1 rounded-lg text-xs"
-                    style="color:var(--text-muted)">取消</button>
-                </template>
-              </div>
-            </div>
-
-            <!-- Item list -->
-            <div class="flex-1 min-h-0 overflow-y-auto space-y-2">
-              <div v-if="whiteboardItems.length === 0" class="text-center py-12 text-sm" style="color:var(--text-faint)">
-                <div class="text-3xl mb-2">🖊️</div>
-                <p>白板为空</p>
-                <p class="text-xs mt-1">输入文字或粘贴图片开始使用</p>
-              </div>
-              <div v-for="item in whiteboardItems" :key="item.id"
-                class="rounded-xl p-3.5 group"
-                style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
-                <div class="flex items-start gap-3">
-                  <span class="flex-shrink-0 text-sm mt-0.5">{{ item.content_type === 'Image' ? '🖼️' : '📝' }}</span>
-                  <div class="flex-1 min-w-0">
-                    <!-- Text content -->
-                    <div v-if="item.content_type === 'Text' && item.text" class="space-y-2">
-                      <textarea v-if="wbEditingId === item.id"
-                        v-model="wbEditingText"
-                        @keydown.ctrl.enter.prevent="saveWbEdit"
-                        @keydown.esc.prevent="cancelWbEdit"
-                        class="w-full min-h-24 rounded-lg px-3 py-2 text-sm focus:outline-none resize-y"
-                        style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)"></textarea>
-                      <div v-else class="space-y-2">
-                        <p
-                        @dblclick="startWbEdit(item)"
-                        class="text-sm whitespace-pre-wrap break-words cursor-text select-text"
-                        title="双击可编辑，文本可直接选择复制"
-                        style="color:var(--text-primary);user-select:text">{{ item.text }}</p>
-                        <div class="flex items-center gap-2">
-                          <button @click="copyWbText(item.text)"
-                            class="px-3 py-1 rounded-lg text-xs transition-colors"
-                            style="background:var(--bg-muted);color:var(--text-secondary)">复制</button>
-                          <button @click="startWbEdit(item)"
-                            class="px-3 py-1 rounded-lg text-xs transition-colors"
-                            style="background:var(--accent-bg);color:var(--accent)">编辑</button>
-                        </div>
-                      </div>
-                      <div v-if="wbEditingId === item.id" class="flex items-center gap-2">
-                        <button @click="saveWbEdit"
-                          :disabled="!wbEditingText.trim()"
-                          :style="wbEditingText.trim()
-                            ? 'background:var(--accent);color:#fff'
-                            : 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'"
-                          class="px-3 py-1 rounded-lg text-xs font-medium transition-colors">保存</button>
-                        <button @click="cancelWbEdit"
-                          class="px-3 py-1 rounded-lg text-xs transition-colors"
-                          style="background:var(--bg-muted);color:var(--text-secondary)">取消</button>
-                        <span class="text-[11px]" style="color:var(--text-faint)">Ctrl+Enter 保存，Esc 取消</span>
-                      </div>
-                    </div>
-                    <!-- Image content -->
-                    <img v-if="item.content_type === 'Image' && item.image_b64"
-                      :src="'data:image/png;base64,' + item.image_b64"
-                      class="max-w-full max-h-48 rounded-lg object-contain"
-                      style="background:var(--bg-muted)" />
-                    <!-- Meta -->
-                    <div class="flex items-center gap-2 mt-1.5 text-[11px]" style="color:var(--text-faint)">
-                      <span>{{ fmtWbTime(item.timestamp) }}</span>
-                      <span v-if="item.source_device" class="px-1.5 py-0.5 rounded-full"
-                        style="background:var(--accent-bg);color:var(--accent)">
-                        {{ item.source_device }}
-                      </span>
-                    </div>
-                  </div>
-                  <button @click="deleteWbItem(item.id)"
-                    class="text-xs flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded-lg"
-                    style="color:var(--text-muted)"
-                    title="删除">🗑</button>
-                </div>
-              </div>
-            </div>
-
-          </div>
+          <WhiteboardPanel
+            :whiteboard-items="whiteboardItems"
+            :wb-text-input="wbTextInput"
+            :wb-clear-confirm="wbClearConfirm"
+            :wb-editing-id="wbEditingId"
+            :wb-editing-text="wbEditingText"
+            :fmt-wb-time="fmtWbTime"
+            @add-text="addWbText"
+            @clear-confirm="(value) => (wbClearConfirm = value)"
+            @clear="clearWhiteboard"
+            @delete-item="deleteWbItem"
+            @paste-image="onWbPaste"
+            @edit-start="startWbEdit"
+            @edit-cancel="cancelWbEdit"
+            @edit-save="saveWbEdit"
+            @edit-input="(value) => (wbEditingText = value)"
+            @text-input="(value) => (wbTextInput = value)"
+            @copy-text="copyWbText"
+          />
         </template>
 
         <!-- SETTINGS TAB -->
