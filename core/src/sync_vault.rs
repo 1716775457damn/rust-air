@@ -241,7 +241,7 @@ pub fn start_watcher(
                 Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            let mut map = pending_flush.lock().unwrap();
+            let mut map = pending_flush.lock().unwrap_or_else(|e| e.into_inner());
             let ready: Vec<PathBuf> = map.iter()
                 .filter(|(_, t)| t.elapsed() >= Duration::from_millis(DEBOUNCE_MS))
                 .map(|(p, _)| p.clone())
@@ -263,7 +263,7 @@ pub fn start_watcher(
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) { return; }
                 let now = Instant::now();
-                let mut map = pending.lock().unwrap();
+                let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
                 for path in event.paths { map.insert(path, now); }
             }
         },

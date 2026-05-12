@@ -299,3 +299,31 @@
 
 ### Recommended Next Step
 - If the goal is another public release, the next pass should be a final targeted audit + version bump + tag/release workflow trigger.
+
+## Iteration 11
+
+### Scope
+- Final production-safety pass over remaining high-value lock poison and runtime-risk sites.
+
+### Changes
+- Replaced `REG_DAEMON.lock().unwrap()` in `core/src/discovery.rs` with poison-tolerant recovery.
+- Replaced several runtime `config` / `echo_guard` mutex `unwrap()` calls in `core/src/clipboard_sync.rs` with poison-tolerant recovery.
+- Replaced watcher debounce map `lock().unwrap()` calls in `core/src/sync_vault.rs` with poison-tolerant recovery.
+
+### Validation
+- `cargo test -p rust-air-core --lib -- --nocapture`
+- `cargo check -p tauri-app`
+- `pnpm exec vue-tsc --noEmit`
+- `pnpm build`
+
+### Stability Impact
+- Reduced the chance that one poisoned mutex crashes long-lived discovery, clipboard sync, or watcher logic.
+- Improved resilience of always-on background services in desktop runtime paths.
+
+### Remaining Issues
+- Some test-only `unwrap` / `expect` usage remains intentionally.
+- Todo/whiteboard UI decomposition is still incomplete.
+- Static release notes and some operational docs still lag behind actual iteration history.
+
+### Recommended Next Step
+- If you want another release now, proceed with version bump + tag + release trigger; otherwise, continue with whiteboard/todo UI decomposition.

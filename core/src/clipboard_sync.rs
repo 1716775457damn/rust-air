@@ -252,34 +252,34 @@ impl ClipboardSyncService {
 
     /// Return a clone of the current in-memory config.
     pub fn config(&self) -> SyncGroupConfig {
-        self.config.lock().unwrap().clone()
+        self.config.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Replace the in-memory config and persist it to disk.
     pub fn save_config(&self, config: SyncGroupConfig) {
         self.enabled.store(config.enabled, Ordering::SeqCst);
-        let mut guard = self.config.lock().unwrap();
+        let mut guard = self.config.lock().unwrap_or_else(|e| e.into_inner());
         *guard = config.clone();
         SyncGroupConfig::save(&config);
     }
 
     /// Add a peer to the sync group and persist.
     pub fn add_peer(&self, peer: SyncPeer) {
-        let mut guard = self.config.lock().unwrap();
+        let mut guard = self.config.lock().unwrap_or_else(|e| e.into_inner());
         guard.peers.push(peer);
         SyncGroupConfig::save(&guard);
     }
 
     /// Remove a peer by `device_name` and persist.
     pub fn remove_peer(&self, device_name: &str) {
-        let mut guard = self.config.lock().unwrap();
+        let mut guard = self.config.lock().unwrap_or_else(|e| e.into_inner());
         guard.peers.retain(|p| p.device_name != device_name);
         SyncGroupConfig::save(&guard);
     }
 
     /// Update a peer's address and last_seen timestamp, and set online=true.
     pub fn update_peer_status(&self, device_name: &str, addr: &str) {
-        let mut guard = self.config.lock().unwrap();
+        let mut guard = self.config.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(peer) = guard.peers.iter_mut().find(|p| p.device_name == device_name) {
             peer.addr = addr.to_string();
             peer.last_seen = std::time::SystemTime::now()
@@ -294,14 +294,14 @@ impl ClipboardSyncService {
     /// Enable or disable sync. Updates the AtomicBool and persists the config.
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
-        let mut guard = self.config.lock().unwrap();
+        let mut guard = self.config.lock().unwrap_or_else(|e| e.into_inner());
         guard.enabled = enabled;
         SyncGroupConfig::save(&guard);
     }
 
     /// Return only the peers that are currently online.
     pub fn online_peers(&self) -> Vec<SyncPeer> {
-        let guard = self.config.lock().unwrap();
+        let guard = self.config.lock().unwrap_or_else(|e| e.into_inner());
         guard.peers.iter().filter(|p| p.online).cloned().collect()
     }
 
@@ -323,7 +323,7 @@ impl ClipboardSyncService {
             ClipContent::Image { rgba, .. } => fnv1a(rgba),
         };
         {
-            let mut eg = self.echo_guard.lock().unwrap();
+            let mut eg = self.echo_guard.lock().unwrap_or_else(|e| e.into_inner());
             if eg.is_suppressed(hash) {
                 return false;
             }
@@ -505,7 +505,7 @@ impl ClipboardSyncService {
             ClipContent::Image { rgba, .. } => fnv1a(rgba),
         };
         {
-            let mut eg = self.echo_guard.lock().unwrap();
+            let mut eg = self.echo_guard.lock().unwrap_or_else(|e| e.into_inner());
             eg.register(hash);
         }
 

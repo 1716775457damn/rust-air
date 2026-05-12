@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 static REG_DAEMON: Mutex<Option<Arc<ServiceDaemon>>> = Mutex::new(None);
 
 fn reg_daemon() -> Result<Arc<ServiceDaemon>> {
-    let mut g = REG_DAEMON.lock().unwrap();
+    let mut g = REG_DAEMON.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref d) = *g { return Ok(d.clone()); }
     let d = Arc::new(ServiceDaemon::new()?);
     *g = Some(d.clone());
