@@ -186,6 +186,22 @@ pub async fn start_listener(
                                             app2.emit("sync-event", rust_air_core::SyncEvent::Error { rel: "file-error".to_string(), err: e }).ok();
                                         }
                                     }
+                                } else if name == "sync:delete-request" {
+                                    if let Some(ss) = app2.try_state::<SyncState>() {
+                                        match crate::sync_commands::handle_sync_delete_request(&data, &ss) {
+                                            Ok(rel) => {
+                                                app2.emit("sync-event", rust_air_core::SyncEvent::Deleted {
+                                                    rel: format!("⇠ 远端删除同步: {}", rel),
+                                                }).ok();
+                                            }
+                                            Err(e) => {
+                                                app2.emit("sync-event", rust_air_core::SyncEvent::Error {
+                                                    rel: "delete-request".to_string(),
+                                                    err: e,
+                                                }).ok();
+                                            }
+                                        }
+                                    }
                                 } else {
                                     // Existing clipboard sync logic
                                     match svc.handle_received(&name, &data) {

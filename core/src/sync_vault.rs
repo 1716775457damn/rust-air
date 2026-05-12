@@ -32,6 +32,7 @@ pub struct SyncManifestEntry {
     pub size: u64,
     pub modified_ts: i64,
     pub hash: String,
+    pub deleted: bool,
 }
 
 /// An action needed to make two devices converge to the latest version of a file.
@@ -39,6 +40,8 @@ pub struct SyncManifestEntry {
 pub enum SyncAction {
     PushToRemote(SyncManifestEntry),
     PullFromRemote(SyncManifestEntry),
+    DeleteRemote(String),
+    DeleteLocal(String),
 }
 
 /// NFD → NFC: macOS HFS+ stores paths in NFD; compose to NFC for correct display.
@@ -73,6 +76,7 @@ pub struct FileRecord {
 #[derive(Default, Serialize, Deserialize)]
 pub struct SyncState {
     pub files:         HashMap<String, FileRecord>,
+    pub deleted:       HashMap<String, DateTime<Local>>,
     pub last_sync:     Option<DateTime<Local>>,
     pub total_synced:  u64,
     pub total_bytes:   u64,
@@ -170,6 +174,7 @@ pub fn full_sync(
         for rel in removed {
             let _ = std::fs::remove_file(dst.join(&rel));
             store.state.files.remove(&rel);
+            store.state.deleted.insert(rel.clone(), Local::now());
             store.mark_dirty();
             let _ = tx.send(SyncEvent::Deleted { rel });
         }
@@ -203,6 +208,7 @@ pub fn sync_file(
     if !abs.exists() {
         let _ = std::fs::remove_file(&dst_path);
         store.state.files.remove(&rel);
+        store.state.deleted.insert(rel.clone(), Local::now());
         store.mark_dirty();
         let _ = tx.send(SyncEvent::Deleted { rel });
         return;
@@ -358,6 +364,7 @@ pub fn build_manifest(src: &Path, excludes: &[String]) -> Vec<SyncManifestEntry>
             size: meta.len(),
             modified_ts,
             hash,
+            deleted: false,
         });
     }
 
@@ -390,6 +397,25 @@ pub fn diff_manifests_latest_wins(
             (Some(local_entry), None) => actions.push(SyncAction::PushToRemote((*local_entry).clone())),
             (None, Some(remote_entry)) => actions.push(SyncAction::PullFromRemote((*remote_entry).clone())),
             (Some(local_entry), Some(remote_entry)) => {
+                if local_entry.deleted && remote_entry.deleted {
+                    continue;
+                }
+                if local_entry.deleted && !remote_entry.deleted {
+                    if local_entry.modified_ts > remote_entry.modified_ts {
+                        actions.push(SyncAction::DeleteRemote(local_entry.rel.clone()));
+                    } else {
+                        actions.push(SyncAction::PullFromRemote((*remote_entry).clone()));
+                    }
+                    continue;
+                }
+                if !local_entry.deleted && remote_entry.deleted {
+                    if remote_entry.modified_ts >= local_entry.modified_ts {
+                        actions.push(SyncAction::DeleteLocal(remote_entry.rel.clone()));
+                    } else {
+                        actions.push(SyncAction::PushToRemote((*local_entry).clone()));
+                    }
+                    continue;
+                }
                 if local_entry.hash == remote_entry.hash {
                     continue;
                 }
@@ -491,6 +517,7 @@ fn atomic_copy(
             store.state.files.insert(rel.to_string(), FileRecord {
                 hash, size, modified: Local::now(),
             });
+            store.state.deleted.remove(rel);
             store.state.total_synced += 1;
             store.state.total_bytes  += bytes;
             store.mark_dirty();
@@ -538,6 +565,7 @@ mod sync_manifest_tests {
             size: 10,
             modified_ts: 100,
             hash: "hash-a".to_string(),
+            deleted: false,
         }];
         let remote = vec![];
 
@@ -553,6 +581,7 @@ mod sync_manifest_tests {
             size: 20,
             modified_ts: 200,
             hash: "hash-b".to_string(),
+            deleted: false,
         }];
 
         let diff = diff_manifests_latest_wins(&local, &remote);
@@ -566,12 +595,14 @@ mod sync_manifest_tests {
             size: 10,
             modified_ts: 300,
             hash: "hash-local".to_string(),
+            deleted: false,
         }];
         let remote = vec![SyncManifestEntry {
             rel: "shared.txt".to_string(),
             size: 10,
             modified_ts: 200,
             hash: "hash-remote".to_string(),
+            deleted: false,
         }];
 
         let diff = diff_manifests_latest_wins(&local, &remote);
@@ -585,12 +616,14 @@ mod sync_manifest_tests {
             size: 10,
             modified_ts: 300,
             hash: "hash-local".to_string(),
+            deleted: false,
         }];
         let remote = vec![SyncManifestEntry {
             rel: "shared.txt".to_string(),
             size: 10,
             modified_ts: 300,
             hash: "hash-remote".to_string(),
+            deleted: false,
         }];
 
         let diff = diff_manifests_latest_wins(&local, &remote);
@@ -606,6 +639,48 @@ mod sync_manifest_tests {
         let manifest = build_manifest(dir.path(), &[]);
         let names: Vec<_> = manifest.iter().map(|e| e.rel.as_str()).collect();
         assert_eq!(names, vec!["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn test_diff_manifests_delete_remote_when_local_tombstone_newer() {
+        let local = vec![SyncManifestEntry {
+            rel: "gone.txt".to_string(),
+            size: 0,
+            modified_ts: 500,
+            hash: String::new(),
+            deleted: true,
+        }];
+        let remote = vec![SyncManifestEntry {
+            rel: "gone.txt".to_string(),
+            size: 10,
+            modified_ts: 100,
+            hash: "hash-old".to_string(),
+            deleted: false,
+        }];
+
+        let diff = diff_manifests_latest_wins(&local, &remote);
+        assert_eq!(diff, vec![SyncAction::DeleteRemote("gone.txt".to_string())]);
+    }
+
+    #[test]
+    fn test_diff_manifests_delete_local_when_remote_tombstone_newer() {
+        let local = vec![SyncManifestEntry {
+            rel: "gone.txt".to_string(),
+            size: 10,
+            modified_ts: 100,
+            hash: "hash-old".to_string(),
+            deleted: false,
+        }];
+        let remote = vec![SyncManifestEntry {
+            rel: "gone.txt".to_string(),
+            size: 0,
+            modified_ts: 500,
+            hash: String::new(),
+            deleted: true,
+        }];
+
+        let diff = diff_manifests_latest_wins(&local, &remote);
+        assert_eq!(diff, vec![SyncAction::DeleteLocal("gone.txt".to_string())]);
     }
 }
 

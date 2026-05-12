@@ -133,6 +133,11 @@ struct RemoteSyncFileRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+struct RemoteSyncDeleteRequest {
+    rel: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct RemoteSyncFileError {
     request_id: String,
     rel: String,
@@ -276,6 +281,30 @@ pub async fn start_remote_sync(
                 transfer::send_clipboard(stream, &json, "sync:file-request", |_| {}).await.map_err(|e| e.to_string())?;
                 pull_waiters.push((entry.rel.clone(), waiter));
             }
+            SyncAction::DeleteRemote(rel) => {
+                app.emit("sync-event", SyncEvent::Info {
+                    msg: format!("⇢ 请求远端删除: {}", rel),
+                }).ok();
+                let req = RemoteSyncDeleteRequest { rel: rel.clone() };
+                let json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+                let stream = tokio::net::TcpStream::connect(&remote_addr).await.map_err(|e| e.to_string())?;
+                transfer::send_clipboard(stream, &json, "sync:delete-request", |_| {}).await.map_err(|e| e.to_string())?;
+                app.emit("sync-event", SyncEvent::Deleted { rel: format!("⇢ 已请求远端删除: {}", rel) }).ok();
+            }
+            SyncAction::DeleteLocal(rel) => {
+                app.emit("sync-event", SyncEvent::Info {
+                    msg: format!("⇠ 本地删除过期文件: {}", rel),
+                }).ok();
+                let dst = src.join(rel);
+                let _ = std::fs::remove_file(&dst);
+                {
+                    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+                    store.state.files.remove(rel);
+                    store.state.deleted.insert(rel.clone(), Local::now());
+                    store.mark_dirty();
+                }
+                app.emit("sync-event", SyncEvent::Deleted { rel: format!("⇠ 已删除本地旧文件: {}", rel) }).ok();
+            }
         }
     }
 
@@ -371,6 +400,27 @@ pub async fn handle_sync_file_request(
     let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
     transfer::send_path_as(stream, &src_file, Some(&logical_name), |_| {}).await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn handle_sync_delete_request(
+    data: &[u8],
+    state: &SyncState,
+) -> Result<String, String> {
+    let req: RemoteSyncDeleteRequest = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if config.src.is_empty() {
+        return Err("local sync source directory not configured".to_string());
+    }
+    let dst = PathBuf::from(&config.src).join(&req.rel);
+    let _ = std::fs::remove_file(&dst);
+    {
+        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.state.files.remove(&req.rel);
+        store.state.deleted.insert(req.rel.clone(), Local::now());
+        store.mark_dirty();
+        store.flush_now();
+    }
+    Ok(req.rel)
 }
 
 pub fn handle_received_sync_file(
