@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use tauri_app_lib::update_commands::{
     apply_download_proxy,
     expected_download_size,
+    expected_installer_signature,
     windows_installer_command,
 };
 
@@ -142,6 +143,13 @@ mod download_proxy_tests {
         // The fallback mechanism should preserve the original URL
         assert!(final_url == original_url || has_proxy_prefix(final_url),
             "URL should either be proxied or original (fallback)");
+    }
+
+    #[test]
+    fn test_expected_installer_signature_for_windows_assets() {
+        assert_eq!(expected_installer_signature("https://example.com/app.msi"), b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1");
+        assert_eq!(expected_installer_signature("https://example.com/app.exe"), b"MZ");
+        assert_eq!(expected_installer_signature("https://example.com/app.dmg"), b"");
     }
 }
 

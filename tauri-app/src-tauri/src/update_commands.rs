@@ -358,6 +358,35 @@ pub fn expected_download_size(total: u64, content_length: Option<u64>) -> u64 {
     content_length.unwrap_or(total)
 }
 
+pub fn expected_installer_signature(url: &str) -> &'static [u8] {
+    let lower = url.to_ascii_lowercase();
+    if lower.ends_with(".msi") {
+        // MSI uses OLE Compound File header: D0 CF 11 E0 A1 B1 1A E1
+        b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
+    } else if lower.ends_with(".exe") {
+        b"MZ"
+    } else {
+        &[]
+    }
+}
+
+async fn validate_downloaded_installer(path: &Path, url: &str) -> anyhow::Result<()> {
+    let signature = expected_installer_signature(url);
+    if signature.is_empty() {
+        return Ok(());
+    }
+
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut header = vec![0u8; signature.len()];
+    file.read_exact(&mut header).await?;
+    anyhow::ensure!(
+        header == signature,
+        "downloaded file header does not match expected installer format"
+    );
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 pub fn windows_installer_command(path: &Path) -> String {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -401,58 +430,68 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
         .timeout(std::time::Duration::from_secs(600))
         .build()?;
 
-    // Try proxied URL first, fall back to direct GitHub URL on failure.
-    let mut resp = match client.get(&proxied_url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => {
-            eprintln!("info: xgn.io proxy unavailable, falling back to direct download");
-            client.get(url).send().await?
-        }
-    };
-
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "download request failed with status {}",
-        resp.status()
-    );
-
-    let expected_total = expected_download_size(total, resp.content_length());
-    let mut file = tokio::fs::File::create(&tmp).await?;
-    let mut downloaded = 0u64;
-    let mut last_emit = std::time::Instant::now();
-
-    use tokio::io::AsyncWriteExt;
-    while let Some(chunk) = resp.chunk().await? {
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-        if last_emit.elapsed().as_millis() >= 100 {
-            app.emit("update-progress", UpdateProgress {
-                downloaded, total: expected_total, done: false,
-            }).ok();
-            last_emit = std::time::Instant::now();
-        }
-    }
-    file.flush().await?;
-
-    // Verify download completeness — reject truncated files
-    if expected_total > 0 && downloaded != expected_total {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        anyhow::bail!(
-            "download incomplete: got {} bytes, expected {} bytes",
-            downloaded, expected_total
+    async fn download_once(
+        client: &reqwest::Client,
+        source_url: &str,
+        original_url: &str,
+        total: u64,
+        tmp: &Path,
+        app: &AppHandle,
+    ) -> anyhow::Result<()> {
+        let mut resp = client.get(source_url).send().await?;
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "download request failed with status {}",
+            resp.status()
         );
-    }
-    // Sanity check: MSI files must be at least 1 KB
-    if downloaded < 1024 {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        anyhow::bail!(
-            "downloaded file too small ({} bytes) — likely not a valid installer",
-            downloaded
-        );
+
+        let expected_total = expected_download_size(total, resp.content_length());
+        let mut file = tokio::fs::File::create(tmp).await?;
+        let mut downloaded = 0u64;
+        let mut last_emit = std::time::Instant::now();
+
+        use tokio::io::AsyncWriteExt;
+        while let Some(chunk) = resp.chunk().await? {
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            if last_emit.elapsed().as_millis() >= 100 {
+                app.emit("update-progress", UpdateProgress {
+                    downloaded, total: expected_total, done: false,
+                }).ok();
+                last_emit = std::time::Instant::now();
+            }
+        }
+        file.flush().await?;
+
+        if expected_total > 0 && downloaded != expected_total {
+            let _ = tokio::fs::remove_file(tmp).await;
+            anyhow::bail!(
+                "download incomplete: got {} bytes, expected {} bytes",
+                downloaded, expected_total
+            );
+        }
+        if downloaded < 1024 {
+            let _ = tokio::fs::remove_file(tmp).await;
+            anyhow::bail!(
+                "downloaded file too small ({} bytes) — likely not a valid installer",
+                downloaded
+            );
+        }
+
+        validate_downloaded_installer(tmp, original_url).await?;
+        app.emit("update-progress", UpdateProgress { downloaded, total: expected_total, done: true }).ok();
+        Ok(())
     }
 
-    app.emit("update-progress", UpdateProgress { downloaded, total: expected_total, done: true }).ok();
-    Ok(tmp)
+    match download_once(&client, &proxied_url, url, total, &tmp, app).await {
+        Ok(()) => Ok(tmp),
+        Err(proxy_err) => {
+            eprintln!("warn: proxied download failed validation, falling back to direct download: {proxy_err}");
+            let _ = tokio::fs::remove_file(&tmp).await;
+            download_once(&client, url, url, total, &tmp, app).await?;
+            Ok(tmp)
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
