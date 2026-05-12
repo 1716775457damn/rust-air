@@ -1,0 +1,8 @@
+{
+  "default_commands": [
+    "cargo test",
+    "cargo check",
+    "pnpm build"
+  ],
+  "notes": "rust-air project standard: proactively use the rust-air-iteration skill for sync, updater, release, Windows installer, Tauri GUI, CLI, performance, and UX work. Treat local mirror sync and two-device sync as separate semantics. Verify version alignment and release asset naming for release-related work."
+}
