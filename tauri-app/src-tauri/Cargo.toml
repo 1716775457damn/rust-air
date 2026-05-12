@@ -35,6 +35,8 @@ regex              = "1"
 hex                = "0.4"
 unicode-normalization = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
 
 # Desktop-only (optional)
 arboard            = { version = "3", optional = true }

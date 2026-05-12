@@ -5,9 +5,12 @@ use rust_air_core::{
     default_excludes, fmt_bytes, full_sync, start_watcher,
     SyncAction, SyncConfig, SyncEvent, SyncManifestEntry, SyncStore,
 };
+use chrono::Local;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    io::Read,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -177,6 +180,14 @@ pub async fn start_remote_sync(
         state.running.store(false, Ordering::Release);
         return Err("source directory must be set".into());
     }
+    if remote_addr.trim().is_empty() {
+        state.running.store(false, Ordering::Release);
+        return Err("remote device address must be set".into());
+    }
+    if callback_addr.trim().is_empty() {
+        state.running.store(false, Ordering::Release);
+        return Err("local callback address is unavailable".into());
+    }
 
     let src = PathBuf::from(&config.src);
     let excludes = config.excludes.clone();
@@ -309,9 +320,38 @@ pub fn handle_received_sync_file(
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::copy(temp_path, &dst).map_err(|e| e.to_string())?;
+    let copied = std::fs::copy(temp_path, &dst).map_err(|e| e.to_string())?;
+
+    // Update persisted sync state so UI status reflects cross-device sync results.
+    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let hash = hash_file_local(&dst).map_err(|e| e.to_string())?;
+    store.state.files.insert(rel.to_string(), rust_air_core::sync_vault::FileRecord {
+        hash,
+        size: copied,
+        modified: Local::now(),
+    });
+    store.state.total_synced += 1;
+    store.state.total_bytes += copied;
+    store.state.last_sync = Some(Local::now());
+    store.mark_dirty();
+    store.flush_now();
+
     let _ = std::fs::remove_file(temp_path);
     Ok((request_id, rel.to_string(), dst))
+}
+
+fn hash_file_local(path: &std::path::Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex::encode(h.finalize()))
 }
 
 /// Run a full sync in a background thread.
