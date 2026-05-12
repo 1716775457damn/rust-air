@@ -1040,7 +1040,7 @@ function updateSyncConfigField(field: string, value: string | boolean) {
 
               <label class="flex items-center justify-between text-xs cursor-pointer"
                 style="color:var(--text-secondary)">
-                <span>发现新版本后自动在后台下载并安装</span>
+                <span>发现新版本后自动在后台下载并安装（Windows 仅 MSI）</span>
                 <input type="checkbox" v-model="updateSettings.auto_install"
                   @change="saveUpdateSettings" class="accent-cyan-500" />
               </label>
@@ -1071,6 +1071,9 @@ function updateSyncConfigField(field: string, value: string | boolean) {
                     {{ updateProgress ? '下载中…' : '立即安装' }}
                   </button>
                 </div>
+                <p class="text-xs" style="color:var(--text-faint)">
+                  {{ updateInfo.auto_install_supported ? '此更新支持后台自动安装。' : '此更新不支持后台自动安装，请下载 MSI 安装包手动升级。' }}
+                </p>
                 <p v-if="updateInfo.release_notes" class="text-xs leading-relaxed"
                   style="color:var(--text-muted)">{{ updateInfo.release_notes.split('\n').slice(0,3).join(' · ') }}</p>
                 <!-- Download progress -->

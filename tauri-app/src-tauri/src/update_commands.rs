@@ -116,6 +116,7 @@ pub struct UpdateInfo {
     pub url:          String,
     pub size:         u64,
     pub release_notes: String,
+    pub auto_install_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,10 +136,10 @@ struct GhRelease {
 }
 
 #[derive(Deserialize)]
-struct GhAsset {
-    name:                 String,
-    browser_download_url: String,
-    size:                 u64,
+pub struct GhAsset {
+    pub name:                 String,
+    pub browser_download_url: String,
+    pub size:                 u64,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -180,6 +181,7 @@ pub async fn check_update() -> Result<Option<UpdateInfo>, String> {
         url:          asset.browser_download_url.clone(),
         size:         asset.size,
         release_notes: release.body.unwrap_or_default(),
+        auto_install_supported: auto_install_supported_asset(asset),
     }))
 }
 
@@ -320,9 +322,9 @@ async fn fetch_latest_release_from_html(client: &reqwest::Client) -> anyhow::Res
 }
 
 /// Pick the right installer asset for the current platform.
-fn pick_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
+pub fn pick_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
     #[cfg(target_os = "windows")]
-    let preferred = &["_x64_en-US.msi", ".msi", "_x64-setup.exe"];
+    let preferred = &["_x64_en-US.msi", ".msi"];
     #[cfg(target_os = "macos")]
     let preferred: &[&str] = if cfg!(target_arch = "aarch64") {
         &["_aarch64.dmg", ".dmg"]
@@ -338,6 +340,18 @@ fn pick_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
         }
     }
     None
+}
+
+pub fn auto_install_supported_asset(asset: &GhAsset) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        asset.name.to_ascii_lowercase().ends_with(".msi")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = asset;
+        true
+    }
 }
 
 /// Simple semver comparison: returns true if `remote` > `local`.

@@ -89,7 +89,7 @@ pub fn run() {
                 // Small delay so the window is visible before any banner appears
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 if let Ok(Some(info)) = update_commands::check_update().await {
-                    if settings.auto_install {
+                    if settings.auto_install && info.auto_install_supported {
                         // Silent background install
                         let _ = update_commands::download_and_install(
                             info.url, info.size, app_handle

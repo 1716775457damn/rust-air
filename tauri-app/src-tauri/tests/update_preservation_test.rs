@@ -16,9 +16,11 @@
 
 use std::path::{Path, PathBuf};
 use tauri_app_lib::update_commands::{
+    auto_install_supported_asset,
     apply_download_proxy,
     expected_download_size,
     expected_installer_signature,
+    pick_asset,
     windows_installer_command,
 };
 
@@ -34,6 +36,13 @@ fn has_proxy_prefix(url: &str) -> bool {
 /// Extracts the original URL from proxied URL
 fn extract_original_url(proxied_url: &str) -> Option<&str> {
     proxied_url.strip_prefix("https://xgn.io/")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GhAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
 }
 
 /// Simulates macOS DMG installer command generation
@@ -150,6 +159,46 @@ mod download_proxy_tests {
         assert_eq!(expected_installer_signature("https://example.com/app.msi"), b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1");
         assert_eq!(expected_installer_signature("https://example.com/app.exe"), b"MZ");
         assert_eq!(expected_installer_signature("https://example.com/app.dmg"), b"");
+    }
+
+    #[test]
+    fn test_windows_pick_asset_prefers_msi_only() {
+        let assets = vec![
+            GhAsset {
+                name: "rust-air_0.3.53_x64-setup.exe".to_string(),
+                browser_download_url: "https://example.com/setup.exe".to_string(),
+                size: 10,
+            },
+            GhAsset {
+                name: "rust-air_0.3.53_x64_en-US.msi".to_string(),
+                browser_download_url: "https://example.com/app.msi".to_string(),
+                size: 10,
+            },
+        ];
+
+        let selected = pick_asset(unsafe { std::mem::transmute::<&Vec<GhAsset>, &Vec<tauri_app_lib::update_commands::GhAsset>>(&assets) });
+        assert!(selected.is_some());
+        assert!(selected.unwrap().browser_download_url.ends_with(".msi"));
+    }
+
+    #[test]
+    fn test_auto_install_supported_asset_is_msi_only_on_windows() {
+        let msi = GhAsset {
+            name: "rust-air_0.3.53_x64_en-US.msi".to_string(),
+            browser_download_url: "https://example.com/app.msi".to_string(),
+            size: 10,
+        };
+        let exe = GhAsset {
+            name: "rust-air_0.3.53_x64-setup.exe".to_string(),
+            browser_download_url: "https://example.com/setup.exe".to_string(),
+            size: 10,
+        };
+
+        let msi_ref = unsafe { std::mem::transmute::<&GhAsset, &tauri_app_lib::update_commands::GhAsset>(&msi) };
+        let exe_ref = unsafe { std::mem::transmute::<&GhAsset, &tauri_app_lib::update_commands::GhAsset>(&exe) };
+
+        assert!(auto_install_supported_asset(msi_ref));
+        assert!(!auto_install_supported_asset(exe_ref));
     }
 }
 
