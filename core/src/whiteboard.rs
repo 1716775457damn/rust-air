@@ -48,6 +48,7 @@ pub struct WhiteboardItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncOp {
     Add,
+    Update,
     Delete,
     Clear,
     Snapshot,
@@ -148,6 +149,24 @@ impl WhiteboardStore {
         true
     }
 
+    /// 更新现有文本条目。返回 true 表示成功更新，false 表示被较新版本拒绝或目标不存在。
+    pub fn update_text(&mut self, id: &str, text: String, timestamp: u64, source_device: String) -> bool {
+        if let Some(existing) = self.items.iter_mut().find(|i| i.id == id) {
+            if existing.timestamp > timestamp {
+                return false;
+            }
+            existing.content_type = WhiteboardContentType::Text;
+            existing.text = Some(text);
+            existing.image_b64 = None;
+            existing.timestamp = timestamp;
+            existing.source_device = source_device;
+            self.items.sort_by_key(|item| item.timestamp);
+            self.dirty = true;
+            return true;
+        }
+        false
+    }
+
     /// 按 UUID 删除条目，返回是否成功删除
     pub fn delete(&mut self, id: &str) -> bool {
         let len_before = self.items.len();
@@ -216,6 +235,20 @@ pub fn apply_sync_message(store: &mut WhiteboardStore, msg: WhiteboardSyncMessag
         SyncOp::Add => {
             if let Some(item) = msg.item {
                 store.add(item);
+            }
+        }
+        SyncOp::Update => {
+            if let Some(item) = msg.item {
+                if item.content_type == WhiteboardContentType::Text {
+                    store.update_text(
+                        &item.id,
+                        item.text.unwrap_or_default(),
+                        item.timestamp,
+                        item.source_device,
+                    );
+                } else {
+                    store.add(item);
+                }
             }
         }
         SyncOp::Delete => {
@@ -360,6 +393,33 @@ mod tests {
         assert!(store.add(make_text_item("id-1", "new", 2000)));
         assert_eq!(store.items.len(), 1);
         assert_eq!(store.items[0].text.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn test_update_text_newer_wins() {
+        let mut store = WhiteboardStore {
+            items: Vec::new(),
+            path: PathBuf::from("/tmp/test-wb.json"),
+            dirty: false,
+            last_save: Instant::now(),
+        };
+        store.add(make_text_item("id-1", "old", 1000));
+        assert!(store.update_text("id-1", "new".to_string(), 2000, "remote".to_string()));
+        assert_eq!(store.items[0].text.as_deref(), Some("new"));
+        assert_eq!(store.items[0].source_device, "remote");
+    }
+
+    #[test]
+    fn test_update_text_older_ignored() {
+        let mut store = WhiteboardStore {
+            items: Vec::new(),
+            path: PathBuf::from("/tmp/test-wb.json"),
+            dirty: false,
+            last_save: Instant::now(),
+        };
+        store.add(make_text_item("id-1", "current", 2000));
+        assert!(!store.update_text("id-1", "stale".to_string(), 1000, "remote".to_string()));
+        assert_eq!(store.items[0].text.as_deref(), Some("current"));
     }
 
     #[test]

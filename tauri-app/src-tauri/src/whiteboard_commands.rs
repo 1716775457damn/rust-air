@@ -114,6 +114,41 @@ pub async fn add_whiteboard_text(
     Ok(item)
 }
 
+/// Update an existing text item on the whiteboard.
+#[tauri::command]
+pub async fn update_whiteboard_text(
+    id: String,
+    text: String,
+    state: State<'_, WhiteboardState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let ts = now_millis();
+    let source = device_name();
+    let (items, devices, updated_item) = {
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !store.update_text(&id, text.clone(), ts, source.clone()) {
+            return Err("whiteboard text item not found or update is stale".to_string());
+        }
+        store.flush_now();
+        let items = store.snapshot();
+        let updated_item = items.iter().find(|item| item.id == id).cloned();
+        let devices = state.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        (items, devices, updated_item)
+    };
+
+    let msg = WhiteboardSyncMessage {
+        op: SyncOp::Update,
+        source_device: source,
+        timestamp: ts,
+        item: updated_item,
+        item_id: None,
+        items: None,
+    };
+
+    broadcast_and_emit(&msg, &devices, items, &app).await;
+    Ok(())
+}
+
 /// Add an image item to the whiteboard (Base64 encoded).
 #[tauri::command]
 pub async fn add_whiteboard_image(

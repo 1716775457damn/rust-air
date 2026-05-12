@@ -188,6 +188,8 @@ const {
 const whiteboardItems = ref<WhiteboardItem[]>([]);
 const wbTextInput     = ref("");
 const wbClearConfirm  = ref(false);
+const wbEditingId     = ref<string | null>(null);
+const wbEditingText   = ref("");
 
 // Toast notifications (Task 10.4)
 const toasts = ref<{ id: number; kind: string; message: string; device?: string }[]>([]);
@@ -437,6 +439,27 @@ async function addWbText() {
     await invoke<WhiteboardItem>("add_whiteboard_text", { text });
     wbTextInput.value = "";
   } catch (e: any) { console.error("addWbText:", e); }
+}
+
+function startWbEdit(item: WhiteboardItem) {
+  if (item.content_type !== 'Text' || !item.text) return;
+  wbEditingId.value = item.id;
+  wbEditingText.value = item.text;
+}
+
+function cancelWbEdit() {
+  wbEditingId.value = null;
+  wbEditingText.value = "";
+}
+
+async function saveWbEdit() {
+  const id = wbEditingId.value;
+  const text = wbEditingText.value.trim();
+  if (!id || !text) return;
+  try {
+    await invoke("update_whiteboard_text", { id, text });
+    cancelWbEdit();
+  } catch (e: any) { console.error("saveWbEdit:", e); }
 }
 
 async function addWbImage(b64: string) {
@@ -1060,9 +1083,31 @@ function updateSyncConfigField(field: string, value: string | boolean) {
                   <span class="flex-shrink-0 text-sm mt-0.5">{{ item.content_type === 'Image' ? '🖼️' : '📝' }}</span>
                   <div class="flex-1 min-w-0">
                     <!-- Text content -->
-                    <p v-if="item.content_type === 'Text' && item.text"
-                      class="text-sm whitespace-pre-wrap break-words"
-                      style="color:var(--text-primary)">{{ item.text }}</p>
+                    <div v-if="item.content_type === 'Text' && item.text" class="space-y-2">
+                      <textarea v-if="wbEditingId === item.id"
+                        v-model="wbEditingText"
+                        @keydown.ctrl.enter.prevent="saveWbEdit"
+                        @keydown.esc.prevent="cancelWbEdit"
+                        class="w-full min-h-24 rounded-lg px-3 py-2 text-sm focus:outline-none resize-y"
+                        style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)"></textarea>
+                      <p v-else
+                        @dblclick="startWbEdit(item)"
+                        class="text-sm whitespace-pre-wrap break-words cursor-text select-text"
+                        title="双击可编辑，文本可直接选择复制"
+                        style="color:var(--text-primary);user-select:text">{{ item.text }}</p>
+                      <div v-if="wbEditingId === item.id" class="flex items-center gap-2">
+                        <button @click="saveWbEdit"
+                          :disabled="!wbEditingText.trim()"
+                          :style="wbEditingText.trim()
+                            ? 'background:var(--accent);color:#fff'
+                            : 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'"
+                          class="px-3 py-1 rounded-lg text-xs font-medium transition-colors">保存</button>
+                        <button @click="cancelWbEdit"
+                          class="px-3 py-1 rounded-lg text-xs transition-colors"
+                          style="background:var(--bg-muted);color:var(--text-secondary)">取消</button>
+                        <span class="text-[11px]" style="color:var(--text-faint)">Ctrl+Enter 保存，Esc 取消</span>
+                      </div>
+                    </div>
                     <!-- Image content -->
                     <img v-if="item.content_type === 'Image' && item.image_b64"
                       :src="'data:image/png;base64,' + item.image_b64"

@@ -163,6 +163,7 @@ pub fn run() {
             // Whiteboard
             whiteboard_commands::get_whiteboard_items,
             whiteboard_commands::add_whiteboard_text,
+            whiteboard_commands::update_whiteboard_text,
             whiteboard_commands::add_whiteboard_image,
             whiteboard_commands::delete_whiteboard_item,
             whiteboard_commands::clear_whiteboard,
