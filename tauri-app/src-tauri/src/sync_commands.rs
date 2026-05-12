@@ -195,6 +195,10 @@ pub async fn start_remote_sync(
         state.running.store(false, Ordering::Release);
         return Err("local callback address is unavailable".into());
     }
+    if remote_addr.trim() == callback_addr.trim() {
+        state.running.store(false, Ordering::Release);
+        return Err("remote device address cannot be the same as local callback address".into());
+    }
 
     let src = PathBuf::from(&config.src);
     let excludes = config.excludes.clone();
@@ -228,10 +232,13 @@ pub async fn start_remote_sync(
     }
 
     let mut pull_waiters = Vec::new();
+    let mut push_count = 0usize;
+    let mut pull_count = 0usize;
     let mut had_error = false;
     for action in &actions {
         match action {
             SyncAction::PushToRemote(entry) => {
+                push_count += 1;
                 app.emit("sync-event", SyncEvent::Info {
                     msg: format!("⇢ 推送到远端: {}", entry.rel),
                 }).ok();
@@ -253,6 +260,7 @@ pub async fn start_remote_sync(
                 app.emit("sync-event", SyncEvent::Copied { rel: format!("⇢ 已推送: {}", entry.rel), bytes: entry.size }).ok();
             }
             SyncAction::PullFromRemote(entry) => {
+                pull_count += 1;
                 app.emit("sync-event", SyncEvent::Info {
                     msg: format!("⇠ 请求远端文件: {}", entry.rel),
                 }).ok();
@@ -299,7 +307,7 @@ pub async fn start_remote_sync(
 
     if !had_error {
         app.emit("sync-event", SyncEvent::Info {
-            msg: "双端同步执行完成".to_string(),
+            msg: format!("双端同步执行完成：推送 {} 个，拉取 {} 个", push_count, pull_count),
         }).ok();
     }
     app.emit("sync-done", ()).ok();
@@ -456,6 +464,24 @@ mod tests {
         assert_eq!(final_path, sync_root.path().join("subdir").join("file.txt"));
         assert!(final_path.exists());
         assert_eq!(fs::read(&final_path).unwrap(), b"hello-sync");
+    }
+
+    #[test]
+    fn test_handle_sync_file_error_resolves_waiter() {
+        let state = SyncState::new();
+        let rx = state.register_pending_remote_file("req-err".to_string());
+
+        let msg = RemoteSyncFileError {
+            request_id: "req-err".to_string(),
+            rel: "subdir/file.txt".to_string(),
+            err: "not found".to_string(),
+        };
+        let bytes = serde_json::to_vec(&msg).unwrap();
+        handle_sync_file_error(&bytes, &state).unwrap();
+
+        let result = rx.blocking_recv().expect("pending file waiter should resolve");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("subdir/file.txt"));
     }
 }
 
