@@ -141,10 +141,10 @@ const emit = defineEmits<{
         <input type="checkbox" :checked="syncConfig.delete_removed" @change="emit('updateConfig', 'delete_removed', ($event.target as HTMLInputElement).checked)" class="accent-cyan-500" />删除已移除的文件
       </label>
       <p class="text-[11px]" style="color:var(--text-faint)">
-        “开启自动同步”仅用于本机把“源目录”实时镜像到“本地镜像目标目录”，不负责双机持续同步。
+        “开始本地同步”会立即同步到本地镜像目录；“开启本地自动镜像”会持续监听本机目录变化。
       </p>
       <p class="text-[11px]" style="color:var(--text-faint)">
-        双机目录同步：两台机器都先选择各自的“源目录”，再在任意一台填写对端地址并点击“首次完全同步”。
+        双机目录同步：两台机器都先选择各自的“源目录”，再在任意一台填写对端地址并点击“开始双机同步”。
       </p>
       <p class="text-[11px]" style="color:var(--text-faint)">
         完全同步默认以最新修改为准。开启删除同步后，较新的删除操作也会同步到另一台设备。
@@ -176,14 +176,14 @@ const emit = defineEmits<{
           ? `background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed`
           : `background:var(--accent);color:#fff`"
         class="flex-1 py-2 rounded-lg text-sm font-medium transition-colors">
-        {{ syncStatus.is_running ? '同步中…' : '🔄 同步到本地镜像' }}
+        {{ syncStatus.is_running ? '同步中…' : '🔄 开始本地同步' }}
       </button>
       <button @click="emit('remoteSync')" :disabled="syncStatus.is_running || !syncConfig.remote_addr"
         :style="syncStatus.is_running || !syncConfig.remote_addr
           ? 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'
           : 'background:#2563eb;color:#fff'"
         class="px-4 py-2 rounded-lg text-sm transition-colors">
-        首次完全同步
+        开始双机同步
       </button>
       <button @click="emit('toggleWatch')"
         :style="syncStatus.is_watching
