@@ -13,6 +13,7 @@
 //! **Validates: Requirements 2.1, 2.2**
 
 use std::path::{Path, PathBuf};
+use tauri_app_lib::update_commands::windows_installer_command;
 
 /// Represents the context for installer launch
 #[derive(Debug, Clone)]
@@ -24,14 +25,8 @@ pub struct InstallerLaunchContext {
 }
 
 /// Generates the MSI command string for testing purposes.
-/// This function mirrors the logic in launch_installer to allow testing.
 fn generate_msi_command(path: &Path) -> String {
-    let msi_path = path.to_string_lossy().to_string();
-    // This is the FIXED implementation (matching update_commands.rs)
-    format!(
-        "ping -n 5 127.0.0.1 >nul & start \"\" msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
-        msi_path
-    )
+    windows_installer_command(path)
 }
 
 /// Generates the expected FIXED MSI command string.
@@ -39,7 +34,7 @@ fn generate_expected_msi_command(path: &Path) -> String {
     let msi_path = path.to_string_lossy().to_string();
     // This is the EXPECTED (fixed) implementation
     format!(
-        "ping -n 5 127.0.0.1 >nul & start \"\" msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
+        "ping -n 5 127.0.0.1 >nul & msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
         msi_path
     )
 }
@@ -232,10 +227,10 @@ mod tests {
 // =============================================================================
 
 // FIXED BEHAVIOR (after fix):
-// Command: ping -n 5 127.0.0.1 >nul & start "" msiexec /i "path" /qb REINSTALL=ALL REINSTALLMODE=vomus
+// Command: ping -n 5 127.0.0.1 >nul & msiexec /i "path" /qb REINSTALL=ALL REINSTALLMODE=vomus
 //
 // PREVIOUS BUGGY BEHAVIOR:
-// Command: ping -n 3 127.0.0.1 >nul & start "" msiexec /i "path" /qb REINSTALLMODE=omus
+// Command: ping -n 3 127.0.0.1 >nul & msiexec /i "path" /qb REINSTALLMODE=omus
 //
 // FIXES APPLIED:
 // 1. REINSTALLMODE: Changed from "omus" to "vomus" - added 'v' flag

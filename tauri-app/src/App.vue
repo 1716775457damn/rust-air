@@ -2,39 +2,38 @@
 import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 import { platform } from "@tauri-apps/plugin-os";
+import { useSearch } from "./composables/useSearch";
+import { useDevices } from "./composables/useDevices";
+import { useClipboardSync } from "./composables/useClipboardSync";
+import DevicesPanel from "./components/DevicesPanel.vue";
+import SearchPanel from "./components/SearchPanel.vue";
+import SyncPanel from "./components/SyncPanel.vue";
+import { useSync } from "./composables/useSync";
+import { useTransfer } from "./composables/useTransfer";
+import { useUpdate } from "./composables/useUpdate";
+import {
+  todayStr,
+} from "./utils/transfer";
+import type {
+  CalendarDay,
+  ClipEntryView,
+  ClipSyncError,
+  ClipSyncReceived,
+  Device,
+  FileResult,
+  SearchEvent,
+  SyncEventPayload,
+  Tab,
+  TodoItem,
+  TransferEvent,
+  UpdateInfo,
+  UpdateProgress,
+  WhiteboardError,
+  WhiteboardItem,
+} from "./types/app";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-
-interface Device { name: string; addr: string; status: "Idle" | "Busy"; lastSeen?: number }
-interface TransferEvent { bytes_done: number; total_bytes: number; bytes_per_sec: number; done: boolean; resumed?: boolean; resume_offset?: number; reconnect_info?: { attempt: number; max_attempts: number }; error?: string }
-interface MatchLine { line_num: number; line: string; ranges: [number,number][] }
-interface FileResult { path: string; icon: string; matches: MatchLine[] }
-interface SearchEvent { kind: string; path?: string; icon?: string; matches?: MatchLine[]; ms?: number; total?: number; msg?: string }
-interface SyncConfig { src: string; dst: string; delete_removed: boolean; excludes: string[]; auto_watch: boolean }
-interface SyncStatus { last_sync: string | null; total_files: number; total_bytes: string; is_running: boolean; is_watching: boolean }
-interface SyncEventPayload { kind: string; rel?: string; bytes?: number; err?: string; scanned?: number; total?: number; total_files?: number; total_bytes?: number }
-
-interface UpdateInfo { version: string; url: string; size: number; release_notes: string }
-interface UpdateProgress { downloaded: number; total: number; done: boolean }
-interface UpdateSettings { auto_check: boolean; auto_install: boolean }
-
-interface TodoItem { id: number; title: string; date: string; completed: boolean }
-
-// Shared clipboard sync types (Task 10.1)
-interface SyncGroupConfig { enabled: boolean; peers: SyncPeer[] }
-interface SyncPeer { device_name: string; addr: string; last_seen: number; online: boolean }
-interface ClipSyncError { kind: string; message: string; device?: string }
-interface ClipSyncReceived { source_device: string; content_type: string }
-interface ClipEntryView { id: number; kind: string; preview: string; stats: string; time_str: string; pinned: boolean; char_count: number; image_b64?: string; source_device?: string }
-
-// Shared whiteboard types
-interface WhiteboardItem { id: string; content_type: "Text" | "Image"; text?: string; image_b64?: string; timestamp: number; source_device: string }
-interface WhiteboardError { kind: string; message: string; device?: string }
-
-type Tab   = "send" | "receive" | "devices" | "search" | "sync" | "todo" | "whiteboard" | "settings";
-type Phase = "idle" | "transferring" | "done" | "error";
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -52,72 +51,117 @@ function toggleTheme() {
 }
 
 // Send
-const sendPhase    = ref<Phase>("idle");
-const sendError    = ref("");
-const sendProgress = ref<TransferEvent>({ bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false });
-const sendPeer     = ref("");
-const selectedPath = ref("");
-const dragOver     = ref(false);
-const sendStartTime = ref(0);
-
-// Receive
-const recvPhase    = ref<Phase>("idle");
-const recvError    = ref("");
-const recvProgress = ref<TransferEvent>({ bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false });
-const recvPeer     = ref("");
-const savedPath    = ref("");
-const recvHistory  = ref<{peer: string; path: string; bytes: number}[]>([]);
-
-// Sender-side reconnect state (reconnection is sender-initiated)
-const sendReconnecting = ref(false);
-const sendReconnectAttempt = ref(0);
-const sendReconnectMax = ref(5);
+const {
+  sendPhase,
+  sendError,
+  sendProgress,
+  sendPeer,
+  selectedPath,
+  dragOver,
+  recvPhase,
+  recvError,
+  recvProgress,
+  recvPeer,
+  savedPath,
+  recvHistory,
+  sendReconnecting,
+  sendReconnectAttempt,
+  sendReconnectMax,
+  sendPct,
+  sendSpeed,
+  sendEta,
+  recvPct,
+  recvSpeed,
+  recvEta,
+  sendIndeterminate,
+  recvIndeterminate,
+  selectedName,
+  pickFile,
+  pickFolder,
+  onDrop,
+  sendToDevice,
+  resetSend,
+  retrySend,
+  resetRecv,
+  onSendProgress,
+  onSendPeerConnected,
+  onSendDone,
+  onSendError,
+  onRecvPeerConnected,
+  onRecvProgress,
+  onRecvDone,
+  onRecvError,
+} = useTransfer();
 
 // Devices
-const devices  = ref<Device[]>([]);
-const scanning = ref(false);
-const myPort   = ref(0);
+const {
+  devices,
+  scanning,
+  primaryIp,
+  ipCopied,
+  peersOnlyFor,
+  initListenerAndIps,
+  onDeviceFound,
+  startScan,
+  copyIp,
+  refreshIps,
+} = useDevices();
 
 // Search
-const searchPattern         = ref("");
-const searchPath            = ref(localStorage.getItem("searchPath") || "C:/");
-const searchMode            = ref<"filename"|"text">("filename");
-const searchIgnoreCase      = ref(true);
-const searchFixed           = ref(false);
-const searchResults         = ref<FileResult[]>([]);
-const searchStatus          = ref("就绪");
-const searchRunning         = ref(false);
-const searchFilter          = ref("");
-const searchFilterDebounced = ref("");
-let   searchFilterTimer: ReturnType<typeof setTimeout> | null = null;
-function onSearchFilterInput(v: string) {
-  searchFilter.value = v;
-  if (searchFilterTimer) clearTimeout(searchFilterTimer);
-  searchFilterTimer = setTimeout(() => { searchFilterDebounced.value = v; }, 150);
-}
+const {
+  searchPattern,
+  searchPath,
+  searchMode,
+  searchIgnoreCase,
+  searchFixed,
+  searchResults,
+  searchStatus,
+  searchRunning,
+  searchFilter,
+  filteredResults,
+  onSearchFilterInput,
+  cachedHighlight,
+  onSearchBatch,
+  onSearchResult,
+  doSearch,
+  stopSearch,
+  pickSearchPath,
+  revealInFolder,
+  cancelSearchOnUnmount,
+} = useSearch();
 
 // Sync
-const syncConfig       = ref<SyncConfig>({ src: "", dst: "", delete_removed: false, excludes: [], auto_watch: false });
-const syncStatus       = ref<SyncStatus>({ last_sync: null, total_files: 0, total_bytes: "0 B", is_running: false, is_watching: false });
-const syncLog          = ref<string[]>([]);
-const syncExcludeInput = ref("");
-
-// IP
-const localIps  = ref<string[]>([]);
-const primaryIp = computed(() => localIps.value[0] ?? "");
-const ipCopied  = ref(false);
+const {
+  syncConfig,
+  syncStatus,
+  syncLog,
+  syncExcludeInput,
+  loadInitialSyncState,
+  onSyncEvent,
+  onSyncDone,
+  pickSyncSrc,
+  pickSyncDst,
+  saveAndSync,
+  toggleWatch,
+  addExclude,
+  removeExclude,
+} = useSync(fmtBytes);
 
 // Update
-const updateInfo     = ref<UpdateInfo | null>(null);
-const updateProgress = ref<UpdateProgress | null>(null);
-const updateChecking = ref(false);
-const updateSettings = ref<UpdateSettings>({ auto_check: true, auto_install: false });
+const {
+  updateInfo,
+  updateProgress,
+  updateChecking,
+  updateSettings,
+  loadInitialUpdateState,
+  onUpdateAvailable,
+  onUpdateProgress,
+  manualCheckUpdate,
+  startInstall,
+  saveUpdateSettings,
+} = useUpdate(showToast);
 
 // Todo
-function todayStr(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-}
 const selectedDate   = ref<string>(todayStr());
 const calendarYear   = ref(new Date().getFullYear());
 const calendarMonth  = ref(new Date().getMonth() + 1);
@@ -126,9 +170,18 @@ const todoDates      = ref<string[]>([]);
 const newTodoTitle   = ref("");
 
 // Clipboard Sync (Task 10.1)
-const clipSyncEnabled = ref(false);
-const syncGroupConfig = ref<SyncGroupConfig>({ enabled: false, peers: [] });
-const clipEntries     = ref<ClipEntryView[]>([]);
+const {
+  clipSyncEnabled,
+  syncGroupConfig,
+  clipEntries,
+  loadInitialClipboardSyncState,
+  onClipUpdate,
+  onClipSyncError,
+  onClipSyncReceived,
+  toggleClipSync,
+  isPeerInSyncGroup,
+  toggleSyncPeer,
+} = useClipboardSync(showToast);
 
 // Whiteboard
 const whiteboardItems = ref<WhiteboardItem[]>([]);
@@ -148,56 +201,9 @@ const unlisten = ref<UnlistenFn[]>([]);
 
 // ── Computed ──────────────────────────────────────────────────────────────────
 
-function makePct(p: TransferEvent) {
-  if (!p.total_bytes) return null;
-  return Math.min(100, Math.round((p.bytes_done / p.total_bytes) * 100));
-}
-function makeSpeed(p: TransferEvent) {
-  const bps = p.bytes_per_sec;
-  if (bps > 1_000_000) return `${(bps/1_000_000).toFixed(1)} MB/s`;
-  if (bps > 1_000)     return `${(bps/1_000).toFixed(0)} KB/s`;
-  return `${bps} B/s`;
-}
-function makeEta(p: TransferEvent): string {
-  if (!p.total_bytes || !p.bytes_per_sec || p.bytes_done >= p.total_bytes) return "";
-  const secs = Math.ceil((p.total_bytes - p.bytes_done) / p.bytes_per_sec);
-  if (secs < 60)   return `${secs}s`;
-  if (secs < 3600) return `${Math.floor(secs/60)}m${secs%60}s`;
-  return `${Math.floor(secs/3600)}h${Math.floor((secs%3600)/60)}m`;
-}
-
-const sendPct   = computed(() => makePct(sendProgress.value));
-const sendSpeed = computed(() => makeSpeed(sendProgress.value));
-const sendEta   = computed(() => makeEta(sendProgress.value));
-const recvPct   = computed(() => makePct(recvProgress.value));
-const recvSpeed = computed(() => makeSpeed(recvProgress.value));
-const recvEta   = computed(() => makeEta(recvProgress.value));
-
-const sendIndeterminate = computed(() => sendPhase.value === "transferring" && !sendProgress.value.total_bytes);
-const recvIndeterminate = computed(() => recvPhase.value === "transferring" && !recvProgress.value.total_bytes);
-
-const peersOnly = computed(() =>
-  devices.value.filter(d => d.addr && !d.addr.startsWith(primaryIp.value + ":"))
-);
-
-const selectedName = computed(() => selectedPath.value.split(/[\/\\]/).pop() ?? selectedPath.value);
-
-const filteredResults = computed(() => {
-  const q = searchFilterDebounced.value.trim().toLowerCase();
-  return q ? searchResults.value.filter(r => r.path.toLowerCase().includes(q)) : searchResults.value;
-});
-
-const hlCache = new Map<string, { text: string; hl: boolean }[]>();
-function cachedHighlight(path: string, lineNum: number, line: string, ranges: [number,number][]) {
-  const key = `${path}:${lineNum}`;
-  if (!hlCache.has(key)) hlCache.set(key, highlightSegments(line, ranges));
-  return hlCache.get(key)!;
-}
-watch(searchResults, () => hlCache.clear());
+const peersOnly = computed(() => peersOnlyFor(primaryIp.value));
 
 // ── Calendar computed ─────────────────────────────────────────────────────────
-
-interface CalendarDay { day: number; current: boolean; dateStr: string }
 
 const calendarDays = computed<CalendarDay[]>(() => {
   const y = calendarYear.value;
@@ -253,111 +259,67 @@ onMounted(async () => {
     isAndroid.value = (p === "android");
   } catch (_) { /* fallback: assume desktop */ }
 
-  myPort.value    = await invoke<number>("start_listener");
-  localIps.value  = await invoke<string[]>("get_local_ips");
+  await initListenerAndIps();
 
   window.addEventListener("keydown", onKeyDown);
 
   unlisten.value.push(
     await listen<TransferEvent>("send-progress", (e) => {
-      sendProgress.value = e.payload;
-      sendPhase.value = "transferring";
-      if (e.payload.reconnect_info) {
-        sendReconnecting.value = true;
-        sendReconnectAttempt.value = e.payload.reconnect_info.attempt;
-        sendReconnectMax.value = e.payload.reconnect_info.max_attempts;
-      } else {
-        sendReconnecting.value = false;
-      }
+      onSendProgress(e.payload);
     }),
     await listen<string>("send-peer-connected", (e) => {
-      sendPeer.value = e.payload;
-      sendStartTime.value = Date.now();
+      onSendPeerConnected(e.payload);
     }),
     await listen("send-done", () => {
-      sendPhase.value = "done";
-      setTimeout(() => { if (sendPhase.value === "done") resetSend(); }, 4000);
+      onSendDone();
     }),
-    await listen<string>("send-error", (e) => { sendError.value = e.payload; sendPhase.value = "error"; }),
+    await listen<string>("send-error", (e) => { onSendError(e.payload); }),
 
     await listen<string>("recv-peer-connected", (e) => {
-      recvPeer.value = e.payload;
-      recvPhase.value = "transferring";
+      onRecvPeerConnected(e.payload);
       tab.value = "receive";
     }),
     await listen<TransferEvent>("recv-progress", (e) => {
-      recvProgress.value = e.payload;
+      onRecvProgress(e.payload);
     }),
     await listen<string>("recv-done", (e) => {
-      savedPath.value = e.payload ?? "";
-      recvHistory.value.unshift({ peer: recvPeer.value, path: savedPath.value, bytes: recvProgress.value.bytes_done });
-      recvPhase.value = "done";
-      const filename = savedPath.value.split(/[\/\\]/).pop() ?? savedPath.value;
-      new Notification("rust-air — 文件已接收", { body: filename, silent: false });
+      onRecvDone(e.payload ?? "");
     }),
-    await listen<string>("recv-error", (e) => { recvError.value = e.payload; recvPhase.value = "error"; }),
+    await listen<string>("recv-error", (e) => { onRecvError(e.payload); }),
 
     await listen<Device>("device-found", (e) => {
-      const dev = { ...e.payload, lastSeen: Date.now() };
-      const idx = devices.value.findIndex(d => d.name === dev.name);
-      if (!dev.addr) { if (idx >= 0) devices.value.splice(idx, 1); }
-      else if (idx >= 0) { devices.value[idx] = dev; }
-      else { devices.value.push(dev); }
+      onDeviceFound(e.payload);
     }),
 
     await listen<SyncEventPayload>("sync-event", (e) => {
-      const ev = e.payload;
-      if (ev.kind === "Copied")
-        syncLog.value.unshift(`✅ ${ev.rel}  (${fmtBytes(ev.bytes ?? 0)})`);
-      else if (ev.kind === "Deleted")  syncLog.value.unshift(`🗑 ${ev.rel}`);
-      else if (ev.kind === "Error")    syncLog.value.unshift(`❌ ${ev.rel}: ${ev.err}`);
-      else if (ev.kind === "Progress") syncLog.value[0] = `⏳ 扫描中… ${ev.scanned} 个文件`;
-      else if (ev.kind === "Done") {
-        syncLog.value.unshift(`🎉 同步完成  共 ${ev.total_files} 个文件`);
-        invoke("sync_done").then(() => invoke<SyncStatus>("get_sync_status").then(s => syncStatus.value = s));
-      }
-      if (syncLog.value.length > 200) syncLog.value.length = 200;
+      onSyncEvent(e.payload);
     }),
     await listen("sync-done", async () => {
-      syncStatus.value = await invoke<SyncStatus>("get_sync_status");
+      await onSyncDone();
     }),
 
     await listen<FileResult[]>("search-batch", (e) => {
-      for (const r of e.payload) searchResults.value.push(r);
-      searchStatus.value = `搜索中… 已找到 ${searchResults.value.length} 个`;
+      onSearchBatch(e.payload);
     }),
     await listen<SearchEvent>("search-result", (e) => {
-      const ev = e.payload;
-      if (ev.kind === "Done") {
-        searchRunning.value = false;
-        searchStatus.value = searchResults.value.length === 0
-          ? `未找到结果 (${ev.ms}ms)` : `找到 ${ev.total} 个文件 (${ev.ms}ms)`;
-      } else if (ev.kind === "Error") {
-        searchRunning.value = false;
-        searchStatus.value = `错误: ${ev.msg}`;
-      }
+      onSearchResult(e.payload);
     }),
     await listen<UpdateInfo>("update-available", (e) => {
-      updateInfo.value = e.payload;
+      onUpdateAvailable(e.payload);
     }),
     await listen<UpdateProgress>("update-progress", (e) => {
-      updateProgress.value = e.payload;
+      onUpdateProgress(e.payload);
     }),
 
     // Clipboard sync events (Task 10.1 & 10.4)
     await listen<ClipEntryView[]>("clip-update", (e) => {
-      clipEntries.value = e.payload;
+      onClipUpdate(e.payload);
     }),
     await listen<ClipSyncError>("clip-sync-error", (e) => {
-      const err = e.payload;
-      const kindLabel = err.kind === "size_limit" ? "大小超限"
-        : err.kind === "transfer_failed" ? "传输失败"
-        : err.kind === "checksum_failed" ? "校验失败"
-        : err.kind;
-      showToast(err.kind, `${kindLabel}: ${err.message}`, err.device ?? undefined);
+      onClipSyncError(e.payload);
     }),
     await listen<ClipSyncReceived>("clip-sync-received", (e) => {
-      showToast("sync_received", `已接收来自 ${e.payload.source_device} 的剪贴板内容`);
+      onClipSyncReceived(e.payload);
     }),
 
     // Whiteboard events
@@ -372,18 +334,13 @@ onMounted(async () => {
 
   // Desktop-only: load sync config, status, excludes, and update settings
   if (!isAndroid.value) {
-    syncConfig.value = await invoke<SyncConfig>("get_sync_config");
-    syncStatus.value = await invoke<SyncStatus>("get_sync_status");
-    const defaultEx  = await invoke<string[]>("get_default_excludes");
-    if (syncConfig.value.excludes.length === 0) syncConfig.value.excludes = defaultEx;
-
-    updateSettings.value = await invoke<UpdateSettings>("get_update_settings");
+    await loadInitialSyncState();
+    await loadInitialUpdateState();
   }
 
   // Load clipboard sync state (Task 10.1)
   try {
-    syncGroupConfig.value = await invoke<SyncGroupConfig>("get_sync_group");
-    clipSyncEnabled.value = syncGroupConfig.value.enabled;
+    await loadInitialClipboardSyncState();
   } catch (_) { /* sync commands may not be registered yet */ }
 
   // Load initial todo data
@@ -394,7 +351,7 @@ onMounted(async () => {
   if (!isAndroid.value) {
     try { whiteboardItems.value = await invoke<WhiteboardItem[]>("get_whiteboard_items"); }
     catch (_) { /* whiteboard commands may not be registered yet */ }
-    setInterval(() => { invoke("flush_whiteboard").catch(() => {}); }, 3000);
+    _whiteboardFlushTimer = setInterval(() => { invoke("flush_whiteboard").catch(() => {}); }, 3000);
   }
 
   startScan();
@@ -403,7 +360,11 @@ onMounted(async () => {
 onUnmounted(async () => {
   window.removeEventListener("keydown", onKeyDown);
   unlisten.value.forEach(fn => fn());
-  await invoke("cancel_search").catch(() => {});
+  if (_whiteboardFlushTimer) {
+    clearInterval(_whiteboardFlushTimer);
+    _whiteboardFlushTimer = null;
+  }
+  await cancelSearchOnUnmount();
 });
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────────
@@ -414,162 +375,15 @@ function onKeyDown(e: KeyboardEvent) {
   if (TAB_KEYS[e.key]) { tab.value = TAB_KEYS[e.key]; e.preventDefault(); }
 }
 
-// ── Send ──────────────────────────────────────────────────────────────────────
+// ── Transfer moved to composable ──────────────────────────────────────────────
 
-async function pickFile()   { const r = await open({ multiple: false, directory: false }); if (r) selectedPath.value = r as string; }
-async function pickFolder() { const r = await open({ multiple: false, directory: true  }); if (r) selectedPath.value = r as string; }
-function onDrop(e: DragEvent) {
-  dragOver.value = false;
-  const f = e.dataTransfer?.files[0];
-  if (f) selectedPath.value = (f as any).path ?? f.name;
-}
+// ── Devices moved to composable ────────────────────────────────────────────────
 
-async function sendToDevice(dev: Device) {
-  if (!selectedPath.value) return;
-  sendPhase.value = "transferring"; sendError.value = ""; sendPeer.value = dev.addr;
-  sendProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
-  try {
-    await invoke("send_to", { path: selectedPath.value, addr: dev.addr });
-  } catch (e: any) { sendError.value = String(e); sendPhase.value = "error"; }
-}
+// ── Search moved to composable ────────────────────────────────────────────────
 
-function resetSend() {
-  invoke("cancel_send").catch(() => {});
-  sendPhase.value = "idle"; sendPeer.value = ""; sendError.value = "";
-  sendProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
-  sendReconnecting.value = false; sendReconnectAttempt.value = 0;
-}
+// ── Sync / Update moved to composables ───────────────────────────────────────
 
-async function retrySend() {
-  sendPhase.value = "transferring"; sendError.value = "";
-  sendProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
-  try {
-    await invoke("retry_send");
-  } catch (e: any) { sendError.value = String(e); sendPhase.value = "error"; }
-}
-
-function resetRecv() {
-  recvPhase.value = "idle"; recvPeer.value = ""; recvError.value = ""; savedPath.value = "";
-  recvProgress.value = { bytes_done: 0, total_bytes: 0, bytes_per_sec: 0, done: false };
-}
-
-// ── Devices ───────────────────────────────────────────────────────────────────
-
-async function startScan() {
-  scanning.value = true;
-  await invoke("scan_devices");
-  setTimeout(() => { scanning.value = false; }, 8000);
-}
-
-// ── Search ────────────────────────────────────────────────────────────────────
-
-async function doSearch() {
-  if (!searchPattern.value.trim()) return;
-  searchResults.value = []; searchRunning.value = true; searchStatus.value = "搜索中…";
-  try {
-    await invoke("start_search", {
-      pattern: searchPattern.value, path: searchPath.value,
-      ignoreCase: searchIgnoreCase.value, fixedString: searchFixed.value, mode: searchMode.value,
-    });
-  } catch (e: any) { searchRunning.value = false; searchStatus.value = `错误: ${e}`; }
-}
-async function stopSearch() {
-  await invoke("cancel_search").catch(() => {});
-  searchRunning.value = false; searchStatus.value = "已取消";
-}
-async function pickSearchPath() {
-  const r = await open({ multiple: false, directory: true });
-  if (r) {
-    searchPath.value = r as string;
-    localStorage.setItem("searchPath", searchPath.value);
-  }
-}
-
-async function openPath(p: string) { await invoke("open_path", { path: p }).catch(() => {}); }
-async function revealInFolder(p: string) {
-  const dir = p.replace(/[\/\\][^\/\\]+$/, "") || p;
-  await openPath(dir);
-}
-
-// ── Sync ──────────────────────────────────────────────────────────────────────
-
-async function pickSyncSrc() { const r = await open({ multiple: false, directory: true }); if (r) syncConfig.value.src = r as string; }
-async function pickSyncDst() { const r = await open({ multiple: false, directory: true }); if (r) syncConfig.value.dst = r as string; }
-async function saveAndSync() {
-  await invoke("save_sync_config", { config: syncConfig.value });
-  syncLog.value = []; syncStatus.value.is_running = true;
-  await invoke("start_sync").catch((e: any) => { syncLog.value.unshift(`❌ ${e}`); syncStatus.value.is_running = false; });
-}
-async function toggleWatch() {
-  if (syncStatus.value.is_watching) {
-    await invoke("stop_watch"); syncStatus.value.is_watching = false;
-  } else {
-    await invoke("save_sync_config", { config: syncConfig.value });
-    await invoke("start_watch").catch((e: any) => syncLog.value.unshift(`❌ ${e}`));
-    syncStatus.value.is_watching = true;
-  }
-}
-function addExclude() {
-  const v = syncExcludeInput.value.trim();
-  if (v && !syncConfig.value.excludes.includes(v)) syncConfig.value.excludes.push(v);
-  syncExcludeInput.value = "";
-}
-function removeExclude(i: number) { syncConfig.value.excludes.splice(i, 1); }
-
-// ── Update ───────────────────────────────────────────────────────────────────
-
-async function manualCheckUpdate() {
-  updateChecking.value = true;
-  try {
-    const info = await invoke<UpdateInfo | null>("check_update");
-    if (info) updateInfo.value = info;
-    else alert("已是最新版本 ✅");
-  } catch (e: any) {
-    alert(`检查更新失败: ${e}`);
-  } finally {
-    updateChecking.value = false;
-  }
-}
-
-async function startInstall() {
-  if (!updateInfo.value) return;
-  updateProgress.value = { downloaded: 0, total: updateInfo.value.size, done: false };
-  try {
-    await invoke("download_and_install", { url: updateInfo.value.url, size: updateInfo.value.size });
-  } catch (e: any) {
-    updateProgress.value = null;
-    alert(`更新失败: ${e}`);
-  }
-}
-
-async function saveUpdateSettings() {
-  await invoke("save_update_settings", { settings: updateSettings.value });
-}
-
-// ── Clipboard Sync IPC (Task 10.2) ──────────────────────────────────────────
-
-async function toggleClipSync(enabled: boolean) {
-  clipSyncEnabled.value = enabled;
-  try {
-    await invoke("set_clip_sync_enabled", { enabled });
-    syncGroupConfig.value = await invoke<SyncGroupConfig>("get_sync_group");
-  } catch (e: any) { console.error("toggleClipSync:", e); }
-}
-
-function isPeerInSyncGroup(deviceName: string): boolean {
-  return syncGroupConfig.value.peers.some(p => p.device_name === deviceName);
-}
-
-async function toggleSyncPeer(dev: Device) {
-  try {
-    if (isPeerInSyncGroup(dev.name)) {
-      await invoke("remove_sync_peer", { deviceName: dev.name });
-    } else {
-      await invoke("add_sync_peer", { deviceName: dev.name, addr: dev.addr });
-    }
-    syncGroupConfig.value = await invoke<SyncGroupConfig>("get_sync_group");
-  } catch (e: any) { console.error("toggleSyncPeer:", e); }
-}
+// ── Clipboard Sync moved to composable ────────────────────────────────────────
 
 // ── Todo IPC ─────────────────────────────────────────────────────────────────
 
@@ -673,18 +487,7 @@ function fmtWbTime(ts: number): string {
   return `${MM}-${DD} ${hh}:${mm}`;
 }
 
-// ── IP ────────────────────────────────────────────────────────────────────────
-
-async function copyIp() {
-  const addr = primaryIp.value; if (!addr) return;
-  if (isAndroid.value) {
-    await navigator.clipboard?.writeText(addr).catch(() => {});
-  } else {
-    await invoke("write_clipboard", { text: addr }).catch(() => navigator.clipboard?.writeText(addr).catch(() => {}));
-  }
-  ipCopied.value = true; setTimeout(() => { ipCopied.value = false; }, 1500);
-}
-async function refreshIps() { localIps.value = await invoke<string[]>("get_local_ips"); }
+// ── IP moved to devices composable ────────────────────────────────────────────
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -698,6 +501,7 @@ function shortName(fullname: string) { return fullname.split(".")[0] ?? fullname
 
 const now = ref(Date.now());
 let _nowTimer: ReturnType<typeof setInterval>;
+let _whiteboardFlushTimer: ReturnType<typeof setInterval> | null = null;
 onMounted(() => { _nowTimer = setInterval(() => { now.value = Date.now(); }, 10_000); });
 onUnmounted(() => clearInterval(_nowTimer));
 
@@ -710,17 +514,18 @@ function fmtLastSeen(ts?: number): string {
   return `${Math.floor(secs/3600)}h 前`;
 }
 
-function highlightSegments(line: string, ranges: [number,number][]) {
-  const chars = [...line];
-  const out: { text: string; hl: boolean }[] = [];
-  let pos = 0;
-  for (const [s, e] of ranges) {
-    if (s > pos) out.push({ text: chars.slice(pos, s).join(""), hl: false });
-    out.push({ text: chars.slice(s, e).join(""), hl: true });
-    pos = e;
-  }
-  if (pos < chars.length) out.push({ text: chars.slice(pos).join(""), hl: false });
-  return out;
+function updateSearchField(field: string, value: string | boolean) {
+  if (field === "searchPath") searchPath.value = value as string
+  else if (field === "searchMode") searchMode.value = value as "filename" | "text"
+  else if (field === "searchPattern") searchPattern.value = value as string
+  else if (field === "searchIgnoreCase") searchIgnoreCase.value = value as boolean
+  else if (field === "searchFixed") searchFixed.value = value as boolean
+}
+
+function updateSyncConfigField(field: string, value: string | boolean) {
+  if (field === "src") syncConfig.value.src = value as string
+  else if (field === "dst") syncConfig.value.dst = value as string
+  else if (field === "delete_removed") syncConfig.value.delete_removed = value as boolean
 }
 </script>
 
@@ -734,7 +539,7 @@ function highlightSegments(line: string, ranges: [number,number][]) {
       <span class="text-lg">✈️</span>
       <h1 class="text-sm font-bold tracking-wide" style="color:var(--text-primary)">rust-air</h1>
       <div class="flex-1"></div>
-      <button v-if="primaryIp" @click="copyIp"
+      <button v-if="primaryIp" @click="() => copyIp(isAndroid)"
         :style="ipCopied
           ? 'background:rgba(34,197,94,0.12);color:#86efac;box-shadow:0 0 0 1px rgba(34,197,94,0.25)'
           : 'background:var(--accent-bg);color:var(--accent);box-shadow:0 0 0 1px var(--accent-ring)'"
@@ -1057,229 +862,58 @@ function highlightSegments(line: string, ranges: [number,number][]) {
 
         <!-- DEVICES TAB -->
         <template v-else-if="tab === 'devices'">
-          <div class="flex-1 flex flex-col gap-4 max-w-lg mx-auto w-full">
-            <div class="flex items-center justify-between">
-              <h2 class="font-medium text-sm" style="color:var(--text-secondary)">局域网设备</h2>
-              <button @click="startScan"
-                :style="scanning ? `color:var(--accent);background:var(--bg-muted)` : `background:var(--bg-muted);color:var(--text-secondary)`"
-                :class="['px-3 py-1.5 rounded-lg text-xs transition-colors', scanning ? 'animate-pulse' : '']">
-                {{ scanning ? '扫描中…' : '🔄 扫描' }}
-              </button>
-            </div>
-
-            <!-- Clipboard sync global toggle (Task 10.2) -->
-            <div class="rounded-xl p-3 flex items-center justify-between"
-              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
-              <div class="flex items-center gap-2">
-                <span class="text-sm">📋</span>
-                <span class="text-xs" style="color:var(--text-secondary)">共享剪贴板</span>
-              </div>
-              <label class="relative inline-flex items-center cursor-pointer">
-                <input type="checkbox" :checked="clipSyncEnabled" @change="toggleClipSync(!clipSyncEnabled)" class="sr-only peer" />
-                <div class="w-9 h-5 rounded-full peer transition-colors duration-200"
-                  :style="clipSyncEnabled ? 'background:var(--accent)' : 'background:var(--border-input)'">
-                  <div class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full transition-transform duration-200 bg-white"
-                    :style="clipSyncEnabled ? 'transform:translateX(16px)' : ''"></div>
-                </div>
-              </label>
-            </div>
-
-            <div v-if="devices.length === 0" class="text-center py-12 text-sm" style="color:var(--text-faint)">未发现设备 — 点击扫描</div>
-            <div v-for="dev in devices" :key="dev.name"
-              class="rounded-xl p-3.5 flex items-center gap-4"
-              style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
-              <div class="w-3 h-3 rounded-full flex-shrink-0" style="background:#4ade80"></div>
-              <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-1.5">
-                  <p class="text-sm font-medium truncate" style="color:var(--text-primary)">{{ shortName(dev.name) }}</p>
-                  <span v-if="isPeerInSyncGroup(dev.name)" class="text-xs" title="已共享剪贴板">📋</span>
-                </div>
-                <p class="text-xs" style="color:var(--text-muted)">{{ dev.addr }}
-                  <span v-if="dev.lastSeen" class="ml-1" style="color:var(--text-faint)">· {{ fmtLastSeen(dev.lastSeen) }}</span>
-                </p>
-              </div>
-              <!-- Sync peer toggle button (Task 10.2) -->
-              <button @click.stop="toggleSyncPeer(dev)"
-                :title="isPeerInSyncGroup(dev.name) ? '取消共享剪贴板' : '共享剪贴板'"
-                :style="isPeerInSyncGroup(dev.name)
-                  ? 'background:var(--accent-bg);color:var(--accent);box-shadow:0 0 0 1px var(--accent-ring)'
-                  : 'background:var(--bg-muted);color:var(--text-muted)'"
-                class="px-2.5 py-1.5 rounded-lg text-xs transition-all flex-shrink-0">
-                {{ isPeerInSyncGroup(dev.name) ? '📋 已共享' : '📋 共享' }}
-              </button>
-            </div>
-          </div>
+          <DevicesPanel
+            :scanning="scanning"
+            :clip-sync-enabled="clipSyncEnabled"
+            :devices="devices"
+            :short-name="shortName"
+            :fmt-last-seen="fmtLastSeen"
+            :is-peer-in-sync-group="isPeerInSyncGroup"
+            @scan="startScan"
+            @toggle-clip-sync="toggleClipSync(!clipSyncEnabled)"
+            @toggle-sync-peer="toggleSyncPeer"
+          />
         </template>
 
         <!-- SEARCH TAB -->
         <template v-else-if="tab === 'search'">
-          <div class="flex-1 flex flex-col gap-3 min-h-0">
-            <!-- Controls -->
-            <div class="flex items-center gap-2 flex-shrink-0 flex-wrap">
-              <div class="flex items-center gap-1 flex-shrink-0">
-                <input v-model="searchPath" placeholder="搜索路径" :title="searchPath"
-                  class="w-44 rounded-lg px-2 py-1.5 text-xs focus:outline-none transition-colors"
-                  style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
-                <button @click="pickSearchPath"
-                  class="px-2 py-1.5 rounded-lg text-xs transition-colors"
-                  style="background:var(--bg-muted);color:var(--text-secondary)" title="选择目录">📂</button>
-              </div>
-              <select v-model="searchMode"
-                class="rounded-lg px-2 py-1.5 text-xs focus:outline-none flex-shrink-0"
-                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)">
-                <option value="filename">🗂 文件名</option>
-                <option value="text">📄 文本</option>
-              </select>
-              <input v-model="searchPattern" @keyup.enter="doSearch" placeholder="搜索内容…"
-                class="flex-1 min-w-[120px] rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
-                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
-              <label class="flex items-center gap-1 text-xs cursor-pointer flex-shrink-0" style="color:var(--text-secondary)">
-                <input type="checkbox" v-model="searchIgnoreCase" class="accent-cyan-500" />忽略大小写
-              </label>
-              <label class="flex items-center gap-1 text-xs cursor-pointer flex-shrink-0" style="color:var(--text-secondary)">
-                <input type="checkbox" v-model="searchFixed" class="accent-cyan-500" />纯文本
-              </label>
-              <button v-if="!searchRunning" @click="doSearch"
-                class="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex-shrink-0 text-white"
-                style="background:var(--accent)">🔍 搜索</button>
-              <button v-else @click="stopSearch"
-                class="px-3 py-1.5 rounded-lg text-xs transition-colors flex-shrink-0 text-white"
-                style="background:#b91c1c">⏹ 取消</button>
-            </div>
-            <!-- Status + filter -->
-            <div class="flex items-center gap-2 flex-shrink-0">
-              <span class="text-xs flex-1" style="color:var(--text-muted)">{{ searchStatus }}</span>
-              <input v-if="searchResults.length > 0" :value="searchFilter"
-                @input="onSearchFilterInput(($event.target as HTMLInputElement).value)"
-                placeholder="过滤结果…"
-                class="w-36 rounded-lg px-2 py-1 text-xs focus:outline-none transition-colors"
-                style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
-            </div>
-            <!-- Results -->
-            <div class="flex-1 overflow-y-auto space-y-1 pr-1 min-h-0">
-              <div v-if="filteredResults.length === 0 && !searchRunning"
-                class="text-center py-16 text-sm" style="color:var(--text-faint)">
-                {{ searchResults.length === 0 ? '输入内容后按回车搜索' : '无匹配结果' }}
-              </div>
-              <div v-for="r in filteredResults" :key="r.path"
-                class="rounded-xl p-3 group"
-                style="background:var(--bg-card);box-shadow:0 0 0 1px var(--border)">
-                <div class="flex items-center gap-2 mb-1">
-                  <span class="flex-shrink-0">{{ r.icon }}</span>
-                  <button @click="revealInFolder(r.path)"
-                    class="text-xs font-mono truncate flex-1 text-left hover:underline transition-colors"
-                    style="color:var(--accent)" :title="r.path">{{ r.path }}</button>
-                  <span class="text-xs flex-shrink-0" style="color:var(--text-faint)">{{ r.matches.length }} 处</span>
-                  <button @click="revealInFolder(r.path)"
-                    class="opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0 text-xs"
-                    style="color:var(--accent)" title="打开所在目录">📂</button>
-                </div>
-                <div v-if="searchMode === 'filename'" class="font-mono text-xs mt-0.5">
-                  <template v-for="seg in cachedHighlight(r.path, r.matches[0].line_num, r.matches[0].line, r.matches[0].ranges)" :key="seg.text">
-                    <span :style="seg.hl ? 'background:rgba(250,204,21,0.25);color:#fde68a;border-radius:2px;padding:0 2px' : `color:var(--text-secondary)`">{{ seg.text }}</span>
-                  </template>
-                </div>
-                <div v-else class="space-y-0.5 mt-1">
-                  <div v-for="(m, mi) in r.matches.slice(0, 5)" :key="mi" class="flex gap-2 font-mono text-xs">
-                    <span class="w-8 text-right flex-shrink-0" style="color:#4ade80">{{ m.line_num }}:</span>
-                    <span class="truncate">
-                      <template v-for="seg in cachedHighlight(r.path, m.line_num, m.line, m.ranges)" :key="seg.text">
-                        <span :style="seg.hl ? 'background:rgba(250,204,21,0.25);color:#fde68a;border-radius:2px;padding:0 2px' : `color:var(--text-secondary)`">{{ seg.text }}</span>
-                      </template>
-                    </span>
-                  </div>
-                  <div v-if="r.matches.length > 5" class="text-xs pl-10" style="color:var(--text-faint)">…另外 {{ r.matches.length - 5 }} 处</div>
-                </div>
-              </div>
-            </div>
-          </div>
+          <SearchPanel
+            :search-path="searchPath"
+            :search-mode="searchMode"
+            :search-pattern="searchPattern"
+            :search-ignore-case="searchIgnoreCase"
+            :search-fixed="searchFixed"
+            :search-running="searchRunning"
+            :search-status="searchStatus"
+            :search-results="searchResults"
+            :search-filter="searchFilter"
+            :filtered-results="filteredResults"
+            :cached-highlight="cachedHighlight"
+            @pick-path="pickSearchPath"
+            @search="doSearch"
+            @stop="stopSearch"
+            @filter-input="onSearchFilterInput"
+            @reveal="revealInFolder"
+            @update="updateSearchField"
+          />
         </template>
 
         <!-- SYNC TAB -->
         <template v-else-if="tab === 'sync'">
-          <div class="flex-1 flex flex-col gap-4 min-h-0 max-w-xl mx-auto w-full">
-            <!-- Status bar -->
-            <div class="flex items-center gap-3 rounded-xl px-4 py-2 text-xs flex-shrink-0"
-              style="background:var(--bg-card)">
-              <span :style="syncStatus.is_running ? 'color:#facc15' : 'color:#4ade80'"
-                :class="syncStatus.is_running ? 'animate-pulse' : ''">
-                {{ syncStatus.is_running ? '⏳ 同步中…' : '✅ 空闲' }}
-              </span>
-              <span style="color:var(--text-faint)">上次: {{ syncStatus.last_sync ?? '从未同步' }}</span>
-              <span style="color:var(--text-faint)">共 {{ syncStatus.total_files }} 个文件 / {{ syncStatus.total_bytes }}</span>
-              <span v-if="syncStatus.is_watching" class="ml-auto" style="color:var(--accent)">👁 监听中</span>
-            </div>
-            <!-- Config -->
-            <div class="space-y-3 flex-shrink-0">
-              <div class="flex gap-2 items-center">
-                <span class="text-xs w-8 flex-shrink-0" style="color:var(--text-muted)">源</span>
-                <input v-model="syncConfig.src" placeholder="源目录路径" :title="syncConfig.src"
-                  class="flex-1 rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
-                  style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
-                <button @click="pickSyncSrc"
-                  class="px-2 py-1.5 rounded-lg text-xs transition-colors flex-shrink-0"
-                  style="background:var(--bg-muted);color:var(--text-secondary)">📂</button>
-              </div>
-              <div class="flex gap-2 items-center">
-                <span class="text-xs w-8 flex-shrink-0" style="color:var(--text-muted)">目标</span>
-                <input v-model="syncConfig.dst" placeholder="目标目录路径" :title="syncConfig.dst"
-                  class="flex-1 rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
-                  style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
-                <button @click="pickSyncDst"
-                  class="px-2 py-1.5 rounded-lg text-xs transition-colors flex-shrink-0"
-                  style="background:var(--bg-muted);color:var(--text-secondary)">📂</button>
-              </div>
-              <label class="flex items-center gap-2 text-xs cursor-pointer" style="color:var(--text-secondary)">
-                <input type="checkbox" v-model="syncConfig.delete_removed" class="accent-cyan-500" />删除已移除的文件
-              </label>
-              <div class="space-y-1">
-                <p class="text-xs" style="color:var(--text-muted)">排除规则</p>
-                <div class="flex gap-2">
-                  <input v-model="syncExcludeInput" @keyup.enter="addExclude" placeholder="*.tmp 或 node_modules"
-                    class="flex-1 rounded-lg px-3 py-1 text-xs focus:outline-none transition-colors"
-                    style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
-                  <button @click="addExclude"
-                    class="px-2 py-1 rounded text-xs transition-colors"
-                    style="background:var(--bg-muted);color:var(--text-secondary)">+</button>
-                </div>
-                <div class="flex flex-wrap gap-1 mt-1">
-                  <span v-for="(ex, i) in syncConfig.excludes" :key="i"
-                    class="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full"
-                    style="background:var(--bg-muted);color:var(--text-secondary)">
-                    {{ ex }}
-                    <button @click="removeExclude(i)" class="leading-none" style="color:var(--text-muted)">×</button>
-                  </span>
-                </div>
-              </div>
-            </div>
-            <!-- Actions -->
-            <div class="flex gap-2 flex-shrink-0">
-              <button @click="saveAndSync" :disabled="syncStatus.is_running"
-                :style="syncStatus.is_running
-                  ? `background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed`
-                  : `background:var(--accent);color:#fff`"
-                class="flex-1 py-2 rounded-lg text-sm font-medium transition-colors">
-                {{ syncStatus.is_running ? '同步中…' : '🔄 立即同步' }}
-              </button>
-              <button @click="toggleWatch"
-                :style="syncStatus.is_watching
-                  ? 'background:#92400e;color:#fff'
-                  : `background:var(--bg-muted);color:var(--text-secondary)`"
-                class="px-4 py-2 rounded-lg text-sm transition-colors">
-                {{ syncStatus.is_watching ? '⏹ 停止监听' : '👁 实时监听' }}
-              </button>
-            </div>
-            <!-- Log -->
-            <div class="flex-1 overflow-y-auto rounded-xl p-3 font-mono text-xs space-y-0.5 min-h-0"
-              style="background:var(--bg-card)">
-              <div v-if="syncLog.length === 0" class="text-center py-4" style="color:var(--text-faint)">日志将在此显示</div>
-              <div v-for="(line, i) in syncLog" :key="i"
-                :style="line.startsWith('❌') ? 'color:#f87171' : line.startsWith('🗑') ? 'color:#facc15' : `color:var(--text-secondary)`"
-                class="leading-5">
-                {{ line }}
-              </div>
-            </div>
-          </div>
+          <SyncPanel
+            :sync-config="syncConfig"
+            :sync-status="syncStatus"
+            :sync-exclude-input="syncExcludeInput"
+            :sync-log="syncLog"
+            @pick-src="pickSyncSrc"
+            @pick-dst="pickSyncDst"
+            @save-and-sync="saveAndSync"
+            @toggle-watch="toggleWatch"
+            @add-exclude="addExclude"
+            @remove-exclude="removeExclude"
+            @update-config="updateSyncConfigField"
+            @update-exclude-input="(value) => (syncExcludeInput = value)"
+          />
         </template>
 
         <!-- TODO TAB -->

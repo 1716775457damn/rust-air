@@ -15,15 +15,15 @@
 //! **Validates: Requirements 3.1, 3.2, 3.3**
 
 use std::path::{Path, PathBuf};
+use tauri_app_lib::update_commands::{
+    apply_download_proxy,
+    expected_download_size,
+    windows_installer_command,
+};
 
 // =============================================================================
 // Helper Functions - Mirror of update_commands.rs logic for testing
 // =============================================================================
-
-/// Simulates download URL processing with proxy prefix
-fn apply_download_proxy(url: &str) -> String {
-    format!("https://xgn.io/{}", url)
-}
 
 /// Checks if URL has proxy prefix
 fn has_proxy_prefix(url: &str) -> bool {
@@ -54,16 +54,6 @@ fn generate_linux_appimage_commands(path: &Path) -> (String, String) {
     let chmod = format!("chmod 755 {}", path.to_string_lossy());
     let run = format!("{}", path.to_string_lossy());
     (chmod, run)
-}
-
-/// Simulates Windows EXE installer command generation
-fn generate_windows_exe_command(path: &Path) -> String {
-    // On Windows for .exe files: cmd /C ping -n 3 ... & start "" "path"
-    let exe_path = path.to_string_lossy().to_string();
-    format!(
-        "ping -n 3 127.0.0.1 >nul & start \"\" \"{}\"",
-        exe_path
-    )
 }
 
 /// UpdateSettings structure (mirrors update_commands.rs)
@@ -312,20 +302,20 @@ mod linux_appimage_tests {
 mod windows_exe_tests {
     use super::*;
     
-    /// Test that Windows EXE uses `start ""` command
+    /// Test that Windows EXE uses direct detached command execution
     ///
     /// **Validates: Requirements 3.3**
     ///
     /// This test verifies the Windows .exe installer launch mechanism.
     #[test]
-    fn test_windows_exe_uses_start_command() {
+    fn test_windows_exe_uses_direct_command() {
         let path = PathBuf::from("C:\\temp\\rust-air-0.3.43-x64-setup.exe");
-        let command = generate_windows_exe_command(&path);
+        let command = windows_installer_command(&path);
         
         println!("Windows EXE command: {}", command);
         
-        assert!(command.contains("start \"\""),
-            "Windows EXE command should contain 'start \"\"'");
+        assert!(!command.contains("start \"\""),
+            "Windows EXE command should no longer rely on cmd start indirection");
         
         assert!(command.contains("rust-air-0.3.43-x64-setup.exe"),
             "Windows EXE command should contain the file path");
@@ -337,7 +327,7 @@ mod windows_exe_tests {
     #[test]
     fn test_windows_exe_no_msi_flags() {
         let path = PathBuf::from("C:\\temp\\rust-air-0.3.43-x64-setup.exe");
-        let command = generate_windows_exe_command(&path);
+        let command = windows_installer_command(&path);
         
         // EXE installer should NOT have MSI-specific flags
         assert!(!command.contains("msiexec"),
@@ -354,7 +344,7 @@ mod windows_exe_tests {
     #[test]
     fn test_windows_exe_ping_delay_unchanged() {
         let path = PathBuf::from("C:\\temp\\rust-air-0.3.43-x64-setup.exe");
-        let command = generate_windows_exe_command(&path);
+        let command = windows_installer_command(&path);
         
         // Extract ping delay
         if let Some(start) = command.find("ping -n ") {
@@ -366,6 +356,12 @@ mod windows_exe_tests {
                     "Windows EXE ping delay should remain at 3 seconds (unchanged behavior)");
             }
         }
+    }
+
+    #[test]
+    fn test_expected_download_size_prefers_content_length() {
+        assert_eq!(expected_download_size(100, Some(120)), 120);
+        assert_eq!(expected_download_size(100, None), 100);
     }
 }
 
@@ -480,7 +476,7 @@ mod cross_platform_tests {
         let macos_cmd = generate_macos_dmg_command(&dmg_path);
         let linux_deb_cmd = generate_linux_deb_command(&deb_path);
         let (linux_appimage_chmod, linux_appimage_run) = generate_linux_appimage_commands(&appimage_path);
-        let windows_exe_cmd = generate_windows_exe_command(&exe_path);
+        let windows_exe_cmd = windows_installer_command(&exe_path);
         
         println!("macOS DMG: {}", macos_cmd);
         println!("Linux deb: {}", linux_deb_cmd);
@@ -525,9 +521,9 @@ mod cross_platform_tests {
         
         // Windows EXE
         let exe_path = PathBuf::from("C:\\temp\\rust-air-setup.exe");
-        let windows_cmd = generate_windows_exe_command(&exe_path);
-        assert!(windows_cmd.contains("start \"\""),
-            "Windows EXE should use 'start'");
+        let windows_cmd = windows_installer_command(&exe_path);
+        assert!(windows_cmd.starts_with("ping -n 3 127.0.0.1 >nul & \""),
+            "Windows EXE should use delayed detached execution");
     }
 }
 
@@ -550,8 +546,8 @@ mod cross_platform_tests {
 //    Behavior: Makes executable and runs directly
 //
 // 4. Windows EXE Installation:
-//    Command: ping -n 3 127.0.0.1 >nul & start "" "C:\path\to\file.exe"
-//    Behavior: Waits 3 seconds then launches NSIS installer
+//    Command: ping -n 3 127.0.0.1 >nul & "C:\path\to\file.exe"
+//    Behavior: Waits 3 seconds then launches installer directly from detached cmd
 //
 // 5. Download Proxy:
 //    URL: https://xgn.io/https://github.com/...

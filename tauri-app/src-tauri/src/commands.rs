@@ -17,7 +17,7 @@ use std::{path::PathBuf, sync::Mutex};
 #[cfg(feature = "desktop")]
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "desktop")]
@@ -33,7 +33,7 @@ pub struct AppState {
     /// mDNS / UDP self-registration handle (kept alive for the app lifetime).
     svc_handle:  Mutex<Option<ServiceHandle>>,
     /// Cancel token for the current outgoing send task.
-    send_cancel: Mutex<Option<oneshot::Sender<()>>>,
+    send_cancel: Mutex<Option<CancellationToken>>,
     /// Last send parameters (path, addr) for retry_send.
     last_send_params: Mutex<Option<(String, String)>>,
 }
@@ -52,12 +52,12 @@ impl AppState {
     pub fn set_svc(&self, h: ServiceHandle) {
         *self.svc_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
-    fn set_send_cancel(&self, tx: oneshot::Sender<()>) {
-        *self.send_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    fn set_send_cancel(&self, token: CancellationToken) {
+        *self.send_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
     }
     fn abort_send(&self) {
-        if let Some(tx) = self.send_cancel.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = tx.send(());
+        if let Some(token) = self.send_cancel.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            token.cancel();
         }
     }
     fn save_send_params(&self, path: &str, addr: &str) {
@@ -250,26 +250,30 @@ pub async fn send_to(
         return Err(format!("path not found: {}", path.display()));
     }
 
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    state.set_send_cancel(cancel_tx);
+    let cancel_token = CancellationToken::new();
+    state.set_send_cancel(cancel_token.clone());
 
     let app_clone = app.clone();
     tokio::spawn(async move {
-        tokio::select! {
-            _ = cancel_rx => {}
-            result = do_send(path, addr, app_clone.clone()) => {
-                match result {
-                    Ok(_)  => { app_clone.emit("send-done", "").ok(); }
-                    Err(e) => { app_clone.emit("send-error", e.to_string()).ok(); }
-                }
+        let result = do_send(path, addr, app_clone.clone(), cancel_token.clone()).await;
+        if cancel_token.is_cancelled() {
+            app_clone.emit("send-error", "transfer cancelled by user").ok();
+        } else {
+            match result {
+                Ok(_)  => { app_clone.emit("send-done", "").ok(); }
+                Err(e) => { app_clone.emit("send-error", e.to_string()).ok(); }
             }
         }
     });
     Ok(())
 }
 
-async fn do_send(path: PathBuf, addr: String, app: AppHandle) -> anyhow::Result<()> {
-    let cancel_token = CancellationToken::new();
+async fn do_send(
+    path: PathBuf,
+    addr: String,
+    app: AppHandle,
+    cancel_token: CancellationToken,
+) -> anyhow::Result<()> {
     let app2 = app.clone();
     transfer::send_path_with_retry(&addr, &path, move |ev| {
         app2.emit("send-progress", &ev).ok();

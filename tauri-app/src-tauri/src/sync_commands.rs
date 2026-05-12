@@ -7,7 +7,10 @@ use rust_air_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
 };
 use tauri::{AppHandle, Emitter, State};
@@ -17,9 +20,24 @@ use tauri::{AppHandle, Emitter, State};
 pub struct SyncState {
     store:   Mutex<SyncStore>,
     config:  Mutex<SyncConfig>,
-    /// Drop to stop the watcher
-    watcher: Mutex<Option<notify::RecommendedWatcher>>,
-    running: Arc<Mutex<bool>>,
+    watch_session: Mutex<Option<WatchSession>>,
+    running: Arc<AtomicBool>,
+}
+
+struct WatchSession {
+    watcher: notify::RecommendedWatcher,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl WatchSession {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Release);
+        drop(self.watcher);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl SyncState {
@@ -28,8 +46,8 @@ impl SyncState {
         Self {
             store:   Mutex::new(SyncStore::load()),
             config:  Mutex::new(config),
-            watcher: Mutex::new(None),
-            running: Arc::new(Mutex::new(false)),
+            watch_session: Mutex::new(None),
+            running: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -61,8 +79,8 @@ pub fn save_sync_config(config: SyncConfig, state: State<'_, SyncState>) {
 #[tauri::command]
 pub fn get_sync_status(state: State<'_, SyncState>) -> SyncStatus {
     let store   = state.store.lock().unwrap_or_else(|e| e.into_inner());
-    let running = *state.running.lock().unwrap_or_else(|e| e.into_inner());
-    let watching = state.watcher.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let running = state.running.load(Ordering::Relaxed);
+    let watching = state.watch_session.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     SyncStatus {
         last_sync:   store.state.last_sync.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
         total_files: store.state.total_synced,
@@ -81,15 +99,13 @@ pub fn get_default_excludes() -> Vec<String> {
 /// Progress events are emitted as "sync-event" to the frontend.
 #[tauri::command]
 pub async fn start_sync(state: State<'_, SyncState>, app: AppHandle) -> Result<(), String> {
-    {
-        let mut running = state.running.lock().unwrap_or_else(|e| e.into_inner());
-        if *running { return Err("sync already running".into()); }
-        *running = true;
+    if state.running.swap(true, Ordering::AcqRel) {
+        return Err("sync already running".into());
     }
 
     let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if config.src.is_empty() || config.dst.is_empty() {
-        *state.running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        state.running.store(false, Ordering::Release);
         return Err("source and destination must be set".into());
     }
 
@@ -119,7 +135,7 @@ pub async fn start_sync(state: State<'_, SyncState>, app: AppHandle) -> Result<(
         full_sync(&src, &dst, &mut store, delete, &excludes, &tx2);
         store.flush_now();
         drop(tx2);
-        *running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        running.store(false, Ordering::Release);
         app2.emit("sync-done", ()).ok();
     });
 
@@ -129,7 +145,7 @@ pub async fn start_sync(state: State<'_, SyncState>, app: AppHandle) -> Result<(
 /// Reset the running flag (called by frontend when it receives sync-done).
 #[tauri::command]
 pub fn sync_done(state: State<'_, SyncState>) {
-    *state.running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    state.running.store(false, Ordering::Release);
     // Reload store from disk to pick up changes made in the sync thread
     *state.store.lock().unwrap_or_else(|e| e.into_inner()) = SyncStore::load();
 }
@@ -141,20 +157,30 @@ pub fn start_watch(state: State<'_, SyncState>, app: AppHandle) -> Result<(), St
     if config.src.is_empty() || config.dst.is_empty() {
         return Err("source and destination must be set".into());
     }
+
+    if let Some(session) = state.watch_session.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        session.stop();
+    }
+
     let src = PathBuf::from(&config.src);
     let dst = PathBuf::from(&config.dst);
     let excludes = config.excludes.clone();
+    let stop = Arc::new(AtomicBool::new(false));
 
     let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
     let watcher  = start_watcher(src.clone(), tx).map_err(|e| e.to_string())?;
-    *state.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
 
     // Sync changed files in background
-    thread::spawn(move || {
+    let stop_worker = stop.clone();
+    let worker = thread::spawn(move || {
         let (ev_tx, ev_rx) = mpsc::channel::<SyncEvent>();
         let app2 = app.clone();
-        thread::spawn(move || {
+        let forward_stop = stop_worker.clone();
+        let forwarder = thread::spawn(move || {
             while let Ok(ev) = ev_rx.recv() {
+                if forward_stop.load(Ordering::Acquire) {
+                    break;
+                }
                 app2.emit("sync-event", &ev).ok();
             }
         });
@@ -162,11 +188,25 @@ pub fn start_watch(state: State<'_, SyncState>, app: AppHandle) -> Result<(), St
         // Build ExcludeSet once outside the loop — not per-file
         let ex = rust_air_core::sync_vault::ExcludeSet::new(&excludes);
         while let Ok(paths) = rx.recv() {
+            if stop_worker.load(Ordering::Acquire) {
+                break;
+            }
             for abs in paths {
+                if stop_worker.load(Ordering::Acquire) {
+                    break;
+                }
                 rust_air_core::sync_vault::sync_file(&abs, &src, &dst, &mut store, &ex, &ev_tx);
             }
             store.flush_if_needed();
         }
+        drop(ev_tx);
+        let _ = forwarder.join();
+    });
+
+    *state.watch_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(WatchSession {
+        watcher,
+        stop,
+        worker: Some(worker),
     });
 
     Ok(())
@@ -175,5 +215,7 @@ pub fn start_watch(state: State<'_, SyncState>, app: AppHandle) -> Result<(), St
 /// Stop the file watcher.
 #[tauri::command]
 pub fn stop_watch(state: State<'_, SyncState>) {
-    *state.watcher.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Some(session) = state.watch_session.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        session.stop();
+    }
 }

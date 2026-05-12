@@ -241,6 +241,42 @@ fn is_newer(remote: &str, local: &str) -> bool {
     parse(remote) > parse(local)
 }
 
+pub fn apply_download_proxy(url: &str) -> String {
+    format!("https://xgn.io/{url}")
+}
+
+pub fn expected_download_size(total: u64, content_length: Option<u64>) -> u64 {
+    content_length.unwrap_or(total)
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_installer_command(path: &Path) -> String {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let path_str = path.to_string_lossy();
+    if ext.eq_ignore_ascii_case("msi") {
+        format!(
+            "ping -n 5 127.0.0.1 >nul & msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
+            path_str
+        )
+    } else {
+        format!("ping -n 3 127.0.0.1 >nul & \"{}\"", path_str)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn windows_installer_command(path: &Path) -> String {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let path_str = path.to_string_lossy();
+    if ext.eq_ignore_ascii_case("msi") {
+        format!(
+            "ping -n 5 127.0.0.1 >nul & msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
+            path_str
+        )
+    } else {
+        format!("ping -n 3 127.0.0.1 >nul & \"{}\"", path_str)
+    }
+}
+
 async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::Result<PathBuf> {
     let tmp = std::env::temp_dir().join(
         url.rsplit('/').next().unwrap_or("rust-air-update.msi")
@@ -249,7 +285,7 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
     // Use xgn.io proxy to accelerate GitHub release downloads (especially for CN users).
     // Original: https://github.com/user/repo/releases/download/vX/file.msi
     // Proxied:  https://xgn.io/https://github.com/user/repo/releases/download/vX/file.msi
-    let proxied_url = format!("https://xgn.io/{}", url);
+    let proxied_url = apply_download_proxy(url);
 
     let client = reqwest::Client::builder()
         .user_agent(format!("rust-air/{CURRENT_VERSION}"))
@@ -271,7 +307,7 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
         resp.status()
     );
 
-    let expected_total = resp.content_length().unwrap_or(total);
+    let expected_total = expected_download_size(total, resp.content_length());
     let mut file = tokio::fs::File::create(&tmp).await?;
     let mut downloaded = 0u64;
     let mut last_emit = std::time::Instant::now();
@@ -330,22 +366,16 @@ fn launch_installer(path: &Path) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let command_line = windows_installer_command(path);
         if ext.eq_ignore_ascii_case("msi") {
             let msi_path = path.to_string_lossy().to_string();
             eprintln!(
                 "info: Launching MSI installer with version rollback support: {}",
                 msi_path
             );
-            spawn_windows_detached(&format!(
-                "ping -n 5 127.0.0.1 >nul & msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
-                msi_path
-            ))?;
+            spawn_windows_detached(&command_line)?;
         } else {
-            let exe_path = path.to_string_lossy().to_string();
-            spawn_windows_detached(&format!(
-                "ping -n 3 127.0.0.1 >nul & \"{}\"",
-                exe_path
-            ))?;
+            spawn_windows_detached(&command_line)?;
         }
     }
     #[cfg(target_os = "macos")]

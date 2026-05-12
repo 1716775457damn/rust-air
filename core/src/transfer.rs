@@ -175,7 +175,8 @@ pub async fn send_path(
         // Use parallel archive generation for directories with many files.
         // Heuristic: use parallel if >= 10 files (typical small-file scenario benefits from parallelism).
         // For smaller directories or resume scenarios, use the sequential path.
-        let entries = dir_entries.unwrap();
+        let entries = dir_entries
+            .ok_or_else(|| anyhow::anyhow!("directory transfer missing precomputed entries"))?;
         let file_count = entries.iter().filter(|(e, _)| e.file_type().is_file()).count();
         let use_parallel = file_count >= 10 && resume_offset == 0;
         

@@ -8,7 +8,7 @@ mod clip_history_commands;
 #[cfg(feature = "desktop")]
 mod clip_sync_commands;
 #[cfg(feature = "desktop")]
-mod update_commands;
+pub mod update_commands;
 #[cfg(feature = "desktop")]
 mod whiteboard_commands;
 mod todo_commands;
