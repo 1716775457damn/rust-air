@@ -75,6 +75,9 @@ const emit = defineEmits<{
       <label class="flex items-center gap-2 text-xs cursor-pointer" style="color:var(--text-secondary)">
         <input type="checkbox" :checked="syncConfig.delete_removed" @change="emit('updateConfig', 'delete_removed', ($event.target as HTMLInputElement).checked)" class="accent-cyan-500" />删除已移除的文件
       </label>
+      <p class="text-[11px]" style="color:var(--text-faint)">
+        完全同步默认以最新修改为准。开启此项后，较新的删除操作也会同步到另一台设备。
+      </p>
       <div class="space-y-1">
         <p class="text-xs" style="color:var(--text-muted)">排除规则</p>
         <div class="flex gap-2">

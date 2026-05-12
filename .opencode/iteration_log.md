@@ -300,6 +300,39 @@
 ### Recommended Next Step
 - If the goal is another public release, the next pass should be a final targeted audit + version bump + tag/release workflow trigger.
 
+## Iteration 12
+
+### Scope
+- Finalize the latest-wins full-sync line with better delete-aware behavior, execution feedback, and validation coverage.
+
+### Changes
+- Added delete-aware manifest fields and diff actions for full sync.
+- Wired remote/local delete execution into the sync command flow.
+- Added remote file completion/error tracking for pull operations.
+- Improved sync log messaging for push/pull/no-op cases.
+- Added tests for sync file path reconstruction, file error waiter resolution, and delete request handling.
+- Added UI wording to clarify that delete propagation is optional and latest-wins driven.
+
+### Validation
+- `cargo test -p rust-air-core sync_manifest_tests -- --nocapture`
+- `cargo test -p tauri-app sync_commands -- --nocapture`
+- `cargo check -p tauri-app`
+- `pnpm exec vue-tsc --noEmit`
+- `pnpm build`
+
+### Stability Impact
+- Full sync now has stronger convergence rules for add/modify/delete cases.
+- Pull execution no longer relies purely on timeouts to discover remote failures.
+- The user gets clearer visibility into what the sync engine is doing.
+
+### Remaining Issues
+- There is still no true two-process end-to-end integration harness simulating both peers automatically.
+- Sync UX still relies on explicit remote address configuration rather than a durable pairing model.
+- Release note generation remains static.
+
+### Recommended Next Step
+- If the immediate goal is shipping, cut another release now. If the goal is maximum confidence, add a dedicated end-to-end sync integration harness next.
+
 ## Iteration 11
 
 ### Scope

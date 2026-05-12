@@ -749,6 +749,72 @@ mod sync_manifest_tests {
         let diff = diff_manifests_latest_wins(&local, &remote);
         assert!(diff.is_empty());
     }
+
+    #[test]
+    fn test_diff_manifests_mixed_convergence_plan() {
+        let local = vec![
+            SyncManifestEntry {
+                rel: "push.txt".to_string(),
+                size: 10,
+                modified_ts: 300,
+                hash: "hash-push-local".to_string(),
+                deleted: false,
+            },
+            SyncManifestEntry {
+                rel: "pull.txt".to_string(),
+                size: 10,
+                modified_ts: 100,
+                hash: "hash-pull-local-old".to_string(),
+                deleted: false,
+            },
+            SyncManifestEntry {
+                rel: "delete-remote.txt".to_string(),
+                size: 0,
+                modified_ts: 500,
+                hash: String::new(),
+                deleted: true,
+            },
+        ];
+
+        let remote = vec![
+            SyncManifestEntry {
+                rel: "push.txt".to_string(),
+                size: 10,
+                modified_ts: 100,
+                hash: "hash-push-remote-old".to_string(),
+                deleted: false,
+            },
+            SyncManifestEntry {
+                rel: "pull.txt".to_string(),
+                size: 10,
+                modified_ts: 400,
+                hash: "hash-pull-remote-new".to_string(),
+                deleted: false,
+            },
+            SyncManifestEntry {
+                rel: "delete-remote.txt".to_string(),
+                size: 10,
+                modified_ts: 200,
+                hash: "hash-delete-remote-old".to_string(),
+                deleted: false,
+            },
+            SyncManifestEntry {
+                rel: "delete-local.txt".to_string(),
+                size: 0,
+                modified_ts: 600,
+                hash: String::new(),
+                deleted: true,
+            },
+        ];
+
+        let diff = diff_manifests_latest_wins(&local, &remote);
+
+        assert!(diff.contains(&SyncAction::PushToRemote(local[0].clone())));
+        assert!(diff.contains(&SyncAction::PullFromRemote(remote[1].clone())));
+        assert!(diff.contains(&SyncAction::DeleteRemote("delete-remote.txt".to_string())));
+        assert!(diff.contains(&SyncAction::DeleteLocal("delete-local.txt".to_string())));
+        assert_eq!(diff.len(), 4);
+    }
 }
 
 fn state_path() -> PathBuf {
