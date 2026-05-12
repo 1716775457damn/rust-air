@@ -34,6 +34,21 @@ async fn archive_to_bytes(path: &Path) -> Vec<u8> {
     buf
 }
 
+/// Helper: read the full parallel archive stream to bytes.
+async fn archive_parallel_to_bytes(path: &Path) -> Vec<u8> {
+    let (_, entries) = archive::walk_dir(path);
+    let reader = archive::stream_archive_parallel(path, entries)
+        .expect("stream_archive_parallel should succeed for readable dirs");
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut tokio::io::BufReader::new(reader),
+        &mut buf,
+    )
+    .await
+    .expect("reading parallel archive stream should succeed for readable dirs");
+    buf
+}
+
 /// Test: single file directory archives and unpacks correctly.
 ///
 /// **Validates: Requirements 3.1, 3.4**
@@ -255,4 +270,36 @@ async fn test_walk_dir_total_size() {
 
     // Cleanup
     let _ = fs::remove_dir_all(&src);
+}
+
+/// Test: many small files round-trip correctly through the parallel archive path.
+#[tokio::test]
+async fn test_parallel_archive_many_small_files_roundtrip() {
+    let src = test_dir("parallel_small_files");
+
+    for i in 0..200u32 {
+        let name = format!("file_{i:04}.txt");
+        let content = format!("small-file-{i}-{}", "x".repeat((i as usize % 128) + 16));
+        fs::write(src.join(&name), content.as_bytes()).unwrap();
+    }
+
+    let compressed = archive_parallel_to_bytes(&src).await;
+    assert!(!compressed.is_empty(), "parallel archive stream should produce bytes");
+
+    let dest = test_dir("parallel_small_files_out");
+    archive::unpack_archive_sync(Cursor::new(&compressed), &dest)
+        .expect("unpack_archive_sync should succeed for parallel archive output");
+
+    let dir_name = src.file_name().unwrap().to_str().unwrap();
+    for i in 0..200u32 {
+        let name = format!("file_{i:04}.txt");
+        let expected = format!("small-file-{i}-{}", "x".repeat((i as usize % 128) + 16));
+        let unpacked = dest.join(dir_name).join(&name);
+        assert!(unpacked.exists(), "file {name} should exist after parallel unpack");
+        let actual = fs::read_to_string(&unpacked).unwrap();
+        assert_eq!(actual, expected, "file {name} content mismatch after parallel roundtrip");
+    }
+
+    let _ = fs::remove_dir_all(&src);
+    let _ = fs::remove_dir_all(&dest);
 }

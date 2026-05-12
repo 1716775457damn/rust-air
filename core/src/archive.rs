@@ -14,13 +14,16 @@
 //! uses multi-threaded compression for improved throughput. See `ParallelArchiveConfig`
 //! for configuration options.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use walkdir::WalkDir;
+
+#[cfg(test)]
+use anyhow::bail;
 
 /// Type alias for preloaded file data in parallel compression.
 /// Clippy recommends factoring complex types.
@@ -157,6 +160,46 @@ struct CompressedEntry {
     compressed_size: u64,
 }
 
+#[cfg(test)]
+struct BatchAssembler {
+    entries: std::collections::BTreeMap<std::path::PathBuf, CompressedEntry>,
+    #[allow(dead_code)]
+    batch_size: usize,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+#[cfg(test)]
+impl BatchAssembler {
+    fn new(batch_size: usize, tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            entries: std::collections::BTreeMap::new(),
+            batch_size,
+            tx,
+        }
+    }
+
+    fn add_entry(&mut self, entry: CompressedEntry) {
+        self.entries.insert(entry.path.clone(), entry);
+    }
+
+    fn flush(self) -> Result<()> {
+        let mut all_tar_data = Vec::new();
+        for (_, entry) in self.entries.into_iter() {
+            all_tar_data.extend_from_slice(&entry.tar_data);
+        }
+
+        if all_tar_data.is_empty() {
+            return Ok(());
+        }
+
+        all_tar_data.extend(std::iter::repeat_n(0u8, 1024));
+        let compressed = zstd::encode_all(&all_tar_data[..], 3)?;
+        self.tx.blocking_send(compressed)
+            .map_err(|e| anyhow::anyhow!("failed to send compressed batch to output channel: {}", e))?;
+        Ok(())
+    }
+}
+
 /// Select compression level based on file size.
 ///
 /// Uses tiered compression levels for optimal performance:
@@ -213,12 +256,13 @@ fn select_compression_level(size: u64, levels: &CompressionLevels) -> i32 {
 /// Creates a tar entry for a single file (uncompressed).
 /// 
 /// This function reads a file and creates a tar entry in memory. The tar entry
-/// is NOT compressed here - compression happens at the batch level in BatchAssembler
+/// is NOT compressed here - compression happens in the shared streaming zstd encoder
 /// to ensure the entire archive is a single zstd stream compatible with unpack_archive_sync.
 /// 
 /// Note: This only writes the header + data, NOT the tar footer. The footer (1024 zero bytes)
 /// must be written once after all entries are appended, by calling `tar::Builder::finish()`
-/// in the assembler.
+/// in the archive writer.
+#[cfg_attr(not(test), allow(dead_code))]
 fn compress_single_entry(
     entry: &walkdir::DirEntry,
     meta: &std::fs::Metadata,
@@ -261,99 +305,6 @@ fn compress_single_entry(
     })
 }
 
-/// Assemble compressed entries in sorted order, batch for encryption.
-///
-/// This struct receives compressed entries from parallel workers, stores them
-/// in a BTreeMap for sorted order (ensuring deterministic tar output), and
-/// flushes batches to the output channel when they reach the target size.
-///
-/// # Memory Behavior
-///
-/// Entries are held in memory until `flush` is called. The BTreeMap ensures
-/// entries are iterated in sorted path order for deterministic archives.
-///
-/// Validates: Requirements 1.2, 2.1, 2.2, 9.1, 9.2
-#[allow(dead_code)] // Used in parallel-archive feature tests
-struct BatchAssembler {
-    /// Sorted map of path → compressed entry.
-    /// BTreeMap ensures deterministic iteration order by path.
-    entries: std::collections::BTreeMap<std::path::PathBuf, CompressedEntry>,
-
-    /// Target batch size (typically 1 MB, matching CHUNK).
-    /// Batches are flushed when they approach this size.
-    #[allow(dead_code)] // Used for debugging and future batch size validation
-    batch_size: usize,
-
-    /// Output channel for sending batched chunks to encryption pipeline.
-    /// Uses tokio::sync::mpsc::Sender for async compatibility with ErrorAwareReader.
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-}
-
-impl BatchAssembler {
-    /// Create a new BatchAssembler.
-    ///
-    /// # Arguments
-    ///
-    /// * `batch_size` - Target batch size in bytes (e.g., 1 MB)
-    /// * `tx` - Tokio channel sender for outputting batched chunks
-    ///
-    /// Validates: Requirements 2.1, 2.2
-    fn new(batch_size: usize, tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
-        Self {
-            entries: std::collections::BTreeMap::new(),
-            batch_size,
-            tx,
-        }
-    }
-
-    /// Add a compressed entry from parallel workers.
-    ///
-    /// Entries are stored in the BTreeMap keyed by path, ensuring
-    /// deterministic order regardless of which thread processed the file.
-    ///
-    /// Validates: Requirements 1.2, 9.2
-    fn add_entry(&mut self, entry: CompressedEntry) {
-        self.entries.insert(entry.path.clone(), entry);
-    }
-
-    /// Flush all entries as a single compressed batch.
-    ///
-    /// Collects all tar entries in sorted path order, appends the tar footer
-    /// (1024 zero bytes), then compresses the entire batch as a single zstd stream.
-    /// This ensures compatibility with unpack_archive_sync which expects a single
-    /// continuous tar+zstd stream.
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) on success, or an error if channel send fails.
-    ///
-    /// Validates: Requirements 2.1, 2.2, 9.1
-    fn flush(self) -> Result<()> {
-        // Collect all tar entries in sorted order
-        let mut all_tar_data = Vec::new();
-        for (_, entry) in self.entries.into_iter() {
-            all_tar_data.extend_from_slice(&entry.tar_data);
-        }
-
-        if all_tar_data.is_empty() {
-            return Ok(());
-        }
-
-        // Append tar footer: 1024 zero bytes (two 512-byte blocks)
-        // This marks the end of the archive
-        all_tar_data.extend(std::iter::repeat_n(0u8, 1024));
-
-        // Compress the entire tar stream as a single zstd stream
-        // This ensures compatibility with unpack_archive_sync
-        let compressed = zstd::encode_all(&all_tar_data[..], 3)?; // Use level 3 for good balance
-
-        // Send the compressed batch
-        self.tx.blocking_send(compressed)
-            .map_err(|e| anyhow::anyhow!("failed to send compressed batch to output channel: {}", e))?;
-
-        Ok(())
-    }
-}
 
 /// Wraps an AsyncRead and checks for compression errors on EOF.
 /// When the inner reader returns EOF (0 bytes), checks the error slot.
@@ -416,7 +367,7 @@ struct ChannelWriter {
     buf: Vec<u8>,
 }
 
-const CHANNEL_BUF_SIZE: usize = 256 * 1024;
+const CHANNEL_BUF_SIZE: usize = 1024 * 1024;
 
 impl ChannelWriter {
     fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
@@ -533,16 +484,10 @@ pub fn stream_archive_parallel(
 ///
 /// # Thread Architecture
 ///
-/// 1. **Compression thread**: Runs `compress_entries_parallel` which uses rayon to
-///    process small files in parallel and large files sequentially. Sends `CompressedEntry`
-///    to the assembler via std::sync::mpsc channel.
-///
-/// 2. **Assembler thread**: Runs `BatchAssembler` which collects entries in a BTreeMap
-///    (sorted by path) and flushes batches to the output channel when they reach
-///    `config.batch_size`.
-///
-/// 3. **Output channel**: tokio::sync::mpsc channel with `PIPELINE_DEPTH` bound for
-///    backpressure between archive generation and the async runtime.
+/// 1. **Archive thread**: Preloads small files in parallel and writes a single streaming
+///    tar+zstd archive to `ChannelWriter`.
+/// 2. **Output channel**: tokio::sync::mpsc channel with bounded backpressure between
+///    archive generation and the async runtime.
 ///
 /// # Error Handling
 ///
@@ -562,38 +507,17 @@ pub fn stream_archive_parallel_with_config(
     // Shared error slot for propagating errors from compression thread to reader.
     let error_slot = Arc::new(Mutex::new(None));
     let error_slot_reader = error_slot.clone();
-    let error_slot_compressor = error_slot.clone();
-
     let path = path.to_path_buf();
 
-    // Spawn compression thread
+    // Spawn archive thread. Keep the output as a single streaming tar+zstd stream
+    // so the receiver can begin decrypting and unpacking without waiting for the
+    // full small-file set to be aggregated first.
     std::thread::spawn(move || {
-        // Internal channel between compression and assembler.
-        // Uses std::sync::mpsc because compressor is synchronous.
-        let (compress_tx, compress_rx) = std::sync::mpsc::channel::<CompressedEntry>();
-
-        // Spawn assembler thread
-        let assembler_tx = tx.clone();
-        let batch_size = config.batch_size;
-        let assembler_error_slot = error_slot.clone();
-
-        std::thread::spawn(move || {
-            let mut assembler = BatchAssembler::new(batch_size, assembler_tx);
-            while let Ok(entry) = compress_rx.recv() {
-                assembler.add_entry(entry);
-            }
-            // Flush any remaining entries. If this fails, capture the error.
-            if let Err(e) = assembler.flush() {
-                *assembler_error_slot.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some(format!("assembler flush error: {}", e));
-            }
-        });
-
-        // Run parallel compression. Errors are captured in error_slot.
-        if let Err(e) = compress_entries_parallel(&path, entries, &config, compress_tx, error_slot_compressor) {
-            *error_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+        let writer = ChannelWriter::new(tx);
+        if let Err(e) = compress_entries_to_writer_with_config(writer, &path, entries, &config) {
+            *error_slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(format!("parallel archive error: {e}"));
         }
-        // Note: compress_tx is dropped here, which signals the assembler to finish.
     });
 
     Ok(ErrorAwareReader {
@@ -651,44 +575,11 @@ pub fn dir_total_size(path: &Path) -> u64 {
     walk_dir(path).0
 }
 
-// ── Internal Threshold for Large File Processing ────────────────────────────────
+fn compress_entries_to_writer(writer: impl std::io::Write, path: &Path, entries: Vec<(walkdir::DirEntry, std::fs::Metadata)>) -> Result<()> {
+    compress_entries_to_writer_with_config(writer, path, entries, &ParallelArchiveConfig::default())
+}
 
-/// Internal threshold for pre-loading files into memory during archive generation.
-/// This matches SMALL_THRESHOLD but is kept internal for backwards compatibility.
-const SMALL_FILE_THRESHOLD: u64 = SMALL_THRESHOLD;
-
-// ── Parallel Compression Orchestration ──────────────────────────────────────────
-
-/// Process files in parallel, producing compressed tar entries.
-///
-/// This function is the core of the parallel archive generation pipeline. It:
-/// 1. Partitions entries into small files (< 1 MB) and large files (>= 1 MB)
-/// 2. Processes small files in parallel using rayon for improved throughput
-/// 3. Processes large files sequentially to avoid memory exhaustion
-/// 4. Sends compressed entries to the assembler via channel
-/// 5. Captures errors in error_slot for propagation
-///
-/// # Arguments
-///
-/// * `path` - Base path being archived (used for relative path computation)
-/// * `entries` - Pre-collected directory entries with metadata
-/// * `config` - Configuration for parallel archive generation
-/// * `tx` - Channel sender for compressed entries to the assembler
-/// * `error_slot` - Shared error slot for error propagation
-///
-/// # Returns
-///
-/// Ok(()) on success, or an error if:
-/// - A file cannot be read
-/// - Compression fails
-/// - Channel send fails (assembler dropped)
-///
-/// # Memory Behavior
-///
-/// Small files are fully read into memory and compressed in parallel. Large files
-/// are processed sequentially to bound memory usage.
-///
-/// Validates: Requirements 1.1, 1.3, 1.5, 5.3, 5.4, 8.1
+#[cfg(test)]
 fn compress_entries_parallel(
     path: &Path,
     entries: Vec<(walkdir::DirEntry, std::fs::Metadata)>,
@@ -698,23 +589,15 @@ fn compress_entries_parallel(
 ) -> Result<()> {
     use rayon::prelude::*;
 
-    // Filter out directories - they are handled separately in the tar format
-    // by the caller (stream_archive_parallel adds directory entries before files).
-    // Directories have size 0 and would be incorrectly classified as "small files".
     let files: Vec<_> = entries
         .into_iter()
         .filter(|(e, _)| e.file_type().is_file())
         .collect();
 
-    // Partition into small (< threshold) and large files.
-    // Small files are processed in parallel; large files sequentially.
     let (small, large): (Vec<_>, Vec<_>) = files
         .into_iter()
         .partition(|(_, meta)| meta.len() < config.small_file_threshold);
 
-    // Process small files in parallel using rayon.
-    // Each worker reads, creates tar header, and compresses independently.
-    // Errors are collected and checked after parallel execution.
     let results: Vec<Result<CompressedEntry, String>> = small
         .into_par_iter()
         .map(|(entry, meta)| {
@@ -723,35 +606,23 @@ fn compress_entries_parallel(
         })
         .collect();
 
-    // Check for errors and propagate.
-    // If any file failed, capture the error and abort.
     for result in results {
         match result {
             Ok(compressed_entry) => {
-                // Send to assembler for sorted batching
                 if let Err(e) = tx.send(compressed_entry) {
-                    // Assembler dropped, cannot continue
                     let msg = format!("failed to send compressed entry to assembler: {}", e);
                     *error_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(msg.clone());
                     bail!("parallel compression failed: {}", e);
                 }
             }
             Err(msg) => {
-                // Capture error and abort
                 *error_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(msg.clone());
                 bail!("parallel compression failed: {}", msg);
             }
         }
     }
 
-    // Process large files sequentially to avoid memory exhaustion.
-    // Large files (>= small_file_threshold) are streamed without full buffering
-    // in the parallel path. We process them one-by-one here.
     for (entry, meta) in large {
-        // For large files, use a streaming approach via compress_single_entry.
-        // Note: compress_single_entry reads the entire file into memory, which is
-        // acceptable for large files since we're processing them sequentially
-        // (not N files in parallel). Future optimization could add true streaming.
         match compress_single_entry(&entry, &meta, path, config) {
             Ok(compressed_entry) => {
                 if let Err(e) = tx.send(compressed_entry) {
@@ -771,13 +642,18 @@ fn compress_entries_parallel(
     Ok(())
 }
 
-fn compress_entries_to_writer(writer: impl std::io::Write, path: &Path, entries: Vec<(walkdir::DirEntry, std::fs::Metadata)>) -> Result<()> {
+fn compress_entries_to_writer_with_config(
+    writer: impl std::io::Write,
+    path: &Path,
+    entries: Vec<(walkdir::DirEntry, std::fs::Metadata)>,
+    config: &ParallelArchiveConfig,
+) -> Result<()> {
     let enc = zstd::Encoder::new(writer, 3)?;  // level 3: better ratio, still fast on LAN
     let mut tar = tar::Builder::new(enc);
     let entry_name = path.file_name().unwrap_or_default();
 
     let (small, large): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(e, m)| {
-        e.file_type().is_file() && m.len() < SMALL_FILE_THRESHOLD
+        e.file_type().is_file() && m.len() < config.small_file_threshold
     });
 
     // Pre-read small files in parallel; metadata already cached.
@@ -803,7 +679,10 @@ fn compress_entries_to_writer(writer: impl std::io::Write, path: &Path, entries:
     }
     let mut preloaded: Vec<PreloadedFile> = preloaded_results
         .into_iter()
-        .map(|r| r.unwrap())
+        .map(|r| match r {
+            Ok(v) => v,
+            Err(msg) => unreachable!("error should be handled before collecting preloaded files: {msg}"),
+        })
         .collect();
     preloaded.sort_by(|a, b| a.0.cmp(&b.0));
 

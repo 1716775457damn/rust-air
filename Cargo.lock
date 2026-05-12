@@ -4129,7 +4129,7 @@ dependencies = [
 
 [[package]]
 name = "rust-air-cli"
-version = "0.3.45"
+version = "0.3.46"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4141,7 +4141,7 @@ dependencies = [
 
 [[package]]
 name = "rust-air-core"
-version = "0.3.45"
+version = "0.3.46"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4962,7 +4962,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.3.45"
+version = "0.3.46"
 dependencies = [
  "anyhow",
  "arboard",
