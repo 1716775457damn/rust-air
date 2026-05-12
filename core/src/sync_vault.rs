@@ -25,6 +25,22 @@ type FileInfo = (String, PathBuf, u64, String);
 /// Type alias for files needing hash computation: (relative_path, absolute_path, size).
 type NeedHashInfo = (String, PathBuf, u64);
 
+/// A fully materialized file manifest entry used for cross-device full sync.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncManifestEntry {
+    pub rel: String,
+    pub size: u64,
+    pub modified_ts: i64,
+    pub hash: String,
+}
+
+/// An action needed to make two devices converge to the latest version of a file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SyncAction {
+    PushToRemote(SyncManifestEntry),
+    PullFromRemote(SyncManifestEntry),
+}
+
 /// NFD → NFC: macOS HFS+ stores paths in NFD; compose to NFC for correct display.
 #[inline]
 fn nfc(s: &str) -> String {
@@ -302,6 +318,92 @@ pub fn default_excludes() -> Vec<String> {
     ]
 }
 
+/// Build a full manifest for a directory, suitable for latest-wins two-device sync.
+pub fn build_manifest(src: &Path, excludes: &[String]) -> Vec<SyncManifestEntry> {
+    let ex = ExcludeSet::new(excludes);
+    let mut entries = Vec::new();
+
+    for entry in WalkDir::new(src).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let abs = entry.path();
+        let rel = match abs.strip_prefix(src) {
+            Ok(r) => nfc(&r.to_string_lossy().replace('\\', "/")),
+            Err(_) => continue,
+        };
+        if ex.matches(&rel) {
+            continue;
+        }
+
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified_ts = meta
+            .modified()
+            .ok()
+            .map(|t| chrono::DateTime::<Local>::from(t).timestamp())
+            .unwrap_or(0);
+        let hash = match hash_file(abs) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+
+        entries.push(SyncManifestEntry {
+            rel,
+            size: meta.len(),
+            modified_ts,
+            hash,
+        });
+    }
+
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+    entries
+}
+
+/// Compute latest-wins bidirectional sync actions to converge local and remote manifests.
+///
+/// Rules:
+/// - Only local exists -> push to remote
+/// - Only remote exists -> pull from remote
+/// - Both exist and hash equal -> no action
+/// - Both exist and hash differ -> newer modified_ts wins
+/// - On equal modified_ts with different hash, prefer remote deterministically
+pub fn diff_manifests_latest_wins(
+    local: &[SyncManifestEntry],
+    remote: &[SyncManifestEntry],
+) -> Vec<SyncAction> {
+    let local_map: HashMap<&str, &SyncManifestEntry> = local.iter().map(|e| (e.rel.as_str(), e)).collect();
+    let remote_map: HashMap<&str, &SyncManifestEntry> = remote.iter().map(|e| (e.rel.as_str(), e)).collect();
+
+    let mut keys: Vec<&str> = local_map.keys().chain(remote_map.keys()).copied().collect();
+    keys.sort_unstable();
+    keys.dedup();
+
+    let mut actions = Vec::new();
+    for rel in keys {
+        match (local_map.get(rel), remote_map.get(rel)) {
+            (Some(local_entry), None) => actions.push(SyncAction::PushToRemote((*local_entry).clone())),
+            (None, Some(remote_entry)) => actions.push(SyncAction::PullFromRemote((*remote_entry).clone())),
+            (Some(local_entry), Some(remote_entry)) => {
+                if local_entry.hash == remote_entry.hash {
+                    continue;
+                }
+                if local_entry.modified_ts > remote_entry.modified_ts {
+                    actions.push(SyncAction::PushToRemote((*local_entry).clone()));
+                } else {
+                    actions.push(SyncAction::PullFromRemote((*remote_entry).clone()));
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    actions
+}
+
 fn scan_needed(
     src: &Path,
     store: &SyncStore,
@@ -419,6 +521,89 @@ impl ExcludeSet {
             }
             false
         })
+    }
+}
+
+#[cfg(test)]
+mod sync_manifest_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_diff_manifests_push_local_only_file() {
+        let local = vec![SyncManifestEntry {
+            rel: "a.txt".to_string(),
+            size: 10,
+            modified_ts: 100,
+            hash: "hash-a".to_string(),
+        }];
+        let remote = vec![];
+
+        let diff = diff_manifests_latest_wins(&local, &remote);
+        assert_eq!(diff, vec![SyncAction::PushToRemote(local[0].clone())]);
+    }
+
+    #[test]
+    fn test_diff_manifests_pull_remote_only_file() {
+        let local = vec![];
+        let remote = vec![SyncManifestEntry {
+            rel: "b.txt".to_string(),
+            size: 20,
+            modified_ts: 200,
+            hash: "hash-b".to_string(),
+        }];
+
+        let diff = diff_manifests_latest_wins(&local, &remote);
+        assert_eq!(diff, vec![SyncAction::PullFromRemote(remote[0].clone())]);
+    }
+
+    #[test]
+    fn test_diff_manifests_latest_modified_wins() {
+        let local = vec![SyncManifestEntry {
+            rel: "shared.txt".to_string(),
+            size: 10,
+            modified_ts: 300,
+            hash: "hash-local".to_string(),
+        }];
+        let remote = vec![SyncManifestEntry {
+            rel: "shared.txt".to_string(),
+            size: 10,
+            modified_ts: 200,
+            hash: "hash-remote".to_string(),
+        }];
+
+        let diff = diff_manifests_latest_wins(&local, &remote);
+        assert_eq!(diff, vec![SyncAction::PushToRemote(local[0].clone())]);
+    }
+
+    #[test]
+    fn test_diff_manifests_equal_timestamp_prefers_remote() {
+        let local = vec![SyncManifestEntry {
+            rel: "shared.txt".to_string(),
+            size: 10,
+            modified_ts: 300,
+            hash: "hash-local".to_string(),
+        }];
+        let remote = vec![SyncManifestEntry {
+            rel: "shared.txt".to_string(),
+            size: 10,
+            modified_ts: 300,
+            hash: "hash-remote".to_string(),
+        }];
+
+        let diff = diff_manifests_latest_wins(&local, &remote);
+        assert_eq!(diff, vec![SyncAction::PullFromRemote(remote[0].clone())]);
+    }
+
+    #[test]
+    fn test_build_manifest_collects_sorted_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.txt"), b"bbb").unwrap();
+        fs::write(dir.path().join("a.txt"), b"aaa").unwrap();
+
+        let manifest = build_manifest(dir.path(), &[]);
+        let names: Vec<_> = manifest.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "b.txt"]);
     }
 }
 
