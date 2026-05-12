@@ -211,6 +211,16 @@ pub async fn start_remote_sync(
         .map_err(|_| "remote sync response channel closed".to_string())?;
 
     let actions = rust_air_core::sync_vault::diff_manifests_latest_wins(&local_manifest, &response.manifest);
+    if actions.is_empty() {
+        app.emit("sync-event", SyncEvent::Copied {
+            rel: "两端目录已一致，无需同步".to_string(),
+            bytes: 0,
+        }).ok();
+        app.emit("sync-done", ()).ok();
+        state.running.store(false, Ordering::Release);
+        return Ok(());
+    }
+
     let mut pull_waiters = Vec::new();
     for action in &actions {
         match action {
@@ -245,6 +255,13 @@ pub async fn start_remote_sync(
         if let Err(e) = received {
             app.emit("sync-event", SyncEvent::Error { rel: rel.clone(), err: e }).ok();
         }
+    }
+
+    {
+        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.state.last_sync = Some(Local::now());
+        store.mark_dirty();
+        store.flush_now();
     }
 
     app.emit("sync-done", ()).ok();
@@ -352,6 +369,38 @@ fn hash_file_local(path: &std::path::Path) -> anyhow::Result<String> {
         h.update(&buf[..n]);
     }
     Ok(hex::encode(h.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_handle_received_sync_file_reconstructs_relative_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync_root = tempfile::tempdir().unwrap();
+        let incoming = tmp.path().join("incoming.bin");
+        fs::write(&incoming, b"hello-sync").unwrap();
+
+        let state = SyncState::new();
+        {
+            let mut cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
+            cfg.src = sync_root.path().to_string_lossy().to_string();
+        }
+
+        let (request_id, rel, final_path) = handle_received_sync_file(
+            &incoming,
+            "sync:file:req-123:subdir/file.txt",
+            &state,
+        ).unwrap();
+
+        assert_eq!(request_id, "req-123");
+        assert_eq!(rel, "subdir/file.txt");
+        assert_eq!(final_path, sync_root.path().join("subdir").join("file.txt"));
+        assert!(final_path.exists());
+        assert_eq!(fs::read(&final_path).unwrap(), b"hello-sync");
+    }
 }
 
 /// Run a full sync in a background thread.

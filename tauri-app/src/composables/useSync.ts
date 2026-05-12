@@ -60,6 +60,7 @@ export function useSync(fmtBytes: (n: number) => string) {
       syncLog.value.unshift(`❌ ${e}`)
       syncStatus.value.is_running = false
     })
+    syncStatus.value = await invoke<SyncStatus>("get_sync_status")
   }
 
   async function toggleWatch() {

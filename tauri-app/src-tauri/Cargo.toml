@@ -46,3 +46,6 @@ memmap2            = { version = "0.9", optional = true }
 num_cpus           = { version = "1", optional = true }
 encoding_rs        = { version = "0.8", optional = true }
 image              = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
