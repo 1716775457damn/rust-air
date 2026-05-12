@@ -24,7 +24,7 @@ use arboard::Clipboard;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use socket2::SockRef;
-use std::{path::{Path, PathBuf}, sync::Arc, time::Instant};
+use std::{path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant}};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +34,56 @@ use walkdir::DirEntry as WalkDirEntry;
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 /// Initial retry delay in seconds (doubles each attempt: 2, 4, 8, 16, 32).
 const INITIAL_RETRY_DELAY_SECS: u64 = 2;
+const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const SPEED_SMOOTHING_FACTOR: f64 = 0.25;
+
+#[derive(Debug, Clone)]
+struct SpeedTracker {
+    started_at: Instant,
+    last_sample_at: Instant,
+    last_sample_bytes: u64,
+    smoothed_bps: f64,
+}
+
+impl SpeedTracker {
+    fn new(now: Instant, initial_bytes: u64) -> Self {
+        Self {
+            started_at: now,
+            last_sample_at: now,
+            last_sample_bytes: initial_bytes,
+            smoothed_bps: 0.0,
+        }
+    }
+
+    fn should_emit(&self, now: Instant, done: bool) -> bool {
+        done || now.duration_since(self.last_sample_at) >= SPEED_SAMPLE_INTERVAL
+    }
+
+    fn sample(&mut self, now: Instant, bytes_done: u64) -> u64 {
+        let elapsed = now.duration_since(self.last_sample_at).as_secs_f64();
+        if elapsed > 0.0 {
+            let delta = bytes_done.saturating_sub(self.last_sample_bytes) as f64;
+            let instant_bps = delta / elapsed;
+            self.smoothed_bps = if self.smoothed_bps > 0.0 {
+                self.smoothed_bps * (1.0 - SPEED_SMOOTHING_FACTOR)
+                    + instant_bps * SPEED_SMOOTHING_FACTOR
+            } else {
+                instant_bps
+            };
+        }
+
+        self.last_sample_at = now;
+        self.last_sample_bytes = bytes_done;
+
+        // Fallback to average speed if we don't yet have enough samples.
+        if self.smoothed_bps <= 0.0 {
+            let total_elapsed = now.duration_since(self.started_at).as_secs_f64().max(0.001);
+            self.smoothed_bps = bytes_done as f64 / total_elapsed;
+        }
+
+        self.smoothed_bps.max(0.0).round() as u64
+    }
+}
 
 // ── Manifest helpers ──────────────────────────────────────────────────────────
 
@@ -541,15 +591,15 @@ async fn receive_file_branch(
     }
     let mut done = already_have;
     let start = Instant::now();
-    let mut last_emit = start;
+    let mut speed = SpeedTracker::new(start, already_have);
 
     while let Some(chunk) = dec.read_chunk().await? {
         done += chunk.len() as u64;
         hash_tx.send(chunk).await
             .map_err(|_| anyhow::anyhow!("hash task failed"))?;
-        if last_emit.elapsed().as_millis() >= 100 {
-            emit_progress_resume(on_progress, done, total_size, &start, false, is_resumed, already_have);
-            last_emit = Instant::now();
+        let now = Instant::now();
+        if speed.should_emit(now, false) {
+            emit_progress_resume(on_progress, done, total_size, false, is_resumed, already_have, &mut speed, now);
         }
     }
     // Close hash channel so Stage 2 finishes, which closes write channel for Stage 3.
@@ -570,7 +620,8 @@ async fn receive_file_branch(
 
     let final_path = unique_path(dest.join(name));
     tokio::fs::rename(part_path, &final_path).await?;
-    emit_progress_resume(on_progress, done, total_size, &start, true, is_resumed, already_have);
+    let now = Instant::now();
+    emit_progress_resume(on_progress, done, total_size, true, is_resumed, already_have, &mut speed, now);
     Ok(ReceiveOutcome::File(final_path))
 }
 
@@ -668,15 +719,15 @@ async fn receive_archive_branch(
 
     let mut done: u64 = already_have;
     let start = Instant::now();
-    let mut last_emit = start;
+    let mut speed = SpeedTracker::new(start, already_have);
 
     while let Some(chunk) = dec.read_chunk().await? {
         done += chunk.len() as u64;
         hash_tx.send(chunk).await
             .map_err(|_| anyhow::anyhow!("hash task failed"))?;
-        if last_emit.elapsed().as_millis() >= 100 {
-            emit_progress_resume(on_progress, done, total_size, &start, false, is_resumed, already_have);
-            last_emit = Instant::now();
+        let now = Instant::now();
+        if speed.should_emit(now, false) {
+            emit_progress_resume(on_progress, done, total_size, false, is_resumed, already_have, &mut speed, now);
         }
     }
     // Close hash channel so Stage 2 finishes, which closes write channel for Stage 3.
@@ -707,7 +758,8 @@ async fn receive_archive_branch(
     // Clean up the .part file after successful decompression.
     let _ = tokio::fs::remove_file(part_path).await;
 
-    emit_progress_resume(on_progress, total_size, total_size, &start, true, is_resumed, already_have);
+    let now = Instant::now();
+    emit_progress_resume(on_progress, total_size, total_size, true, is_resumed, already_have, &mut speed, now);
     Ok(ReceiveOutcome::File(dest.to_path_buf()))
 }
 
@@ -810,17 +862,20 @@ async fn stream_encrypted_hash<R: AsyncRead + Unpin + Send + 'static>(
     // Main task: receive chunks, hash, encrypt, write to network.
     let mut done = initial;
     let start = Instant::now();
-    let mut last_emit = start;
+    let mut speed = SpeedTracker::new(start, initial);
     while let Some(result) = rx.recv().await {
         let chunk = result?;
         hasher.update(&chunk);
         enc.write_chunk(&chunk).await?;
         done += chunk.len() as u64;
-        if last_emit.elapsed().as_millis() >= 100 {
-            emit_progress(&on_progress, done, total, &start, false);
-            last_emit = Instant::now();
+        let now = Instant::now();
+        if speed.should_emit(now, false) {
+            emit_progress(&on_progress, done, total, false, &mut speed, now);
         }
     }
+
+    let now = Instant::now();
+    emit_progress(&on_progress, done, total, true, &mut speed, now);
 
     // Capture read task panic.
     read_task
@@ -872,17 +927,20 @@ async fn stream_encrypted_hash_pipeline<R: AsyncRead + Unpin + Send + 'static>(
     // Encrypt task: receives from channel, hashes sequentially, then encrypts.
     let mut done = initial;
     let start = Instant::now();
-    let mut last_emit = start;
+    let mut speed = SpeedTracker::new(start, initial);
     while let Some(result) = rx.recv().await {
         let chunk = result?;
         hasher.update(&chunk);
         enc.write_chunk(&chunk).await?;
         done += chunk.len() as u64;
-        if last_emit.elapsed().as_millis() >= 100 {
-            emit_progress(&on_progress, done, total, &start, false);
-            last_emit = Instant::now();
+        let now = Instant::now();
+        if speed.should_emit(now, false) {
+            emit_progress(&on_progress, done, total, false, &mut speed, now);
         }
     }
+
+    let now = Instant::now();
+    emit_progress(&on_progress, done, total, true, &mut speed, now);
 
     // Capture read task panic.
     read_task
@@ -920,12 +978,16 @@ pub async fn send_clipboard(
     let mut hasher = Sha256::new();
     let mut done = 0u64;
     let start = Instant::now();
+    let mut speed = SpeedTracker::new(start, 0);
     for chunk in data.chunks(CHUNK) {
         hasher.update(chunk);
         enc.write_chunk(chunk).await?;
         done += chunk.len() as u64;
-        emit_progress(&on_progress, done, total_size, &start, false);
+        let now = Instant::now();
+        emit_progress(&on_progress, done, total_size, false, &mut speed, now);
     }
+    let now = Instant::now();
+    emit_progress(&on_progress, done, total_size, true, &mut speed, now);
     let checksum: [u8; 32] = hasher.finalize().into();
     enc.shutdown().await?;
     enc.write_trailing(&checksum).await?;
@@ -956,12 +1018,16 @@ pub async fn send_clipboard_image(
     let mut hasher = Sha256::new();
     let mut done = 0u64;
     let start = Instant::now();
+    let mut speed = SpeedTracker::new(start, 0);
     for chunk in png_data.chunks(CHUNK) {
         hasher.update(chunk);
         enc.write_chunk(chunk).await?;
         done += chunk.len() as u64;
-        emit_progress(&on_progress, done, total_size, &start, false);
+        let now = Instant::now();
+        emit_progress(&on_progress, done, total_size, false, &mut speed, now);
     }
+    let now = Instant::now();
+    emit_progress(&on_progress, done, total_size, true, &mut speed, now);
     let checksum: [u8; 32] = hasher.finalize().into();
     enc.shutdown().await?;
     enc.write_trailing(&checksum).await?;
@@ -1010,12 +1076,19 @@ fn tune_socket(stream: &TcpStream) {
 }
 
 #[inline]
-fn emit_progress(cb: &Arc<impl Fn(TransferEvent)>, bytes_done: u64, total_bytes: u64, start: &Instant, done: bool) {
-    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+fn emit_progress(
+    cb: &Arc<impl Fn(TransferEvent)>,
+    bytes_done: u64,
+    total_bytes: u64,
+    done: bool,
+    speed: &mut SpeedTracker,
+    now: Instant,
+) {
+    let bytes_per_sec = speed.sample(now, bytes_done);
     cb(TransferEvent {
         bytes_done,
         total_bytes,
-        bytes_per_sec: (bytes_done as f64 / elapsed) as u64,
+        bytes_per_sec,
         done,
         error: None,
         resumed: false,
@@ -1029,20 +1102,55 @@ fn emit_progress_resume(
     cb: &Arc<impl Fn(TransferEvent)>,
     bytes_done: u64,
     total_bytes: u64,
-    start: &Instant,
     done: bool,
     resumed: bool,
     resume_offset: u64,
+    speed: &mut SpeedTracker,
+    now: Instant,
 ) {
-    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    let bytes_per_sec = speed.sample(now, bytes_done);
     cb(TransferEvent {
         bytes_done,
         total_bytes,
-        bytes_per_sec: (bytes_done as f64 / elapsed) as u64,
+        bytes_per_sec,
         done,
         error: None,
         resumed,
         resume_offset,
         reconnect_info: None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speed_tracker_reports_positive_smoothed_rate() {
+        let start = Instant::now();
+        let mut tracker = SpeedTracker::new(start, 0);
+
+        let later = start + Duration::from_millis(200);
+        let rate = tracker.sample(later, 2 * 1024 * 1024);
+
+        assert!(rate > 0, "speed tracker should report positive throughput");
+    }
+
+    #[test]
+    fn speed_tracker_uses_delta_not_total_average() {
+        let start = Instant::now();
+        let mut tracker = SpeedTracker::new(start, 4 * 1024 * 1024);
+
+        let later = start + Duration::from_millis(250);
+        let rate = tracker.sample(later, 5 * 1024 * 1024);
+
+        assert!(
+            rate < 20 * 1024 * 1024,
+            "resumed transfer speed should be based on newly transferred bytes, got {rate} B/s"
+        );
+        assert!(
+            rate > 3 * 1024 * 1024,
+            "resumed transfer speed should still reflect useful throughput, got {rate} B/s"
+        );
+    }
 }

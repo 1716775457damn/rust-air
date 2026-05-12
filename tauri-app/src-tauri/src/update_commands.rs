@@ -264,6 +264,14 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
             client.get(url).send().await?
         }
     };
+
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "download request failed with status {}",
+        resp.status()
+    );
+
+    let expected_total = resp.content_length().unwrap_or(total);
     let mut file = tokio::fs::File::create(&tmp).await?;
     let mut downloaded = 0u64;
     let mut last_emit = std::time::Instant::now();
@@ -274,7 +282,7 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
         downloaded += chunk.len() as u64;
         if last_emit.elapsed().as_millis() >= 100 {
             app.emit("update-progress", UpdateProgress {
-                downloaded, total, done: false,
+                downloaded, total: expected_total, done: false,
             }).ok();
             last_emit = std::time::Instant::now();
         }
@@ -282,11 +290,11 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
     file.flush().await?;
 
     // Verify download completeness — reject truncated files
-    if total > 0 && downloaded != total {
+    if expected_total > 0 && downloaded != expected_total {
         let _ = tokio::fs::remove_file(&tmp).await;
         anyhow::bail!(
             "download incomplete: got {} bytes, expected {} bytes",
-            downloaded, total
+            downloaded, expected_total
         );
     }
     // Sanity check: MSI files must be at least 1 KB
@@ -298,19 +306,29 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
         );
     }
 
-    app.emit("update-progress", UpdateProgress { downloaded, total, done: true }).ok();
+    app.emit("update-progress", UpdateProgress { downloaded, total: expected_total, done: true }).ok();
     Ok(tmp)
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_windows_detached(command_line: &str) -> anyhow::Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    std::process::Command::new("cmd")
+        .args(["/C", command_line])
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .spawn()?;
+
+    Ok(())
 }
 
 fn launch_installer(path: &Path) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
-
-    #[cfg(target_os = "windows")]
     {
-        // Launch the installer in a fully detached process so it survives
-        // the app exiting. Using `cmd /C start "" ...` creates a new
-        // console window that is independent of the parent process.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext.eq_ignore_ascii_case("msi") {
             let msi_path = path.to_string_lossy().to_string();
@@ -318,25 +336,16 @@ fn launch_installer(path: &Path) -> anyhow::Result<()> {
                 "info: Launching MSI installer with version rollback support: {}",
                 msi_path
             );
-            std::process::Command::new("cmd")
-                .args([
-                    "/C",
-                    &format!(
-                        "ping -n 5 127.0.0.1 >nul & start \"\" msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
-                        msi_path
-                    ),
-                ])
-                .creation_flags(0x00000008) // DETACHED_PROCESS
-                .spawn()?;
+            spawn_windows_detached(&format!(
+                "ping -n 5 127.0.0.1 >nul & msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
+                msi_path
+            ))?;
         } else {
             let exe_path = path.to_string_lossy().to_string();
-            std::process::Command::new("cmd")
-                .args([
-                    "/C",
-                    &format!("ping -n 3 127.0.0.1 >nul & start \"\" \"{}\"", exe_path),
-                ])
-                .creation_flags(0x00000008) // DETACHED_PROCESS
-                .spawn()?;
+            spawn_windows_detached(&format!(
+                "ping -n 3 127.0.0.1 >nul & \"{}\"",
+                exe_path
+            ))?;
         }
     }
     #[cfg(target_os = "macos")]
