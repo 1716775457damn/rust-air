@@ -20,7 +20,7 @@ export function useSync(fmtBytes: (n: number) => string) {
     if (ev.kind === "Copied") syncLog.value.unshift(`✅ ${ev.rel}  (${fmtBytes(ev.bytes ?? 0)})`)
     else if (ev.kind === "Deleted") syncLog.value.unshift(`🗑 ${ev.rel}`)
     else if (ev.kind === "Error") syncLog.value.unshift(`❌ ${ev.rel}: ${ev.err}`)
-    else if (ev.kind === "Progress") syncLog.value[0] = `⏳ 扫描中… ${ev.scanned} 个文件`
+    else if (ev.kind === "Progress") syncLog.value[0] = `⏳ 同步处理中… ${ev.scanned} 个文件`
     else if (ev.kind === "Done") {
       syncLog.value.unshift(`🎉 同步完成  共 ${ev.total_files} 个文件`)
       invoke("sync_done").then(() => invoke<SyncStatus>("get_sync_status").then((s) => (syncStatus.value = s)))

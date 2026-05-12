@@ -109,7 +109,7 @@ const emit = defineEmits<{
           ? 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'
           : 'background:#2563eb;color:#fff'"
         class="px-4 py-2 rounded-lg text-sm transition-colors">
-        双端同步
+        完全同步
       </button>
       <button @click="emit('toggleWatch')"
         :style="syncStatus.is_watching

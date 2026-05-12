@@ -225,13 +225,20 @@ pub async fn start_remote_sync(
     for action in &actions {
         match action {
             SyncAction::PushToRemote(entry) => {
+                app.emit("sync-event", SyncEvent::Copied {
+                    rel: format!("⇢ 推送到远端: {}", entry.rel),
+                    bytes: entry.size,
+                }).ok();
                 let src_file = src.join(&entry.rel);
                 let logical_name = format!("sync:file:push:{}", entry.rel);
                 let stream = tokio::net::TcpStream::connect(&remote_addr).await.map_err(|e| e.to_string())?;
                 transfer::send_path_as(stream, &src_file, Some(&logical_name), |_| {}).await.map_err(|e| e.to_string())?;
-                app.emit("sync-event", SyncEvent::Copied { rel: entry.rel.clone(), bytes: entry.size }).ok();
             }
             SyncAction::PullFromRemote(entry) => {
+                app.emit("sync-event", SyncEvent::Copied {
+                    rel: format!("⇠ 请求远端文件: {}", entry.rel),
+                    bytes: entry.size,
+                }).ok();
                 let file_request_id = uuid::Uuid::new_v4().to_string();
                 let req = RemoteSyncFileRequest {
                     request_id: file_request_id.clone(),
@@ -252,8 +259,16 @@ pub async fn start_remote_sync(
             .await
             .map_err(|_| format!("timed out waiting for synced file: {rel}"))?
             .map_err(|_| format!("sync file completion channel closed: {rel}"))?;
-        if let Err(e) = received {
-            app.emit("sync-event", SyncEvent::Error { rel: rel.clone(), err: e }).ok();
+        match received {
+            Ok(path) => {
+                app.emit("sync-event", SyncEvent::Copied {
+                    rel: format!("⇠ 已拉取到本地: {}", rel),
+                    bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                }).ok();
+            }
+            Err(e) => {
+                app.emit("sync-event", SyncEvent::Error { rel: rel.clone(), err: e }).ok();
+            }
         }
     }
 
