@@ -10,6 +10,7 @@
 //!   `auto_install`: download+install silently when update found (default false)
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
@@ -117,6 +118,7 @@ pub struct UpdateInfo {
     pub size:         u64,
     pub release_notes: String,
     pub auto_install_supported: bool,
+    pub digest:       Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +142,7 @@ pub struct GhAsset {
     pub name:                 String,
     pub browser_download_url: String,
     pub size:                 u64,
+    pub digest:               Option<String>,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -182,6 +185,7 @@ pub async fn check_update() -> Result<Option<UpdateInfo>, String> {
         size:         asset.size,
         release_notes: release.body.unwrap_or_default(),
         auto_install_supported: auto_install_supported_asset(asset),
+        digest:       asset.digest.clone(),
     }))
 }
 
@@ -191,9 +195,10 @@ pub async fn check_update() -> Result<Option<UpdateInfo>, String> {
 pub async fn download_and_install(
     url:  String,
     size: u64,
+    digest: Option<String>,
     app:  AppHandle,
 ) -> Result<(), String> {
-    let path = download_installer(&url, size, &app).await.map_err(|e| e.to_string())?;
+    let path = download_installer(&url, size, digest.as_deref(), &app).await.map_err(|e| e.to_string())?;
 
     // Record the installer path so the next launch can clean it up.
     if let Some(rec_path) = cleanup_record_path() {
@@ -296,6 +301,7 @@ async fn fetch_latest_release_from_html(client: &reqwest::Client) -> anyhow::Res
             name,
             browser_download_url: absolute,
             size: 0,
+            digest: None,
         });
     }
 
@@ -384,20 +390,52 @@ pub fn expected_installer_signature(url: &str) -> &'static [u8] {
     }
 }
 
-async fn validate_downloaded_installer(path: &Path, url: &str) -> anyhow::Result<()> {
-    let signature = expected_installer_signature(url);
-    if signature.is_empty() {
+pub fn normalize_sha256_digest(digest: Option<&str>) -> Option<String> {
+    let raw = digest?.trim();
+    let trimmed = raw.strip_prefix("sha256:").unwrap_or(raw).trim();
+    if trimmed.len() != 64 || !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+async fn compute_file_sha256(path: &Path) -> anyhow::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+async fn validate_downloaded_installer(path: &Path, url: &str, expected_digest: Option<&str>) -> anyhow::Result<()> {
+    if let Some(expected) = normalize_sha256_digest(expected_digest) {
+        let actual = compute_file_sha256(path).await?;
+        anyhow::ensure!(
+            actual == expected,
+            "downloaded file sha256 does not match release digest"
+        );
         return Ok(());
     }
 
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut header = vec![0u8; signature.len()];
-    file.read_exact(&mut header).await?;
-    anyhow::ensure!(
-        header == signature,
-        "downloaded file header does not match expected installer format"
-    );
+    let signature = expected_installer_signature(url);
+    if !signature.is_empty() {
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut header = vec![0u8; signature.len()];
+        file.read_exact(&mut header).await?;
+        anyhow::ensure!(
+            header == signature,
+            "downloaded file header does not match expected installer format"
+        );
+    }
     Ok(())
 }
 
@@ -429,7 +467,7 @@ pub fn windows_installer_command(path: &Path) -> String {
     }
 }
 
-async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::Result<PathBuf> {
+async fn download_installer(url: &str, total: u64, digest: Option<&str>, app: &AppHandle) -> anyhow::Result<PathBuf> {
     let tmp = std::env::temp_dir().join(
         url.rsplit('/').next().unwrap_or("rust-air-update.msi")
     );
@@ -449,6 +487,7 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
         source_url: &str,
         original_url: &str,
         total: u64,
+        digest: Option<&str>,
         tmp: &Path,
         app: &AppHandle,
     ) -> anyhow::Result<()> {
@@ -492,17 +531,17 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
             );
         }
 
-        validate_downloaded_installer(tmp, original_url).await?;
+        validate_downloaded_installer(tmp, original_url, digest).await?;
         app.emit("update-progress", UpdateProgress { downloaded, total: expected_total, done: true }).ok();
         Ok(())
     }
 
-    match download_once(&client, &proxied_url, url, total, &tmp, app).await {
+    match download_once(&client, &proxied_url, url, total, digest, &tmp, app).await {
         Ok(()) => Ok(tmp),
         Err(proxy_err) => {
             eprintln!("warn: proxied download failed validation, falling back to direct download: {proxy_err}");
             let _ = tokio::fs::remove_file(&tmp).await;
-            download_once(&client, url, url, total, &tmp, app).await?;
+            download_once(&client, url, url, total, digest, &tmp, app).await?;
             Ok(tmp)
         }
     }

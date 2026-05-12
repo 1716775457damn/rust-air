@@ -39,7 +39,7 @@ export function useUpdate(showToast: (kind: string, message: string, device?: st
     if (!updateInfo.value) return
     updateProgress.value = { downloaded: 0, total: updateInfo.value.size, done: false }
     try {
-      await invoke("download_and_install", { url: updateInfo.value.url, size: updateInfo.value.size })
+      await invoke("download_and_install", { url: updateInfo.value.url, size: updateInfo.value.size, digest: updateInfo.value.digest ?? null })
     } catch (e: any) {
       updateProgress.value = null
       showToast("update_error", `更新失败: ${e}`)

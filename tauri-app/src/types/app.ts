@@ -107,6 +107,7 @@ export interface UpdateInfo {
   size: number
   release_notes: string
   auto_install_supported: boolean
+  digest?: string | null
 }
 
 export interface UpdateProgress {

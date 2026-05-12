@@ -20,6 +20,8 @@ use tauri_app_lib::update_commands::{
     apply_download_proxy,
     expected_download_size,
     expected_installer_signature,
+    GhAsset,
+    normalize_sha256_digest,
     pick_asset,
     windows_installer_command,
 };
@@ -36,13 +38,6 @@ fn has_proxy_prefix(url: &str) -> bool {
 /// Extracts the original URL from proxied URL
 fn extract_original_url(proxied_url: &str) -> Option<&str> {
     proxied_url.strip_prefix("https://xgn.io/")
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct GhAsset {
-    name: String,
-    browser_download_url: String,
-    size: u64,
 }
 
 /// Simulates macOS DMG installer command generation
@@ -162,21 +157,34 @@ mod download_proxy_tests {
     }
 
     #[test]
+    fn test_normalize_sha256_digest_accepts_prefixed_and_plain_values() {
+        let plain = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let prefixed = format!("sha256:{plain}");
+
+        assert_eq!(normalize_sha256_digest(Some(plain)).as_deref(), Some(plain));
+        assert_eq!(normalize_sha256_digest(Some(&prefixed)).as_deref(), Some(plain));
+        assert!(normalize_sha256_digest(Some("sha256:not-a-real-digest")).is_none());
+        assert!(normalize_sha256_digest(None).is_none());
+    }
+
+    #[test]
     fn test_windows_pick_asset_prefers_msi_only() {
         let assets = vec![
             GhAsset {
                 name: "rust-air_0.3.53_x64-setup.exe".to_string(),
                 browser_download_url: "https://example.com/setup.exe".to_string(),
                 size: 10,
+                digest: None,
             },
             GhAsset {
                 name: "rust-air_0.3.53_x64_en-US.msi".to_string(),
                 browser_download_url: "https://example.com/app.msi".to_string(),
                 size: 10,
+                digest: None,
             },
         ];
 
-        let selected = pick_asset(unsafe { std::mem::transmute::<&Vec<GhAsset>, &Vec<tauri_app_lib::update_commands::GhAsset>>(&assets) });
+        let selected = pick_asset(&assets);
         assert!(selected.is_some());
         assert!(selected.unwrap().browser_download_url.ends_with(".msi"));
     }
@@ -187,18 +195,17 @@ mod download_proxy_tests {
             name: "rust-air_0.3.53_x64_en-US.msi".to_string(),
             browser_download_url: "https://example.com/app.msi".to_string(),
             size: 10,
+            digest: None,
         };
         let exe = GhAsset {
             name: "rust-air_0.3.53_x64-setup.exe".to_string(),
             browser_download_url: "https://example.com/setup.exe".to_string(),
             size: 10,
+            digest: None,
         };
 
-        let msi_ref = unsafe { std::mem::transmute::<&GhAsset, &tauri_app_lib::update_commands::GhAsset>(&msi) };
-        let exe_ref = unsafe { std::mem::transmute::<&GhAsset, &tauri_app_lib::update_commands::GhAsset>(&exe) };
-
-        assert!(auto_install_supported_asset(msi_ref));
-        assert!(!auto_install_supported_asset(exe_ref));
+        assert!(auto_install_supported_asset(&msi));
+        assert!(!auto_install_supported_asset(&exe));
     }
 }
 

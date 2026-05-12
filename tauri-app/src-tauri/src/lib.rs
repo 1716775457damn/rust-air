@@ -92,7 +92,7 @@ pub fn run() {
                     if settings.auto_install && info.auto_install_supported {
                         // Silent background install
                         let _ = update_commands::download_and_install(
-                            info.url, info.size, app_handle
+                            info.url, info.size, info.digest, app_handle
                         ).await;
                     } else {
                         app_handle.emit("update-available", &info).ok();
