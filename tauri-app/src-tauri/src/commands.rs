@@ -25,6 +25,8 @@ use crate::clip_history_commands::{ClipEntryView, HistoryState};
 #[cfg(feature = "desktop")]
 use crate::clip_sync_commands::ClipSyncState;
 #[cfg(feature = "desktop")]
+use crate::sync_commands::SyncState;
+#[cfg(feature = "desktop")]
 use crate::whiteboard_commands::WhiteboardState;
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -107,8 +109,27 @@ pub async fn start_listener(
                         match transfer::receive_to_disk(stream, &out, move |ev| {
                             app3.emit("recv-progress", &ev).ok();
                         }).await {
-                            Ok(ReceiveOutcome::File(p)) => {
-                                app2.emit("recv-done", p.to_string_lossy().to_string()).ok();
+                            Ok(ReceiveOutcome::File { path, name, .. }) => {
+                                if name.starts_with("sync:file:") {
+                                    if let Some(ss) = app2.try_state::<SyncState>() {
+                                        match crate::sync_commands::handle_received_sync_file(&path, &name, &ss) {
+                                            Ok(final_path) => {
+                                                app2.emit("sync-event", rust_air_core::SyncEvent::Copied {
+                                                    rel: name.trim_start_matches("sync:file:").to_string(),
+                                                    bytes: std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0),
+                                                }).ok();
+                                            }
+                                            Err(e) => {
+                                                app2.emit("sync-event", rust_air_core::SyncEvent::Error {
+                                                    rel: name.trim_start_matches("sync:file:").to_string(),
+                                                    err: e,
+                                                }).ok();
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    app2.emit("recv-done", path.to_string_lossy().to_string()).ok();
+                                }
                             }
                             Ok(ReceiveOutcome::Clipboard { name, data, .. }) => {
                                 // Check if this is a whiteboard sync message
@@ -134,6 +155,24 @@ pub async fn start_listener(
                                                 device: None,
                                             };
                                             let _ = app2.emit("whiteboard-error", &wb_err);
+                                        }
+                                    }
+                                } else if name == "sync:manifest-request" {
+                                    if let Some(ss) = app2.try_state::<SyncState>() {
+                                        if let Err(e) = crate::sync_commands::handle_sync_manifest_request(&data, &ss).await {
+                                            app2.emit("sync-event", rust_air_core::SyncEvent::Error { rel: "manifest-request".to_string(), err: e }).ok();
+                                        }
+                                    }
+                                } else if name == "sync:manifest-response" {
+                                    if let Some(ss) = app2.try_state::<SyncState>() {
+                                        if let Err(e) = crate::sync_commands::handle_sync_manifest_response(&data, &ss) {
+                                            app2.emit("sync-event", rust_air_core::SyncEvent::Error { rel: "manifest-response".to_string(), err: e }).ok();
+                                        }
+                                    }
+                                } else if name == "sync:file-request" {
+                                    if let Some(ss) = app2.try_state::<SyncState>() {
+                                        if let Err(e) = crate::sync_commands::handle_sync_file_request(&data, &ss).await {
+                                            app2.emit("sync-event", rust_air_core::SyncEvent::Error { rel: "file-request".to_string(), err: e }).ok();
                                         }
                                     }
                                 } else {
@@ -214,8 +253,8 @@ pub async fn start_listener(
                         match transfer::receive_to_disk(stream, &out, move |ev| {
                             app3.emit("recv-progress", &ev).ok();
                         }).await {
-                            Ok(ReceiveOutcome::File(p)) => {
-                                app2.emit("recv-done", p.to_string_lossy().to_string()).ok();
+                            Ok(ReceiveOutcome::File { path, .. }) => {
+                                app2.emit("recv-done", path.to_string_lossy().to_string()).ok();
                             }
                             Ok(ReceiveOutcome::Clipboard { .. }) => {
                                 // Clipboard sync not available on non-desktop; ignore.

@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog"
 import type { SyncConfig, SyncEventPayload, SyncStatus } from "../types/app"
 
 export function useSync(fmtBytes: (n: number) => string) {
-  const syncConfig = ref<SyncConfig>({ src: "", dst: "", delete_removed: false, excludes: [], auto_watch: false })
+  const syncConfig = ref<SyncConfig>({ src: "", dst: "", remote_addr: "", delete_removed: false, excludes: [], auto_watch: false })
   const syncStatus = ref<SyncStatus>({ last_sync: null, total_files: 0, total_bytes: "0 B", is_running: false, is_watching: false })
   const syncLog = ref<string[]>([])
   const syncExcludeInput = ref("")
@@ -52,6 +52,16 @@ export function useSync(fmtBytes: (n: number) => string) {
     })
   }
 
+  async function startRemoteSync(callbackAddr: string) {
+    await invoke("save_sync_config", { config: syncConfig.value })
+    syncLog.value = []
+    syncStatus.value.is_running = true
+    await invoke("start_remote_sync", { remoteAddr: syncConfig.value.remote_addr, callbackAddr }).catch((e: any) => {
+      syncLog.value.unshift(`❌ ${e}`)
+      syncStatus.value.is_running = false
+    })
+  }
+
   async function toggleWatch() {
     if (syncStatus.value.is_watching) {
       await invoke("stop_watch")
@@ -84,6 +94,7 @@ export function useSync(fmtBytes: (n: number) => string) {
     pickSyncSrc,
     pickSyncDst,
     saveAndSync,
+    startRemoteSync,
     toggleWatch,
     addExclude,
     removeExclude,

@@ -12,6 +12,7 @@ const emit = defineEmits<{
   pickSrc: []
   pickDst: []
   saveAndSync: []
+  remoteSync: []
   toggleWatch: []
   addExclude: []
   removeExclude: [index: number]
@@ -52,6 +53,12 @@ const emit = defineEmits<{
           class="px-2 py-1.5 rounded-lg text-xs transition-colors flex-shrink-0"
           style="background:var(--bg-muted);color:var(--text-secondary)">📂</button>
       </div>
+      <div class="flex gap-2 items-center">
+        <span class="text-xs w-8 flex-shrink-0" style="color:var(--text-muted)">远端</span>
+        <input :value="syncConfig.remote_addr" @input="emit('updateConfig', 'remote_addr', ($event.target as HTMLInputElement).value)" placeholder="远端设备地址，例如 192.168.1.5:49821" :title="syncConfig.remote_addr"
+          class="flex-1 rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
+          style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+      </div>
       <label class="flex items-center gap-2 text-xs cursor-pointer" style="color:var(--text-secondary)">
         <input type="checkbox" :checked="syncConfig.delete_removed" @change="emit('updateConfig', 'delete_removed', ($event.target as HTMLInputElement).checked)" class="accent-cyan-500" />删除已移除的文件
       </label>
@@ -83,6 +90,13 @@ const emit = defineEmits<{
           : `background:var(--accent);color:#fff`"
         class="flex-1 py-2 rounded-lg text-sm font-medium transition-colors">
         {{ syncStatus.is_running ? '同步中…' : '🔄 立即同步' }}
+      </button>
+      <button @click="emit('remoteSync')" :disabled="syncStatus.is_running || !syncConfig.remote_addr"
+        :style="syncStatus.is_running || !syncConfig.remote_addr
+          ? 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'
+          : 'background:#2563eb;color:#fff'"
+        class="px-4 py-2 rounded-lg text-sm transition-colors">
+        双端同步
       </button>
       <button @click="emit('toggleWatch')"
         :style="syncStatus.is_watching

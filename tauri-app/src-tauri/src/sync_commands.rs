@@ -1,11 +1,13 @@
 //! Tauri IPC commands for file sync/backup (sync-vault).
 
 use rust_air_core::{
+    transfer,
     default_excludes, fmt_bytes, full_sync, start_watcher,
-    SyncConfig, SyncEvent, SyncStore,
+    SyncAction, SyncConfig, SyncEvent, SyncManifestEntry, SyncStore,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,6 +16,7 @@ use std::{
     thread,
 };
 use tauri::{AppHandle, Emitter, State};
+use tokio::sync::oneshot;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -22,6 +25,7 @@ pub struct SyncState {
     config:  Mutex<SyncConfig>,
     watch_session: Mutex<Option<WatchSession>>,
     running: Arc<AtomicBool>,
+    pending_remote_sync: Mutex<HashMap<String, oneshot::Sender<RemoteSyncResponse>>>,
 }
 
 struct WatchSession {
@@ -48,6 +52,26 @@ impl SyncState {
             config:  Mutex::new(config),
             watch_session: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
+            pending_remote_sync: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register_pending_remote_sync(&self, request_id: String) -> oneshot::Receiver<RemoteSyncResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_remote_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id, tx);
+        rx
+    }
+
+    fn resolve_pending_remote_sync(&self, response: RemoteSyncResponse) {
+        if let Some(tx) = self.pending_remote_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&response.request_id)
+        {
+            let _ = tx.send(response);
         }
     }
 }
@@ -61,6 +85,26 @@ pub struct SyncStatus {
     pub total_bytes:  String,
     pub is_running:   bool,
     pub is_watching:  bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemoteSyncRequest {
+    request_id: String,
+    manifest: Vec<SyncManifestEntry>,
+    callback_addr: String,
+    excludes: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemoteSyncResponse {
+    request_id: String,
+    manifest: Vec<SyncManifestEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemoteSyncFileRequest {
+    rel: String,
+    callback_addr: String,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -93,6 +137,137 @@ pub fn get_sync_status(state: State<'_, SyncState>) -> SyncStatus {
 #[tauri::command]
 pub fn get_default_excludes() -> Vec<String> {
     default_excludes()
+}
+
+#[tauri::command]
+pub async fn start_remote_sync(
+    remote_addr: String,
+    callback_addr: String,
+    state: State<'_, SyncState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if state.running.swap(true, Ordering::AcqRel) {
+        return Err("sync already running".into());
+    }
+
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if config.src.is_empty() {
+        state.running.store(false, Ordering::Release);
+        return Err("source directory must be set".into());
+    }
+
+    let src = PathBuf::from(&config.src);
+    let excludes = config.excludes.clone();
+    let local_manifest = rust_air_core::sync_vault::build_manifest(&src, &excludes);
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request = RemoteSyncRequest {
+        request_id: request_id.clone(),
+        manifest: local_manifest.clone(),
+        callback_addr,
+        excludes: excludes.clone(),
+    };
+    let response_rx = state.register_pending_remote_sync(request_id.clone());
+
+    let json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    let stream = tokio::net::TcpStream::connect(&remote_addr).await.map_err(|e| e.to_string())?;
+    transfer::send_clipboard(stream, &json, "sync:manifest-request", |_| {}).await.map_err(|e| e.to_string())?;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(20), response_rx)
+        .await
+        .map_err(|_| "timed out waiting for remote sync manifest response".to_string())?
+        .map_err(|_| "remote sync response channel closed".to_string())?;
+
+    let actions = rust_air_core::sync_vault::diff_manifests_latest_wins(&local_manifest, &response.manifest);
+    for action in &actions {
+        match action {
+            SyncAction::PushToRemote(entry) => {
+                let src_file = src.join(&entry.rel);
+                let logical_name = format!("sync:file:{}", entry.rel);
+                let stream = tokio::net::TcpStream::connect(&remote_addr).await.map_err(|e| e.to_string())?;
+                transfer::send_path_as(stream, &src_file, Some(&logical_name), |_| {}).await.map_err(|e| e.to_string())?;
+                app.emit("sync-event", SyncEvent::Copied { rel: entry.rel.clone(), bytes: entry.size }).ok();
+            }
+            SyncAction::PullFromRemote(entry) => {
+                let req = RemoteSyncFileRequest { rel: entry.rel.clone(), callback_addr: request.callback_addr.clone() };
+                let json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+                let stream = tokio::net::TcpStream::connect(&remote_addr).await.map_err(|e| e.to_string())?;
+                transfer::send_clipboard(stream, &json, "sync:file-request", |_| {}).await.map_err(|e| e.to_string())?;
+                app.emit("sync-event", SyncEvent::Progress { scanned: 0, total: 0 }).ok();
+            }
+        }
+    }
+    app.emit("sync-done", ()).ok();
+    state.running.store(false, Ordering::Release);
+    Ok(())
+}
+
+pub async fn handle_sync_manifest_request(
+    data: &[u8],
+    state: &SyncState,
+) -> Result<(), String> {
+    let req: RemoteSyncRequest = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if config.src.is_empty() {
+        return Err("local sync source directory not configured".to_string());
+    }
+    let src = PathBuf::from(&config.src);
+    let manifest = rust_air_core::sync_vault::build_manifest(&src, &config.excludes);
+    let resp = RemoteSyncResponse {
+        request_id: req.request_id,
+        manifest,
+    };
+    let json = serde_json::to_string(&resp).map_err(|e| e.to_string())?;
+    let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
+    transfer::send_clipboard(stream, &json, "sync:manifest-response", |_| {}).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn handle_sync_manifest_response(
+    data: &[u8],
+    state: &SyncState,
+) -> Result<(), String> {
+    let resp: RemoteSyncResponse = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    state.resolve_pending_remote_sync(resp);
+    Ok(())
+}
+
+pub async fn handle_sync_file_request(
+    data: &[u8],
+    state: &SyncState,
+) -> Result<(), String> {
+    let req: RemoteSyncFileRequest = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if config.src.is_empty() {
+        return Err("local sync source directory not configured".to_string());
+    }
+    let src_file = PathBuf::from(&config.src).join(&req.rel);
+    if !src_file.exists() {
+        return Err(format!("sync source file not found: {}", src_file.display()));
+    }
+    let logical_name = format!("sync:file:{}", req.rel);
+    let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
+    transfer::send_path_as(stream, &src_file, Some(&logical_name), |_| {}).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn handle_received_sync_file(
+    temp_path: &std::path::Path,
+    logical_name: &str,
+    state: &SyncState,
+) -> Result<PathBuf, String> {
+    let rel = logical_name
+        .strip_prefix("sync:file:")
+        .ok_or_else(|| "invalid sync file logical name".to_string())?;
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if config.src.is_empty() {
+        return Err("local sync source directory not configured".to_string());
+    }
+    let dst = PathBuf::from(&config.src).join(rel);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::copy(temp_path, &dst).map_err(|e| e.to_string())?;
+    Ok(dst)
 }
 
 /// Run a full sync in a background thread.

@@ -82,6 +82,7 @@ pub struct SyncState {
 pub struct SyncConfig {
     pub src:            String,
     pub dst:            String,
+    pub remote_addr:    String,
     pub delete_removed: bool,
     pub excludes:       Vec<String>,
     pub auto_watch:     bool,

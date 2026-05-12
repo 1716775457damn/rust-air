@@ -35,7 +35,7 @@ pub use proto::{DeviceInfo, DeviceStatus, TransferEvent};
 
 // ── Desktop-only re-exports ───────────────────────────────────────────────────
 #[cfg(feature = "desktop")]
-pub use sync_vault::{SyncConfig, SyncEvent, SyncStore, full_sync, start_watcher, fmt_bytes, default_excludes};
+pub use sync_vault::{SyncAction, SyncConfig, SyncEvent, SyncManifestEntry, SyncStore, full_sync, start_watcher, fmt_bytes, default_excludes};
 #[cfg(feature = "desktop")]
 pub use sync_vault::ExcludeSet;
 #[cfg(feature = "desktop")]

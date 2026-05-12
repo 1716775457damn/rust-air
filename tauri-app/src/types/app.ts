@@ -46,6 +46,7 @@ export interface SearchEvent {
 export interface SyncConfig {
   src: string
   dst: string
+  remote_addr: string
   delete_removed: boolean
   excludes: string[]
   auto_watch: boolean

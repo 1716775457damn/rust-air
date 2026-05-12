@@ -118,7 +118,7 @@ async fn remove_manifest(path: &Path) {
 /// raw decrypted bytes so the caller can post-process (EchoGuard, history, etc.).
 pub enum ReceiveOutcome {
     /// File or archive saved to disk.
-    File(PathBuf),
+    File { path: PathBuf, name: String, kind: Kind },
     /// Clipboard data received and written to system clipboard.
     /// `name` is the header name field (e.g. "clip:text:DEVICE"), `data` is the
     /// raw decrypted payload bytes.
@@ -129,8 +129,22 @@ impl ReceiveOutcome {
     /// Return the output path regardless of variant.
     pub fn path(&self) -> &Path {
         match self {
-            ReceiveOutcome::File(p) => p,
+            ReceiveOutcome::File { path, .. } => path,
             ReceiveOutcome::Clipboard { path, .. } => path,
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            ReceiveOutcome::File { name, .. } => Some(name.as_str()),
+            ReceiveOutcome::Clipboard { .. } => None,
+        }
+    }
+
+    pub fn kind(&self) -> Option<Kind> {
+        match self {
+            ReceiveOutcome::File { kind, .. } => Some(*kind),
+            ReceiveOutcome::Clipboard { .. } => None,
         }
     }
 }
@@ -144,11 +158,25 @@ pub async fn send_path(
     path: &Path,
     on_progress: impl Fn(TransferEvent) + Send + Sync + 'static,
 ) -> Result<()> {
+    send_path_as(stream, path, None, on_progress).await
+}
+
+/// Send a file or folder using an explicit logical name in the transfer header.
+/// This is used by higher-level protocols such as bidirectional sync where the
+/// destination-relative path must be preserved exactly.
+pub async fn send_path_as(
+    stream: TcpStream,
+    path: &Path,
+    logical_name: Option<&str>,
+    on_progress: impl Fn(TransferEvent) + Send + Sync + 'static,
+) -> Result<()> {
     let key = random_key();
     let meta = tokio::fs::metadata(path).await?;
     let is_dir = meta.is_dir();
     let kind = if is_dir { Kind::Archive } else { Kind::File };
-    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let name = logical_name
+        .map(str::to_string)
+        .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().into_owned());
     let total_size: u64;
     let dir_entries: Option<Vec<(WalkDirEntry, std::fs::Metadata)>>;
     if is_dir {
@@ -348,7 +376,7 @@ pub async fn receive_to_disk(
             // Write to system clipboard (desktop only)
             #[cfg(feature = "desktop")]
             {
-                if name.starts_with("wb:") {
+                if name.starts_with("wb:") || name.starts_with("sync:") {
                     // Whiteboard sync messages reuse the clipboard transport but must not
                     // overwrite the user's real system clipboard.
                 } else if name.starts_with("clip:image:") {
@@ -626,7 +654,7 @@ async fn receive_file_branch(
     tokio::fs::rename(part_path, &final_path).await?;
     let now = Instant::now();
     emit_progress_resume(on_progress, done, total_size, true, is_resumed, already_have, &mut speed, now);
-    Ok(ReceiveOutcome::File(final_path))
+    Ok(ReceiveOutcome::File { path: final_path, name: name.to_string(), kind: Kind::File })
 }
 
 /// Archive receive branch with resume support.
@@ -764,7 +792,7 @@ async fn receive_archive_branch(
 
     let now = Instant::now();
     emit_progress_resume(on_progress, total_size, total_size, true, is_resumed, already_have, &mut speed, now);
-    Ok(ReceiveOutcome::File(dest.to_path_buf()))
+    Ok(ReceiveOutcome::File { path: dest.to_path_buf(), name: _name.to_string(), kind: Kind::Archive })
 }
 
 // ── Wire helpers ──────────────────────────────────────────────────────────────

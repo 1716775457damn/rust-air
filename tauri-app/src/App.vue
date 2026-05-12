@@ -99,6 +99,7 @@ const {
 const {
   devices,
   scanning,
+  myPort,
   primaryIp,
   ipCopied,
   peersOnlyFor,
@@ -144,6 +145,7 @@ const {
   pickSyncSrc,
   pickSyncDst,
   saveAndSync,
+  startRemoteSync,
   toggleWatch,
   addExclude,
   removeExclude,
@@ -868,6 +870,7 @@ function updateSyncConfigField(field: string, value: string | boolean) {
             @pick-src="pickSyncSrc"
             @pick-dst="pickSyncDst"
             @save-and-sync="saveAndSync"
+            @remote-sync="startRemoteSync(myPort ? `${primaryIp}:${myPort}` : '')"
             @toggle-watch="toggleWatch"
             @add-exclude="addExclude"
             @remove-exclude="removeExclude"

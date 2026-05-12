@@ -131,6 +131,7 @@ pub fn run() {
             sync_commands::get_sync_status,
             sync_commands::get_default_excludes,
             sync_commands::start_sync,
+            sync_commands::start_remote_sync,
             sync_commands::sync_done,
             sync_commands::start_watch,
             sync_commands::stop_watch,
