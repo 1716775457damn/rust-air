@@ -16,6 +16,8 @@ use tauri::{AppHandle, Emitter};
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_API: &str =
     "https://api.github.com/repos/1716775457damn/rust-air/releases/latest";
+const GITHUB_RELEASES_LATEST: &str =
+    "https://github.com/1716775457damn/rust-air/releases/latest";
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -216,8 +218,105 @@ async fn fetch_latest_release() -> anyhow::Result<GhRelease> {
         .user_agent(format!("rust-air/{CURRENT_VERSION}"))
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
-    let release = client.get(GITHUB_API).send().await?.json::<GhRelease>().await?;
-    Ok(release)
+
+    let resp = client
+        .get(GITHUB_API)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body = resp.text().await?;
+    if status.is_success() {
+        match serde_json::from_str::<GhRelease>(&body) {
+            Ok(release) => return Ok(release),
+            Err(err) => {
+                eprintln!(
+                    "warn: GitHub API decode failed, falling back to HTML release page: {err}"
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "warn: GitHub API returned status {}, falling back to HTML release page",
+            status
+        );
+    }
+
+    fetch_latest_release_from_html(&client).await
+}
+
+async fn fetch_latest_release_from_html(client: &reqwest::Client) -> anyhow::Result<GhRelease> {
+    use anyhow::{anyhow, Context};
+    use regex::Regex;
+
+    let resp = client.get(GITHUB_RELEASES_LATEST).send().await?;
+    let final_url = resp.url().clone();
+    let html = resp.text().await?;
+
+    let tag_name = final_url
+        .path_segments()
+        .and_then(|segments| segments.last())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            Regex::new(r#"/releases/tag/([^\"?#]+)"#)
+                .ok()
+                .and_then(|re| re.captures(&html))
+                .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+        })
+        .ok_or_else(|| anyhow!("unable to determine latest release tag from GitHub HTML page"))?;
+
+    let href_re = Regex::new(r#"href=\"([^\"]+/releases/download/[^\"]+)\""#)
+        .context("compile asset href regex")?;
+    let body_re = Regex::new(r#"(?s)<div[^>]*data-test-selector=\"body-content\"[^>]*>(.*?)</div>"#)
+        .context("compile release body regex")?;
+    let strip_tags_re = Regex::new(r"<[^>]+>").context("compile strip tags regex")?;
+
+    let mut assets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for caps in href_re.captures_iter(&html) {
+        let Some(raw_href) = caps.get(1).map(|m| m.as_str()) else { continue };
+        let href = raw_href.replace("&amp;", "&");
+        let absolute = if href.starts_with("http://") || href.starts_with("https://") {
+            href.clone()
+        } else {
+            format!("https://github.com{href}")
+        };
+        if !seen.insert(absolute.clone()) {
+            continue;
+        }
+        let name = absolute.rsplit('/').next().unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        assets.push(GhAsset {
+            name,
+            browser_download_url: absolute,
+            size: 0,
+        });
+    }
+
+    let release_notes = body_re
+        .captures(&html)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+        .map(|body| strip_tags_re.replace_all(&body, " ").to_string())
+        .map(|body| {
+            body.replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&nbsp;", " ")
+        })
+        .map(|body| body.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+
+    Ok(GhRelease {
+        tag_name,
+        body: Some(release_notes),
+        assets,
+    })
 }
 
 /// Pick the right installer asset for the current platform.

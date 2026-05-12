@@ -137,7 +137,9 @@ const {
 const {
   syncConfig,
   syncStatus,
+  syncProgress,
   syncLog,
+  syncErrors,
   syncExcludeInput,
   loadInitialSyncState,
   onSyncEvent,
@@ -487,7 +489,9 @@ function updateSearchField(field: string, value: string | boolean) {
 function updateSyncConfigField(field: string, value: string | boolean) {
   if (field === "src") syncConfig.value.src = value as string
   else if (field === "dst") syncConfig.value.dst = value as string
+  else if (field === "remote_addr") syncConfig.value.remote_addr = value as string
   else if (field === "delete_removed") syncConfig.value.delete_removed = value as boolean
+  else if (field === "auto_watch") syncConfig.value.auto_watch = value as boolean
 }
 </script>
 
@@ -865,8 +869,10 @@ function updateSyncConfigField(field: string, value: string | boolean) {
           <SyncPanel
             :sync-config="syncConfig"
             :sync-status="syncStatus"
+            :sync-progress="syncProgress"
             :sync-exclude-input="syncExcludeInput"
             :sync-log="syncLog"
+            :sync-errors="syncErrors"
             :devices="devices"
             :short-name="shortName"
             @pick-src="pickSyncSrc"

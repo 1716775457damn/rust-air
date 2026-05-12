@@ -60,14 +60,43 @@ export interface SyncStatus {
   is_watching: boolean
 }
 
+export interface SyncStatsView {
+  label: string
+  scanned_files: number
+  hashed_files: number
+  cached_files: number
+}
+
+export interface SyncProgressView {
+  phase: string
+  detail: string
+  tone: "idle" | "running" | "done" | "error"
+  current: number
+  total: number
+  push_count: number
+  pull_count: number
+  delete_count: number
+  stats: SyncStatsView[]
+}
+
 export interface SyncEventPayload {
   kind: string
+  phase?: string
+  detail?: string
+  current?: number
+  push_count?: number
+  pull_count?: number
+  delete_count?: number
+  label?: string
   msg?: string
   rel?: string
   bytes?: number
   err?: string
   scanned?: number
   total?: number
+  hashed_files?: number
+  cached_files?: number
+  scanned_files?: number
   total_files?: number
   total_bytes?: number
 }

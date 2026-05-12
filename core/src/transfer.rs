@@ -125,6 +125,13 @@ pub enum ReceiveOutcome {
     Clipboard { path: PathBuf, name: String, data: Vec<u8> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendOutcome {
+    pub logical_name: String,
+    pub total_size: u64,
+    pub checksum_hex: String,
+}
+
 impl ReceiveOutcome {
     /// Return the output path regardless of variant.
     pub fn path(&self) -> &Path {
@@ -170,6 +177,15 @@ pub async fn send_path_as(
     logical_name: Option<&str>,
     on_progress: impl Fn(TransferEvent) + Send + Sync + 'static,
 ) -> Result<()> {
+    send_path_as_with_outcome(stream, path, logical_name, on_progress).await.map(|_| ())
+}
+
+pub async fn send_path_as_with_outcome(
+    stream: TcpStream,
+    path: &Path,
+    logical_name: Option<&str>,
+    on_progress: impl Fn(TransferEvent) + Send + Sync + 'static,
+) -> Result<SendOutcome> {
     let key = random_key();
     let meta = tokio::fs::metadata(path).await?;
     let is_dir = meta.is_dir();
@@ -260,7 +276,11 @@ pub async fn send_path_as(
     // v4 protocol: EOF sentinel first, then SHA-256 checksum.
     enc.shutdown().await?;
     enc.write_trailing(&checksum).await?;
-    Ok(())
+    Ok(SendOutcome {
+        logical_name: name,
+        total_size,
+        checksum_hex: hex::encode(checksum),
+    })
 }
 
 // ── Receive ───────────────────────────────────────────────────────────────────
@@ -1184,5 +1204,18 @@ mod tests {
             rate > 3 * 1024 * 1024,
             "resumed transfer speed should still reflect useful throughput, got {rate} B/s"
         );
+    }
+
+    #[test]
+    fn send_outcome_carries_expected_metadata() {
+        let outcome = SendOutcome {
+            logical_name: "sync:file:test".to_string(),
+            total_size: 123,
+            checksum_hex: "abc123".to_string(),
+        };
+
+        assert_eq!(outcome.logical_name, "sync:file:test");
+        assert_eq!(outcome.total_size, 123);
+        assert_eq!(outcome.checksum_hex, "abc123");
     }
 }

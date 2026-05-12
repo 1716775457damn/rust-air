@@ -25,6 +25,13 @@ type FileInfo = (String, PathBuf, u64, String);
 /// Type alias for files needing hash computation: (relative_path, absolute_path, size).
 type NeedHashInfo = (String, PathBuf, u64);
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ManifestBuildStats {
+    pub scanned_files: usize,
+    pub hashed_files: usize,
+    pub cached_files: usize,
+}
+
 /// A fully materialized file manifest entry used for cross-device full sync.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncManifestEntry {
@@ -40,8 +47,8 @@ pub struct SyncManifestEntry {
 pub enum SyncAction {
     PushToRemote(SyncManifestEntry),
     PullFromRemote(SyncManifestEntry),
-    DeleteRemote(String),
-    DeleteLocal(String),
+    DeleteRemote(SyncManifestEntry),
+    DeleteLocal(SyncManifestEntry),
 }
 
 /// NFD → NFC: macOS HFS+ stores paths in NFD; compose to NFC for correct display.
@@ -57,6 +64,9 @@ fn nfc(s: &str) -> String {
 #[serde(tag = "kind")]
 pub enum SyncEvent {
     Info     { msg: String },
+    Phase    { phase: String, detail: String },
+    ActionProgress { current: usize, total: usize, push_count: usize, pull_count: usize, delete_count: usize },
+    Stats    { label: String, scanned_files: usize, hashed_files: usize, cached_files: usize },
     Copied   { rel: String, bytes: u64 },
     Deleted  { rel: String },
     Error    { rel: String, err: String },
@@ -158,7 +168,16 @@ pub fn full_sync(
     excludes: &[String],
     tx: &Sender<SyncEvent>,
 ) {
+    let _ = tx.send(SyncEvent::Phase {
+        phase: "scan".to_string(),
+        detail: "扫描本地源目录并比对缓存状态".to_string(),
+    });
     let (to_copy, seen) = scan_needed(src, store, excludes, tx);
+
+    let _ = tx.send(SyncEvent::Phase {
+        phase: "transfer".to_string(),
+        detail: format!("准备复制 {} 个变更文件", to_copy.len()),
+    });
 
     for (rel, abs, size, hash) in to_copy {
         let dst_path = dst.join(&rel);
@@ -166,6 +185,10 @@ pub fn full_sync(
     }
 
     if delete_removed {
+        let _ = tx.send(SyncEvent::Phase {
+            phase: "cleanup".to_string(),
+            detail: "处理已删除文件".to_string(),
+        });
         // Collect keys to remove before mutating the map.
         let removed: Vec<String> = store.state.files.keys()
             .filter(|k| !seen.contains(*k))
@@ -182,6 +205,10 @@ pub fn full_sync(
 
     store.state.last_sync = Some(Local::now());
     store.mark_dirty();
+    let _ = tx.send(SyncEvent::Phase {
+        phase: "finalize".to_string(),
+        detail: "写入同步状态".to_string(),
+    });
     let _ = tx.send(SyncEvent::Done {
         total_files: store.state.total_synced,
         total_bytes: store.state.total_bytes,
@@ -344,14 +371,25 @@ pub fn build_manifest_with_state(
     excludes: &[String],
     include_deleted: bool,
 ) -> Vec<SyncManifestEntry> {
+    build_manifest_with_state_and_stats(src, store, excludes, include_deleted).0
+}
+
+pub fn build_manifest_with_state_and_stats(
+    src: &Path,
+    store: &SyncStore,
+    excludes: &[String],
+    include_deleted: bool,
+) -> (Vec<SyncManifestEntry>, ManifestBuildStats) {
     let ex = ExcludeSet::new(excludes);
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
+    let mut stats = ManifestBuildStats::default();
 
     for entry in WalkDir::new(src).follow_links(false).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
+        stats.scanned_files += 1;
 
         let abs = entry.path();
         let rel = match abs.strip_prefix(src) {
@@ -367,19 +405,34 @@ pub fn build_manifest_with_state(
             Ok(m) => m,
             Err(_) => continue,
         };
+        let size = meta.len();
         let modified_ts = meta
             .modified()
             .ok()
             .map(|t| chrono::DateTime::<Local>::from(t).timestamp())
             .unwrap_or(0);
-        let hash = match hash_file(abs) {
-            Ok(h) => h,
-            Err(_) => continue,
+        let hash = if let Some(rec) = store.state.files.get(&rel) {
+            if record_matches(size, modified_ts, rec) {
+                stats.cached_files += 1;
+                rec.hash.clone()
+            } else {
+                stats.hashed_files += 1;
+                match hash_file(abs) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                }
+            }
+        } else {
+            stats.hashed_files += 1;
+            match hash_file(abs) {
+                Ok(h) => h,
+                Err(_) => continue,
+            }
         };
 
         entries.push(SyncManifestEntry {
             rel,
-            size: meta.len(),
+            size,
             modified_ts,
             hash,
             deleted: false,
@@ -402,7 +455,7 @@ pub fn build_manifest_with_state(
     }
 
     entries.sort_by(|a, b| a.rel.cmp(&b.rel));
-    entries
+    (entries, stats)
 }
 
 /// Compute latest-wins bidirectional sync actions to converge local and remote manifests.
@@ -435,7 +488,7 @@ pub fn diff_manifests_latest_wins(
                 }
                 if local_entry.deleted && !remote_entry.deleted {
                     if local_entry.modified_ts > remote_entry.modified_ts {
-                        actions.push(SyncAction::DeleteRemote(local_entry.rel.clone()));
+                        actions.push(SyncAction::DeleteRemote((*local_entry).clone()));
                     } else {
                         actions.push(SyncAction::PullFromRemote((*remote_entry).clone()));
                     }
@@ -443,7 +496,7 @@ pub fn diff_manifests_latest_wins(
                 }
                 if !local_entry.deleted && remote_entry.deleted {
                     if remote_entry.modified_ts >= local_entry.modified_ts {
-                        actions.push(SyncAction::DeleteLocal(remote_entry.rel.clone()));
+                        actions.push(SyncAction::DeleteLocal((*remote_entry).clone()));
                     } else {
                         actions.push(SyncAction::PushToRemote((*local_entry).clone()));
                     }
@@ -531,6 +584,10 @@ fn scan_needed(
     (to_copy, seen)
 }
 
+fn record_matches(size: u64, modified_ts: i64, rec: &FileRecord) -> bool {
+    rec.size == size && rec.modified.timestamp() == modified_ts
+}
+
 fn atomic_copy(
     src: &Path, dst: &Path, rel: &str,
     hash: String, size: u64,
@@ -547,8 +604,12 @@ fn atomic_copy(
                 let _ = tx.send(SyncEvent::Error { rel: rel.to_string(), err: e.to_string() });
                 return;
             }
+            let modified = std::fs::metadata(src)
+                .and_then(|m| m.modified())
+                .map(chrono::DateTime::<Local>::from)
+                .unwrap_or_else(|_| Local::now());
             store.state.files.insert(rel.to_string(), FileRecord {
-                hash, size, modified: Local::now(),
+                hash, size, modified,
             });
             store.state.deleted.remove(rel);
             store.state.total_synced += 1;
@@ -688,6 +749,77 @@ mod sync_manifest_tests {
     }
 
     #[test]
+    fn test_build_manifest_reuses_cached_hash_when_size_and_mtime_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("cached.txt");
+        fs::write(&file_path, b"fresh-bytes").unwrap();
+
+        let meta = fs::metadata(&file_path).unwrap();
+        let modified = meta.modified().unwrap();
+        let modified_local = chrono::DateTime::<Local>::from(modified);
+
+        let mut store = SyncStore::load();
+        store.state.files.insert(
+            "cached.txt".to_string(),
+            FileRecord {
+                hash: "cached-hash-value".to_string(),
+                size: meta.len(),
+                modified: modified_local,
+            },
+        );
+
+        let manifest = build_manifest_with_state(dir.path(), &store, &[], false);
+        let entry = manifest.iter().find(|e| e.rel == "cached.txt").unwrap();
+
+        assert_eq!(entry.hash, "cached-hash-value");
+        assert_eq!(entry.size, meta.len());
+        assert_eq!(entry.modified_ts, modified_local.timestamp());
+    }
+
+    #[test]
+    fn test_build_manifest_reports_cache_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached_path = dir.path().join("cached.txt");
+        let fresh_path = dir.path().join("fresh.txt");
+        fs::write(&cached_path, b"cached-bytes").unwrap();
+        fs::write(&fresh_path, b"fresh-bytes").unwrap();
+
+        let meta = fs::metadata(&cached_path).unwrap();
+        let modified_local = chrono::DateTime::<Local>::from(meta.modified().unwrap());
+
+        let mut store = SyncStore::load();
+        store.state.files.insert(
+            "cached.txt".to_string(),
+            FileRecord {
+                hash: "cached-hash-value".to_string(),
+                size: meta.len(),
+                modified: modified_local,
+            },
+        );
+
+        let (_manifest, stats) = build_manifest_with_state_and_stats(dir.path(), &store, &[], false);
+        assert_eq!(stats.scanned_files, 2);
+        assert_eq!(stats.cached_files, 1);
+        assert_eq!(stats.hashed_files, 1);
+    }
+
+    #[test]
+    fn test_action_progress_event_serializes_counters() {
+        let ev = SyncEvent::ActionProgress {
+            current: 2,
+            total: 5,
+            push_count: 1,
+            pull_count: 1,
+            delete_count: 0,
+        };
+
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"kind\":\"ActionProgress\""));
+        assert!(json.contains("\"current\":2"));
+        assert!(json.contains("\"total\":5"));
+    }
+
+    #[test]
     fn test_diff_manifests_delete_remote_when_local_tombstone_newer() {
         let local = vec![SyncManifestEntry {
             rel: "gone.txt".to_string(),
@@ -705,7 +837,13 @@ mod sync_manifest_tests {
         }];
 
         let diff = diff_manifests_latest_wins(&local, &remote);
-        assert_eq!(diff, vec![SyncAction::DeleteRemote("gone.txt".to_string())]);
+        assert_eq!(diff, vec![SyncAction::DeleteRemote(SyncManifestEntry {
+            rel: "gone.txt".to_string(),
+            size: 0,
+            modified_ts: 200,
+            hash: String::new(),
+            deleted: true,
+        })]);
     }
 
     #[test]
@@ -726,7 +864,13 @@ mod sync_manifest_tests {
         }];
 
         let diff = diff_manifests_latest_wins(&local, &remote);
-        assert_eq!(diff, vec![SyncAction::DeleteLocal("gone.txt".to_string())]);
+        assert_eq!(diff, vec![SyncAction::DeleteLocal(SyncManifestEntry {
+            rel: "gone.txt".to_string(),
+            size: 0,
+            modified_ts: 200,
+            hash: String::new(),
+            deleted: true,
+        })]);
     }
 
     #[test]
@@ -811,8 +955,20 @@ mod sync_manifest_tests {
 
         assert!(diff.contains(&SyncAction::PushToRemote(local[0].clone())));
         assert!(diff.contains(&SyncAction::PullFromRemote(remote[1].clone())));
-        assert!(diff.contains(&SyncAction::DeleteRemote("delete-remote.txt".to_string())));
-        assert!(diff.contains(&SyncAction::DeleteLocal("delete-local.txt".to_string())));
+        assert!(diff.contains(&SyncAction::DeleteRemote(SyncManifestEntry {
+            rel: "delete-remote.txt".to_string(),
+            size: 0,
+            modified_ts: 300,
+            hash: String::new(),
+            deleted: true,
+        })));
+        assert!(diff.contains(&SyncAction::DeleteLocal(SyncManifestEntry {
+            rel: "delete-local.txt".to_string(),
+            size: 0,
+            modified_ts: 300,
+            hash: String::new(),
+            deleted: true,
+        })));
         assert_eq!(diff.len(), 4);
     }
 }

@@ -115,14 +115,11 @@ pub async fn start_listener(
                                         match crate::sync_commands::handle_received_sync_file(&path, &name, &ss) {
                                             Ok((request_id, rel, final_path)) => {
                                                 ss.resolve_pending_remote_file(request_id, Ok(final_path.clone()));
-                                                app2.emit("sync-event", rust_air_core::SyncEvent::Copied {
-                                                    rel,
-                                                    bytes: std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0),
-                                                }).ok();
+                                                let _ = rel;
                                             }
                                             Err(e) => {
                                                 if let Some(payload) = name.strip_prefix("sync:file:") {
-                                                    let request_id = payload.splitn(2, ':').next().unwrap_or_default().to_string();
+                                                    let request_id = payload.splitn(5, ':').next().unwrap_or_default().to_string();
                                                     ss.resolve_pending_remote_file(request_id, Err(e.clone()));
                                                 }
                                                 app2.emit("sync-event", rust_air_core::SyncEvent::Error {
