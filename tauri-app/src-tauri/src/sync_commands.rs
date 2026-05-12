@@ -26,6 +26,7 @@ pub struct SyncState {
     watch_session: Mutex<Option<WatchSession>>,
     running: Arc<AtomicBool>,
     pending_remote_sync: Mutex<HashMap<String, oneshot::Sender<RemoteSyncResponse>>>,
+    pending_remote_files: Mutex<HashMap<String, oneshot::Sender<Result<PathBuf, String>>>>,
 }
 
 struct WatchSession {
@@ -53,6 +54,7 @@ impl SyncState {
             watch_session: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
             pending_remote_sync: Mutex::new(HashMap::new()),
+            pending_remote_files: Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,6 +74,25 @@ impl SyncState {
             .remove(&response.request_id)
         {
             let _ = tx.send(response);
+        }
+    }
+
+    fn register_pending_remote_file(&self, request_id: String) -> oneshot::Receiver<Result<PathBuf, String>> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_remote_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id, tx);
+        rx
+    }
+
+    pub(crate) fn resolve_pending_remote_file(&self, request_id: String, result: Result<PathBuf, String>) {
+        if let Some(tx) = self.pending_remote_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_id)
+        {
+            let _ = tx.send(result);
         }
     }
 }
@@ -103,6 +124,7 @@ struct RemoteSyncResponse {
 
 #[derive(Serialize, Deserialize)]
 struct RemoteSyncFileRequest {
+    request_id: String,
     rel: String,
     callback_addr: String,
 }
@@ -178,24 +200,42 @@ pub async fn start_remote_sync(
         .map_err(|_| "remote sync response channel closed".to_string())?;
 
     let actions = rust_air_core::sync_vault::diff_manifests_latest_wins(&local_manifest, &response.manifest);
+    let mut pull_waiters = Vec::new();
     for action in &actions {
         match action {
             SyncAction::PushToRemote(entry) => {
                 let src_file = src.join(&entry.rel);
-                let logical_name = format!("sync:file:{}", entry.rel);
+                let logical_name = format!("sync:file:push:{}", entry.rel);
                 let stream = tokio::net::TcpStream::connect(&remote_addr).await.map_err(|e| e.to_string())?;
                 transfer::send_path_as(stream, &src_file, Some(&logical_name), |_| {}).await.map_err(|e| e.to_string())?;
                 app.emit("sync-event", SyncEvent::Copied { rel: entry.rel.clone(), bytes: entry.size }).ok();
             }
             SyncAction::PullFromRemote(entry) => {
-                let req = RemoteSyncFileRequest { rel: entry.rel.clone(), callback_addr: request.callback_addr.clone() };
+                let file_request_id = uuid::Uuid::new_v4().to_string();
+                let req = RemoteSyncFileRequest {
+                    request_id: file_request_id.clone(),
+                    rel: entry.rel.clone(),
+                    callback_addr: request.callback_addr.clone(),
+                };
+                let waiter = state.register_pending_remote_file(file_request_id.clone());
                 let json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
                 let stream = tokio::net::TcpStream::connect(&remote_addr).await.map_err(|e| e.to_string())?;
                 transfer::send_clipboard(stream, &json, "sync:file-request", |_| {}).await.map_err(|e| e.to_string())?;
-                app.emit("sync-event", SyncEvent::Progress { scanned: 0, total: 0 }).ok();
+                pull_waiters.push((entry.rel.clone(), waiter));
             }
         }
     }
+
+    for (rel, waiter) in pull_waiters {
+        let received = tokio::time::timeout(std::time::Duration::from_secs(60), waiter)
+            .await
+            .map_err(|_| format!("timed out waiting for synced file: {rel}"))?
+            .map_err(|_| format!("sync file completion channel closed: {rel}"))?;
+        if let Err(e) = received {
+            app.emit("sync-event", SyncEvent::Error { rel: rel.clone(), err: e }).ok();
+        }
+    }
+
     app.emit("sync-done", ()).ok();
     state.running.store(false, Ordering::Release);
     Ok(())
@@ -244,7 +284,7 @@ pub async fn handle_sync_file_request(
     if !src_file.exists() {
         return Err(format!("sync source file not found: {}", src_file.display()));
     }
-    let logical_name = format!("sync:file:{}", req.rel);
+    let logical_name = format!("sync:file:{}:{}", req.request_id, req.rel);
     let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
     transfer::send_path_as(stream, &src_file, Some(&logical_name), |_| {}).await.map_err(|e| e.to_string())?;
     Ok(())
@@ -254,10 +294,13 @@ pub fn handle_received_sync_file(
     temp_path: &std::path::Path,
     logical_name: &str,
     state: &SyncState,
-) -> Result<PathBuf, String> {
-    let rel = logical_name
+) -> Result<(String, String, PathBuf), String> {
+    let payload = logical_name
         .strip_prefix("sync:file:")
         .ok_or_else(|| "invalid sync file logical name".to_string())?;
+    let mut parts = payload.splitn(2, ':');
+    let request_id = parts.next().unwrap_or_default().to_string();
+    let rel = parts.next().ok_or_else(|| "missing sync file relative path".to_string())?;
     let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if config.src.is_empty() {
         return Err("local sync source directory not configured".to_string());
@@ -267,7 +310,8 @@ pub fn handle_received_sync_file(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::copy(temp_path, &dst).map_err(|e| e.to_string())?;
-    Ok(dst)
+    let _ = std::fs::remove_file(temp_path);
+    Ok((request_id, rel.to_string(), dst))
 }
 
 /// Run a full sync in a background thread.

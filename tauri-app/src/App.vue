@@ -867,6 +867,8 @@ function updateSyncConfigField(field: string, value: string | boolean) {
             :sync-status="syncStatus"
             :sync-exclude-input="syncExcludeInput"
             :sync-log="syncLog"
+            :devices="devices"
+            :short-name="shortName"
             @pick-src="pickSyncSrc"
             @pick-dst="pickSyncDst"
             @save-and-sync="saveAndSync"

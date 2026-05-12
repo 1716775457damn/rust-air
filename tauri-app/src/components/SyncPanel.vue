@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import type { SyncConfig, SyncStatus } from "../types/app"
+import type { Device, SyncConfig, SyncStatus } from "../types/app"
 
 defineProps<{
   syncConfig: SyncConfig
   syncStatus: SyncStatus
   syncExcludeInput: string
   syncLog: string[]
+  devices: Device[]
+  shortName: (name: string) => string
 }>()
 
 const emit = defineEmits<{
@@ -58,6 +60,17 @@ const emit = defineEmits<{
         <input :value="syncConfig.remote_addr" @input="emit('updateConfig', 'remote_addr', ($event.target as HTMLInputElement).value)" placeholder="远端设备地址，例如 192.168.1.5:49821" :title="syncConfig.remote_addr"
           class="flex-1 rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
           style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
+      </div>
+      <div v-if="devices.length > 0" class="flex gap-2 items-center">
+        <span class="text-xs w-8 flex-shrink-0" style="color:var(--text-muted)">设备</span>
+        <select @change="emit('updateConfig', 'remote_addr', ($event.target as HTMLSelectElement).value)"
+          class="flex-1 rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
+          style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)">
+          <option value="">选择已发现设备</option>
+          <option v-for="dev in devices.filter(d => !!d.addr)" :key="dev.name" :value="dev.addr">
+            {{ shortName(dev.name) }} · {{ dev.addr }}
+          </option>
+        </select>
       </div>
       <label class="flex items-center gap-2 text-xs cursor-pointer" style="color:var(--text-secondary)">
         <input type="checkbox" :checked="syncConfig.delete_removed" @change="emit('updateConfig', 'delete_removed', ($event.target as HTMLInputElement).checked)" class="accent-cyan-500" />删除已移除的文件
