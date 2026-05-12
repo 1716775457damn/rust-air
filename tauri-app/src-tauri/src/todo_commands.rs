@@ -42,6 +42,7 @@ impl TodoStore {
 
     /// For testing: create a TodoStore backed by a specific file path.
     #[cfg(test)]
+    #[allow(dead_code)] // Only used in tests
     pub fn with_path(path: PathBuf) -> Self {
         let mut store = Self {
             items: Vec::new(),

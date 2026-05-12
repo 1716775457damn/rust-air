@@ -1,5 +1,7 @@
 //! Tauri IPC command handlers — v3 (scan-and-click, no pre-shared key).
 
+#![allow(clippy::while_let_loop)]
+
 #[cfg(feature = "desktop")]
 use rust_air_core::clipboard;
 #[cfg(feature = "desktop")]
@@ -392,7 +394,7 @@ fn device_name() -> String {
 
 fn default_download_dir() -> PathBuf {
     dirs::download_dir()
-        .or_else(|| dirs::home_dir())
+        .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
 }
 

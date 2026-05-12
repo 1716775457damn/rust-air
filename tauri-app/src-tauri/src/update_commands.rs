@@ -1,16 +1,16 @@
 //! Auto-update: check GitHub Releases, download installer, run silently.
 //!
 //! Flow:
-//!   check_update()  → returns UpdateInfo { version, url, size } or None
-//!   download_and_install(url) → streams download, emits "update-progress",
+//!   `check_update()`  → returns `UpdateInfo` { version, url, size } or None
+//!   `download_and_install(url)` → streams download, emits "update-progress",
 //!                               then launches installer and exits the app.
 //!
 //! Settings (persisted in data_local_dir/rust-air/update-settings.json):
-//!   auto_check:   check on startup (default true)
-//!   auto_install: download+install silently when update found (default false)
+//!   `auto_check`:   check on startup (default true)
+//!   `auto_install`: download+install silently when update found (default false)
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -70,10 +70,7 @@ fn cleanup_record_path() -> Option<PathBuf> {
 /// failure here can never prevent the application from starting.
 pub fn cleanup_old_update_files() {
     // 1. Read the cleanup record (if any) and try to delete the recorded file.
-    let record_path = match cleanup_record_path() {
-        Some(p) => p,
-        None => return,
-    };
+    let Some(record_path) = cleanup_record_path() else { return };
 
     if let Ok(json) = std::fs::read_to_string(&record_path) {
         if let Ok(record) = serde_json::from_str::<CleanupRecord>(&json) {
@@ -305,7 +302,7 @@ async fn download_installer(url: &str, total: u64, app: &AppHandle) -> anyhow::R
     Ok(tmp)
 }
 
-fn launch_installer(path: &PathBuf) -> anyhow::Result<()> {
+fn launch_installer(path: &Path) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
 
@@ -317,11 +314,15 @@ fn launch_installer(path: &PathBuf) -> anyhow::Result<()> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext.eq_ignore_ascii_case("msi") {
             let msi_path = path.to_string_lossy().to_string();
+            eprintln!(
+                "info: Launching MSI installer with version rollback support: {}",
+                msi_path
+            );
             std::process::Command::new("cmd")
                 .args([
                     "/C",
                     &format!(
-                        "ping -n 3 127.0.0.1 >nul & start \"\" msiexec /i \"{}\" /qb REINSTALLMODE=omus",
+                        "ping -n 5 127.0.0.1 >nul & start \"\" msiexec /i \"{}\" /qb REINSTALL=ALL REINSTALLMODE=vomus",
                         msi_path
                     ),
                 ])

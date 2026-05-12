@@ -454,6 +454,7 @@ pub async fn send_path_with_retry(
 ///   Stage 1 (main task): Network read + decrypt via `Decryptor.read_chunk()` + progress
 ///   Stage 2 (spawned):   Hash computation — updates SHA-256, forwards chunks to write
 ///   Stage 3 (spawned):   Disk write — writes chunks to .part file
+#[allow(clippy::too_many_arguments)]
 async fn receive_file_branch(
     key: &[u8; 32],
     rx: impl AsyncReadExt + Unpin,
@@ -582,6 +583,7 @@ async fn receive_file_branch(
 ///   Stage 1 (main task): Network read + decrypt via `Decryptor.read_chunk()` + progress
 ///   Stage 2 (spawned):   Hash computation — updates SHA-256, forwards chunks to write
 ///   Stage 3 (spawned):   Disk write — writes chunks to .part file
+#[allow(clippy::too_many_arguments)]
 async fn receive_archive_branch(
     key: &[u8; 32],
     rx: impl AsyncReadExt + Unpin,

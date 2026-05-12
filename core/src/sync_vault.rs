@@ -19,6 +19,12 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
+/// Type alias for file sync info: (relative_path, absolute_path, size, hash).
+type FileInfo = (String, PathBuf, u64, String);
+
+/// Type alias for files needing hash computation: (relative_path, absolute_path, size).
+type NeedHashInfo = (String, PathBuf, u64);
+
 /// NFD → NFC: macOS HFS+ stores paths in NFD; compose to NFC for correct display.
 #[inline]
 fn nfc(s: &str) -> String {
@@ -301,12 +307,12 @@ fn scan_needed(
     store: &SyncStore,
     excludes: &[String],
     tx: &Sender<SyncEvent>,
-) -> (Vec<(String, PathBuf, u64, String)>, HashSet<String>) {
+) -> (Vec<FileInfo>, HashSet<String>) {
     let ex = ExcludeSet::new(excludes);
     let mut seen    = HashSet::new();
     let mut scanned = 0usize;
     // Candidates that passed the size+mtime fast-path and need hashing.
-    let mut need_hash: Vec<(String, PathBuf, u64)> = Vec::new();
+    let mut need_hash: Vec<NeedHashInfo> = Vec::new();
 
     for entry in WalkDir::new(src).follow_links(false).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() { continue; }
@@ -316,7 +322,7 @@ fn scan_needed(
             Err(_) => continue,
         };
         scanned += 1;
-        if scanned % 100 == 0 { let _ = tx.send(SyncEvent::Progress { scanned, total: 0 }); }
+        if scanned.is_multiple_of(100) { let _ = tx.send(SyncEvent::Progress { scanned, total: 0 }); }
         if ex.matches(&rel) { continue; }
         seen.insert(rel.clone());
 
@@ -354,7 +360,7 @@ fn scan_needed(
         .into_par_iter()
         .filter_map(|(rel, abs, size)| {
             let hash = hash_file(&abs).ok()?;
-            if cached.get(&rel).map_or(false, |h| h == &hash) { return None; }
+            if cached.get(&rel) == Some(&hash) { return None; }
             Some((rel, abs, size, hash))
         })
         .collect();

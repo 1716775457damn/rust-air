@@ -134,12 +134,12 @@ pub fn start_search(
                     Err(_) => return ignore::WalkState::Continue,
                 };
                 let result = if is_text {
-                    if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                         return ignore::WalkState::Continue;
                     }
                     search_file(entry.path(), &re).ok().flatten()
                 } else {
-                    if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                         return ignore::WalkState::Continue;
                     }
                     search_filename(entry.path(), &re)

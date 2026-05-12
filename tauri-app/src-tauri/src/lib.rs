@@ -18,8 +18,6 @@ use std::sync::Mutex;
 use std::sync::Arc;
 #[cfg(feature = "desktop")]
 use tauri::Emitter;
-use tauri_plugin_dialog;
-use tauri_plugin_opener;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -90,18 +88,15 @@ pub fn run() {
                 if !settings.auto_check { return; }
                 // Small delay so the window is visible before any banner appears
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                match update_commands::check_update().await {
-                    Ok(Some(info)) => {
-                        if settings.auto_install {
-                            // Silent background install
-                            let _ = update_commands::download_and_install(
-                                info.url, info.size, app_handle
-                            ).await;
-                        } else {
-                            app_handle.emit("update-available", &info).ok();
-                        }
+                if let Ok(Some(info)) = update_commands::check_update().await {
+                    if settings.auto_install {
+                        // Silent background install
+                        let _ = update_commands::download_and_install(
+                            info.url, info.size, app_handle
+                        ).await;
+                    } else {
+                        app_handle.emit("update-available", &info).ok();
                     }
-                    _ => {}
                 }
             });
             Ok(())

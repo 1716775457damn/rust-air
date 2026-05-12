@@ -73,7 +73,7 @@ pub fn start_clip_monitor(
             if let Ok(c) = arboard::Clipboard::new() { cb = Some(c); break; }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        let mut cb = match cb { Some(c) => c, None => return };
+        let Some(mut cb) = cb else { return };
 
         let mut last_text = String::new();
         let mut last_img_hash = 0u64;
@@ -89,7 +89,7 @@ pub fn start_clip_monitor(
 
         // Emit initial load from disk immediately
         {
-            let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+            let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
             let _ = app.emit("clip-update", &entries);
         }
@@ -99,7 +99,7 @@ pub fn start_clip_monitor(
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
 
-            let paused = *state.paused.lock().unwrap_or_else(|e| e.into_inner());
+            let paused = *state.paused.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // Refresh clipboard handle each tick
             if let Ok(fresh) = arboard::Clipboard::new() { cb = fresh; }
@@ -149,7 +149,7 @@ pub fn start_clip_monitor(
                     }
                 }
 
-                let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+                let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !paused { store.push(content); }
                 store.flush_if_needed();
                 let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
@@ -162,7 +162,7 @@ pub fn start_clip_monitor(
 fn fnv1a(data: &[u8]) -> u64 {
     let step = (data.len() / 512).max(1);
     let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data.iter().step_by(step) { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    for &b in data.iter().step_by(step) { h ^= u64::from(b); h = h.wrapping_mul(0x100000001b3); }
     h
 }
 
@@ -170,13 +170,13 @@ fn fnv1a(data: &[u8]) -> u64 {
 
 #[tauri::command]
 pub fn get_history(state: State<'_, Arc<HistoryState>>) -> Vec<ClipEntryView> {
-    state.store.lock().unwrap_or_else(|e| e.into_inner())
+    state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .entries.iter().map(ClipEntryView::from).collect()
 }
 
 #[tauri::command]
 pub fn copy_history_entry(id: u64, app: AppHandle, state: State<'_, Arc<HistoryState>>) -> Result<(), String> {
-    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = store.entries.iter().find(|e| e.id == id).cloned()
         .ok_or_else(|| format!("entry {id} not found"))?;
     let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
@@ -197,7 +197,7 @@ pub fn copy_history_entry(id: u64, app: AppHandle, state: State<'_, Arc<HistoryS
 
 #[tauri::command]
 pub fn delete_history_entry(id: u64, app: AppHandle, state: State<'_, Arc<HistoryState>>) {
-    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     store.remove(id);
     let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
     let _ = app.emit("clip-update", &entries);
@@ -205,7 +205,7 @@ pub fn delete_history_entry(id: u64, app: AppHandle, state: State<'_, Arc<Histor
 
 #[tauri::command]
 pub fn toggle_pin_entry(id: u64, app: AppHandle, state: State<'_, Arc<HistoryState>>) {
-    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     store.toggle_pin(id);
     let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
     let _ = app.emit("clip-update", &entries);
@@ -213,7 +213,7 @@ pub fn toggle_pin_entry(id: u64, app: AppHandle, state: State<'_, Arc<HistorySta
 
 #[tauri::command]
 pub fn clear_history(app: AppHandle, state: State<'_, Arc<HistoryState>>) {
-    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     store.clear_unpinned();
     let entries: Vec<ClipEntryView> = store.entries.iter().map(ClipEntryView::from).collect();
     let _ = app.emit("clip-update", &entries);
@@ -221,21 +221,21 @@ pub fn clear_history(app: AppHandle, state: State<'_, Arc<HistoryState>>) {
 
 #[tauri::command]
 pub fn set_history_paused(paused: bool, state: State<'_, Arc<HistoryState>>) {
-    *state.paused.lock().unwrap_or_else(|e| e.into_inner()) = paused;
+    *state.paused.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = paused;
 }
 
 #[tauri::command]
 pub fn flush_history(state: State<'_, Arc<HistoryState>>) {
-    state.store.lock().unwrap_or_else(|e| e.into_inner()).flush_now();
+    state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).flush_now();
 }
 
 #[tauri::command]
 pub fn tick_history(state: State<'_, Arc<HistoryState>>) -> Vec<ClipEntryView> {
-    state.store.lock().unwrap_or_else(|e| e.into_inner())
+    state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .entries.iter().map(ClipEntryView::from).collect()
 }
 
 #[tauri::command]
 pub fn get_history_paused(state: State<'_, Arc<HistoryState>>) -> bool {
-    *state.paused.lock().unwrap_or_else(|e| e.into_inner())
+    *state.paused.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

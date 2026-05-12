@@ -235,17 +235,14 @@ pub fn start_monitor(tx: std::sync::mpsc::Sender<ClipContent>) {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             if let Ok(fresh) = arboard::Clipboard::new() { cb = fresh; }
-            match cb.get_text() {
-                Ok(text) => {
-                    let text = text.trim().to_string();
-                    if !text.is_empty() && text != last_text {
-                        last_text = text.clone();
-                        last_img_hash = 0;
-                        if tx.send(ClipContent::Text { text }).is_err() { return; }
-                    }
-                    continue;
+            if let Ok(text) = cb.get_text() {
+                let text = text.trim().to_string();
+                if !text.is_empty() && text != last_text {
+                    last_text = text.clone();
+                    last_img_hash = 0;
+                    if tx.send(ClipContent::Text { text }).is_err() { return; }
                 }
-                Err(_) => {}
+                continue;
             }
             if let Ok(img) = cb.get_image() {
                 let hash = fnv1a(&img.bytes);

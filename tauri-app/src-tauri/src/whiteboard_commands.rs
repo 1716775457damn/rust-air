@@ -23,9 +23,9 @@ impl WhiteboardState {
         }
     }
 
-    /// Update the list of discovered devices (called from scan_devices).
+    /// Update the list of discovered devices (called from `scan_devices`).
     pub fn update_device(&self, dev: DeviceInfo) {
-        let mut devs = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+        let mut devs = self.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = devs.iter_mut().find(|d| d.name == dev.name) {
             existing.addr = dev.addr;
         } else {
@@ -33,9 +33,9 @@ impl WhiteboardState {
         }
     }
 
-    /// Remove a device by name (when ServiceRemoved is received).
+    /// Remove a device by name (when `ServiceRemoved` is received).
     pub fn remove_device(&self, name: &str) {
-        let mut devs = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+        let mut devs = self.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         devs.retain(|d| d.name != name);
     }
 }
@@ -46,7 +46,7 @@ fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis() as u64 // Safe: current time in millis fits in u64
 }
 
 fn device_name() -> String {
@@ -72,7 +72,7 @@ async fn broadcast_and_emit(
 /// Return all whiteboard items.
 #[tauri::command]
 pub fn get_whiteboard_items(state: State<'_, WhiteboardState>) -> Vec<WhiteboardItem> {
-    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     store.snapshot()
 }
 
@@ -93,11 +93,11 @@ pub async fn add_whiteboard_text(
     };
 
     let (items, devices) = {
-        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.add(item.clone());
         store.flush_now();
         let items = store.snapshot();
-        let devices = state.devices.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let devices = state.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         (items, devices)
     };
 
@@ -131,11 +131,11 @@ pub async fn add_whiteboard_image(
     };
 
     let (items, devices) = {
-        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.add(item.clone());
         store.flush_now();
         let items = store.snapshot();
-        let devices = state.devices.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let devices = state.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         (items, devices)
     };
 
@@ -161,11 +161,11 @@ pub async fn delete_whiteboard_item(
 ) -> Result<(), String> {
     let ts = now_millis();
     let (items, devices) = {
-        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.delete(&id);
         store.flush_now();
         let items = store.snapshot();
-        let devices = state.devices.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let devices = state.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         (items, devices)
     };
 
@@ -190,10 +190,10 @@ pub async fn clear_whiteboard(
 ) -> Result<(), String> {
     let ts = now_millis();
     let devices = {
-        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.clear();
         store.flush_now();
-        let devices = state.devices.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let devices = state.devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         devices
     };
 
@@ -214,7 +214,7 @@ pub async fn clear_whiteboard(
 /// Flush whiteboard store to disk if needed (called periodically by frontend).
 #[tauri::command]
 pub fn flush_whiteboard(state: State<'_, WhiteboardState>) {
-    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     store.flush_if_needed();
 }
 
@@ -226,7 +226,7 @@ pub async fn send_whiteboard_snapshot(
     _app: AppHandle,
 ) -> Result<(), String> {
     let items = {
-        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.snapshot()
     };
 

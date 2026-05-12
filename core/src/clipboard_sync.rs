@@ -40,7 +40,7 @@ pub struct SyncPeer {
 }
 
 /// Sync group configuration (persisted to disk).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SyncGroupConfig {
     /// Whether clipboard sharing is enabled
     pub enabled: bool,
@@ -94,15 +94,6 @@ pub struct ClipSyncError {
     pub message: String,
     /// Related device name (if applicable)
     pub device: Option<String>,
-}
-
-impl Default for SyncGroupConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            peers: Vec::new(),
-        }
-    }
 }
 
 /// Result of broadcasting clipboard content to a single peer.
@@ -237,6 +228,12 @@ pub struct ClipboardSyncService {
     config: Arc<Mutex<SyncGroupConfig>>,
     echo_guard: Arc<Mutex<EchoGuard>>,
     enabled: Arc<AtomicBool>,
+}
+
+impl Default for ClipboardSyncService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClipboardSyncService {

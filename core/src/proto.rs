@@ -11,7 +11,6 @@
 ///   [32B sha256]   ← computed on-the-fly while streaming, sent after EOF sentinel
 ///
 /// This eliminates the double-read of large files (no pre-scan for checksum).
-
 use serde::{Deserialize, Serialize};
 
 pub const MAGIC: &[u8; 4] = b"RAR4";
