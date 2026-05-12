@@ -328,8 +328,25 @@ pub fn default_excludes() -> Vec<String> {
 
 /// Build a full manifest for a directory, suitable for latest-wins two-device sync.
 pub fn build_manifest(src: &Path, excludes: &[String]) -> Vec<SyncManifestEntry> {
+    let empty_store = SyncStore {
+        state: SyncState::default(),
+        path: PathBuf::new(),
+        dirty: false,
+        last_save: Instant::now(),
+    };
+    build_manifest_with_state(src, &empty_store, excludes, false)
+}
+
+/// Build a full manifest, optionally including local delete tombstones.
+pub fn build_manifest_with_state(
+    src: &Path,
+    store: &SyncStore,
+    excludes: &[String],
+    include_deleted: bool,
+) -> Vec<SyncManifestEntry> {
     let ex = ExcludeSet::new(excludes);
     let mut entries = Vec::new();
+    let mut seen = HashSet::new();
 
     for entry in WalkDir::new(src).follow_links(false).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
@@ -344,6 +361,7 @@ pub fn build_manifest(src: &Path, excludes: &[String]) -> Vec<SyncManifestEntry>
         if ex.matches(&rel) {
             continue;
         }
+        seen.insert(rel.clone());
 
         let meta = match entry.metadata() {
             Ok(m) => m,
@@ -366,6 +384,21 @@ pub fn build_manifest(src: &Path, excludes: &[String]) -> Vec<SyncManifestEntry>
             hash,
             deleted: false,
         });
+    }
+
+    if include_deleted {
+        for (rel, deleted_at) in &store.state.deleted {
+            if seen.contains(rel) || ex.matches(rel) {
+                continue;
+            }
+            entries.push(SyncManifestEntry {
+                rel: rel.clone(),
+                size: 0,
+                modified_ts: deleted_at.timestamp(),
+                hash: String::new(),
+                deleted: true,
+            });
+        }
     }
 
     entries.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -642,6 +675,19 @@ mod sync_manifest_tests {
     }
 
     #[test]
+    fn test_build_manifest_with_deleted_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("live.txt"), b"alive").unwrap();
+
+        let mut store = SyncStore::load();
+        store.state.deleted.insert("gone.txt".to_string(), Local::now());
+
+        let manifest = build_manifest_with_state(dir.path(), &store, &[], true);
+        assert!(manifest.iter().any(|e| e.rel == "live.txt" && !e.deleted));
+        assert!(manifest.iter().any(|e| e.rel == "gone.txt" && e.deleted));
+    }
+
+    #[test]
     fn test_diff_manifests_delete_remote_when_local_tombstone_newer() {
         let local = vec![SyncManifestEntry {
             rel: "gone.txt".to_string(),
@@ -681,6 +727,27 @@ mod sync_manifest_tests {
 
         let diff = diff_manifests_latest_wins(&local, &remote);
         assert_eq!(diff, vec![SyncAction::DeleteLocal("gone.txt".to_string())]);
+    }
+
+    #[test]
+    fn test_diff_manifests_both_deleted_noop() {
+        let local = vec![SyncManifestEntry {
+            rel: "gone.txt".to_string(),
+            size: 0,
+            modified_ts: 500,
+            hash: String::new(),
+            deleted: true,
+        }];
+        let remote = vec![SyncManifestEntry {
+            rel: "gone.txt".to_string(),
+            size: 0,
+            modified_ts: 400,
+            hash: String::new(),
+            deleted: true,
+        }];
+
+        let diff = diff_manifests_latest_wins(&local, &remote);
+        assert!(diff.is_empty());
     }
 }
 

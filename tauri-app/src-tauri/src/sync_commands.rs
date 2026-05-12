@@ -207,7 +207,15 @@ pub async fn start_remote_sync(
 
     let src = PathBuf::from(&config.src);
     let excludes = config.excludes.clone();
-    let local_manifest = rust_air_core::sync_vault::build_manifest(&src, &excludes);
+    let local_manifest = {
+        let local_store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        rust_air_core::sync_vault::build_manifest_with_state(
+            &src,
+            &local_store,
+            &excludes,
+            config.delete_removed,
+        )
+    };
     let request_id = uuid::Uuid::new_v4().to_string();
     let request = RemoteSyncRequest {
         request_id: request_id.clone(),
@@ -354,7 +362,15 @@ pub async fn handle_sync_manifest_request(
         return Err("local sync source directory not configured".to_string());
     }
     let src = PathBuf::from(&config.src);
-    let manifest = rust_air_core::sync_vault::build_manifest(&src, &config.excludes);
+    let manifest = {
+        let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        rust_air_core::sync_vault::build_manifest_with_state(
+            &src,
+            &store,
+            &config.excludes,
+            config.delete_removed,
+        )
+    };
     let resp = RemoteSyncResponse {
         request_id: req.request_id,
         manifest,
@@ -379,25 +395,31 @@ pub async fn handle_sync_file_request(
     state: &SyncState,
 ) -> Result<(), String> {
     let req: RemoteSyncFileRequest = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if config.src.is_empty() {
-        return Err("local sync source directory not configured".to_string());
-    }
-    let src_file = PathBuf::from(&config.src).join(&req.rel);
-    if !src_file.exists() {
-        let err = format!("sync source file not found: {}", src_file.display());
-        let msg = RemoteSyncFileError {
-            request_id: req.request_id,
-            rel: req.rel,
-            err: err.clone(),
-        };
-        let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-        let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
-        transfer::send_clipboard(stream, &json, "sync:file-error", |_| {}).await.map_err(|e| e.to_string())?;
-        return Err(err);
-    }
-    let logical_name = format!("sync:file:{}:{}", req.request_id, req.rel);
-    let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
+    let (src_file, logical_name, callback_addr) = {
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if config.src.is_empty() {
+            return Err("local sync source directory not configured".to_string());
+        }
+        let src_file = PathBuf::from(&config.src).join(&req.rel);
+        if !src_file.exists() {
+            let err = format!("sync source file not found: {}", src_file.display());
+            let msg = RemoteSyncFileError {
+                request_id: req.request_id,
+                rel: req.rel,
+                err: err.clone(),
+            };
+            let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
+            let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
+            transfer::send_clipboard(stream, &json, "sync:file-error", |_| {}).await.map_err(|e| e.to_string())?;
+            return Err(err);
+        }
+        (
+            src_file,
+            format!("sync:file:{}:{}", req.request_id, req.rel),
+            req.callback_addr.clone(),
+        )
+    };
+    let stream = tokio::net::TcpStream::connect(&callback_addr).await.map_err(|e| e.to_string())?;
     transfer::send_path_as(stream, &src_file, Some(&logical_name), |_| {}).await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -434,11 +456,13 @@ pub fn handle_received_sync_file(
     let mut parts = payload.splitn(2, ':');
     let request_id = parts.next().unwrap_or_default().to_string();
     let rel = parts.next().ok_or_else(|| "missing sync file relative path".to_string())?;
-    let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if config.src.is_empty() {
-        return Err("local sync source directory not configured".to_string());
-    }
-    let dst = PathBuf::from(&config.src).join(rel);
+    let dst = {
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if config.src.is_empty() {
+            return Err("local sync source directory not configured".to_string());
+        }
+        PathBuf::from(&config.src).join(rel)
+    };
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }

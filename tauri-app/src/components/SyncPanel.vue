@@ -47,7 +47,7 @@ const emit = defineEmits<{
           style="background:var(--bg-muted);color:var(--text-secondary)">📂</button>
       </div>
       <div class="flex gap-2 items-center">
-        <span class="text-xs w-8 flex-shrink-0" style="color:var(--text-muted)">目标</span>
+        <span class="text-xs w-8 flex-shrink-0" style="color:var(--text-muted)">本地</span>
         <input :value="syncConfig.dst" @input="emit('updateConfig', 'dst', ($event.target as HTMLInputElement).value)" placeholder="目标目录路径" :title="syncConfig.dst"
           class="flex-1 rounded-lg px-3 py-1.5 text-sm focus:outline-none transition-colors"
           style="background:var(--bg-input);border:1px solid var(--border-input);color:var(--text-primary)" />
