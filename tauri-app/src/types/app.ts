@@ -88,6 +88,10 @@ export interface UpdateSettings {
   auto_install: boolean
 }
 
+export interface AppVersionInfo {
+  version: string
+}
+
 export interface TodoItem {
   id: number
   title: string

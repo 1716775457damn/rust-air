@@ -157,6 +157,7 @@ pub fn run() {
             // Auto-update
             update_commands::get_update_settings,
             update_commands::save_update_settings,
+            update_commands::get_app_version,
             update_commands::check_update,
             update_commands::download_and_install,
             // Whiteboard

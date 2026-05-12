@@ -149,6 +149,7 @@ const {
 
 // Update
 const {
+  currentVersion,
   updateInfo,
   updateProgress,
   updateChecking,
@@ -1138,7 +1139,7 @@ function updateSyncConfigField(field: string, value: string | boolean) {
 
               <!-- Current version + check button -->
               <div class="flex items-center justify-between pt-1">
-                <span class="text-xs" style="color:var(--text-faint)">当前版本: v{{ '0.3.41' }}</span>
+                <span class="text-xs" style="color:var(--text-faint)">当前版本: v{{ currentVersion || '...' }}</span>
                 <button @click="manualCheckUpdate" :disabled="updateChecking"
                   :style="updateChecking
                     ? 'background:var(--bg-muted);color:var(--text-faint);cursor:not-allowed'
@@ -1186,7 +1187,7 @@ function updateSyncConfigField(field: string, value: string | boolean) {
 
     <footer class="text-center text-[11px] py-1.5"
       style="color:var(--text-faint);border-top:1px solid var(--border);background:var(--bg-surface)">
-      rust-air v0.3 · E2EE · mDNS · SHA-256 · 自动更新 · 快捷键 1-7 切换标签
+      rust-air v{{ currentVersion || '...' }} · E2EE · mDNS · SHA-256 · 自动更新 · 快捷键 1-7 切换标签
     </footer>
 
     <!-- Toast notifications (Task 10.4) -->

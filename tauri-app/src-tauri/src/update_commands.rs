@@ -151,10 +151,20 @@ pub fn save_update_settings(settings: UpdateSettings) {
     settings.save();
 }
 
+#[tauri::command]
+pub fn get_app_version() -> String {
+    CURRENT_VERSION.to_string()
+}
+
 /// Check GitHub for a newer release. Returns Some(UpdateInfo) if one exists.
 #[tauri::command]
 pub async fn check_update() -> Result<Option<UpdateInfo>, String> {
-    let release = fetch_latest_release().await.map_err(|e| e.to_string())?;
+    let release = fetch_latest_release().await.map_err(|e| {
+        format!(
+            "检查更新失败：无法获取 GitHub Release 信息（可能是网络、代理或 GitHub API 限制）。原始错误：{}",
+            e
+        )
+    })?;
 
     let remote = release.tag_name.trim_start_matches('v');
     if !is_newer(remote, CURRENT_VERSION) {

@@ -3,12 +3,14 @@ import { invoke } from "@tauri-apps/api/core"
 import type { UpdateInfo, UpdateProgress, UpdateSettings } from "../types/app"
 
 export function useUpdate(showToast: (kind: string, message: string, device?: string) => void) {
+  const currentVersion = ref("")
   const updateInfo = ref<UpdateInfo | null>(null)
   const updateProgress = ref<UpdateProgress | null>(null)
   const updateChecking = ref(false)
   const updateSettings = ref<UpdateSettings>({ auto_check: true, auto_install: false })
 
   async function loadInitialUpdateState() {
+    currentVersion.value = await invoke<string>("get_app_version")
     updateSettings.value = await invoke<UpdateSettings>("get_update_settings")
   }
 
@@ -49,6 +51,7 @@ export function useUpdate(showToast: (kind: string, message: string, device?: st
   }
 
   return {
+    currentVersion,
     updateInfo,
     updateProgress,
     updateChecking,
