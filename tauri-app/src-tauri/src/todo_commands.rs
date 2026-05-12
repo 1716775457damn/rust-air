@@ -78,7 +78,7 @@ impl TodoStore {
     fn gen_id() -> u64 {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         ts + rand::random::<u16>() as u64
     }

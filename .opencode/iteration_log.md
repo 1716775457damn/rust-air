@@ -271,3 +271,31 @@
 
 ### Recommended Next Step
 - Prepare a cleanup/release pass: reconcile README, review remaining production `unwrap` sites, and then package these iterations for upstream push/release.
+
+## Iteration 10
+
+### Scope
+- Release-prep cleanup for production safety and documentation consistency.
+
+### Changes
+- Replaced `TodoStore::gen_id()` time conversion `unwrap()` with `unwrap_or_default()`.
+- Updated README protocol/performance docs from outdated `256 KB` chunk references to `1 MB`.
+- Updated README frontend structure section to reflect the new `composables/`, `components/`, `types/`, and `utils/` layout.
+
+### Validation
+- `cargo test -p rust-air-core --lib -- --nocapture`
+- `cargo check -p tauri-app`
+- `pnpm exec vue-tsc --noEmit`
+- `pnpm build`
+
+### Stability Impact
+- Reduced one additional production `unwrap()` in the desktop todo path.
+- Lowered documentation drift risk ahead of the next release/tag cycle.
+
+### Remaining Issues
+- A few production mutex `.lock().unwrap()` sites still exist in modules like discovery/clipboard sync and should be reviewed case by case rather than blindly replaced.
+- Todo and whiteboard panels are still inline in `App.vue`.
+- Release note generation is still static/manual.
+
+### Recommended Next Step
+- If the goal is another public release, the next pass should be a final targeted audit + version bump + tag/release workflow trigger.
