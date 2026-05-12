@@ -180,6 +180,12 @@ pub async fn start_listener(
                                             app2.emit("sync-event", rust_air_core::SyncEvent::Error { rel: "file-request".to_string(), err: e }).ok();
                                         }
                                     }
+                                } else if name == "sync:file-error" {
+                                    if let Some(ss) = app2.try_state::<SyncState>() {
+                                        if let Err(e) = crate::sync_commands::handle_sync_file_error(&data, &ss) {
+                                            app2.emit("sync-event", rust_air_core::SyncEvent::Error { rel: "file-error".to_string(), err: e }).ok();
+                                        }
+                                    }
                                 } else {
                                     // Existing clipboard sync logic
                                     match svc.handle_received(&name, &data) {

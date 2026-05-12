@@ -53,6 +53,7 @@ fn nfc(s: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum SyncEvent {
+    Info     { msg: String },
     Copied   { rel: String, bytes: u64 },
     Deleted  { rel: String },
     Error    { rel: String, err: String },

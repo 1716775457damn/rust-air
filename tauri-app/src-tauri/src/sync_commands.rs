@@ -132,6 +132,13 @@ struct RemoteSyncFileRequest {
     callback_addr: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct RemoteSyncFileError {
+    request_id: String,
+    rel: String,
+    err: String,
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -212,9 +219,8 @@ pub async fn start_remote_sync(
 
     let actions = rust_air_core::sync_vault::diff_manifests_latest_wins(&local_manifest, &response.manifest);
     if actions.is_empty() {
-        app.emit("sync-event", SyncEvent::Copied {
-            rel: "两端目录已一致，无需同步".to_string(),
-            bytes: 0,
+        app.emit("sync-event", SyncEvent::Info {
+            msg: "两端目录已一致，无需同步".to_string(),
         }).ok();
         app.emit("sync-done", ()).ok();
         state.running.store(false, Ordering::Release);
@@ -222,22 +228,33 @@ pub async fn start_remote_sync(
     }
 
     let mut pull_waiters = Vec::new();
+    let mut had_error = false;
     for action in &actions {
         match action {
             SyncAction::PushToRemote(entry) => {
-                app.emit("sync-event", SyncEvent::Copied {
-                    rel: format!("⇢ 推送到远端: {}", entry.rel),
-                    bytes: entry.size,
+                app.emit("sync-event", SyncEvent::Info {
+                    msg: format!("⇢ 推送到远端: {}", entry.rel),
                 }).ok();
                 let src_file = src.join(&entry.rel);
                 let logical_name = format!("sync:file:push:{}", entry.rel);
                 let stream = tokio::net::TcpStream::connect(&remote_addr).await.map_err(|e| e.to_string())?;
                 transfer::send_path_as(stream, &src_file, Some(&logical_name), |_| {}).await.map_err(|e| e.to_string())?;
+                {
+                    let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+                    store.state.files.insert(entry.rel.clone(), rust_air_core::sync_vault::FileRecord {
+                        hash: entry.hash.clone(),
+                        size: entry.size,
+                        modified: chrono::DateTime::<Local>::from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.modified_ts.max(0) as u64)),
+                    });
+                    store.state.total_synced += 1;
+                    store.state.total_bytes += entry.size;
+                    store.mark_dirty();
+                }
+                app.emit("sync-event", SyncEvent::Copied { rel: format!("⇢ 已推送: {}", entry.rel), bytes: entry.size }).ok();
             }
             SyncAction::PullFromRemote(entry) => {
-                app.emit("sync-event", SyncEvent::Copied {
-                    rel: format!("⇠ 请求远端文件: {}", entry.rel),
-                    bytes: entry.size,
+                app.emit("sync-event", SyncEvent::Info {
+                    msg: format!("⇠ 请求远端文件: {}", entry.rel),
                 }).ok();
                 let file_request_id = uuid::Uuid::new_v4().to_string();
                 let req = RemoteSyncFileRequest {
@@ -267,6 +284,7 @@ pub async fn start_remote_sync(
                 }).ok();
             }
             Err(e) => {
+                had_error = true;
                 app.emit("sync-event", SyncEvent::Error { rel: rel.clone(), err: e }).ok();
             }
         }
@@ -279,6 +297,11 @@ pub async fn start_remote_sync(
         store.flush_now();
     }
 
+    if !had_error {
+        app.emit("sync-event", SyncEvent::Info {
+            msg: "双端同步执行完成".to_string(),
+        }).ok();
+    }
     app.emit("sync-done", ()).ok();
     state.running.store(false, Ordering::Release);
     Ok(())
@@ -325,7 +348,16 @@ pub async fn handle_sync_file_request(
     }
     let src_file = PathBuf::from(&config.src).join(&req.rel);
     if !src_file.exists() {
-        return Err(format!("sync source file not found: {}", src_file.display()));
+        let err = format!("sync source file not found: {}", src_file.display());
+        let msg = RemoteSyncFileError {
+            request_id: req.request_id,
+            rel: req.rel,
+            err: err.clone(),
+        };
+        let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
+        let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
+        transfer::send_clipboard(stream, &json, "sync:file-error", |_| {}).await.map_err(|e| e.to_string())?;
+        return Err(err);
     }
     let logical_name = format!("sync:file:{}:{}", req.request_id, req.rel);
     let stream = tokio::net::TcpStream::connect(&req.callback_addr).await.map_err(|e| e.to_string())?;
@@ -370,6 +402,15 @@ pub fn handle_received_sync_file(
 
     let _ = std::fs::remove_file(temp_path);
     Ok((request_id, rel.to_string(), dst))
+}
+
+pub fn handle_sync_file_error(
+    data: &[u8],
+    state: &SyncState,
+) -> Result<(), String> {
+    let msg: RemoteSyncFileError = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    state.resolve_pending_remote_file(msg.request_id, Err(format!("{}: {}", msg.rel, msg.err)));
+    Ok(())
 }
 
 fn hash_file_local(path: &std::path::Path) -> anyhow::Result<String> {

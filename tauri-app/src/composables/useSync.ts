@@ -17,7 +17,8 @@ export function useSync(fmtBytes: (n: number) => string) {
   }
 
   function onSyncEvent(ev: SyncEventPayload) {
-    if (ev.kind === "Copied") syncLog.value.unshift(`✅ ${ev.rel}  (${fmtBytes(ev.bytes ?? 0)})`)
+    if (ev.kind === "Info") syncLog.value.unshift(`ℹ️ ${ev.msg}`)
+    else if (ev.kind === "Copied") syncLog.value.unshift(`✅ ${ev.rel}  (${fmtBytes(ev.bytes ?? 0)})`)
     else if (ev.kind === "Deleted") syncLog.value.unshift(`🗑 ${ev.rel}`)
     else if (ev.kind === "Error") syncLog.value.unshift(`❌ ${ev.rel}: ${ev.err}`)
     else if (ev.kind === "Progress") syncLog.value[0] = `⏳ 同步处理中… ${ev.scanned} 个文件`

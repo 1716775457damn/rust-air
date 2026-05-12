@@ -62,6 +62,7 @@ export interface SyncStatus {
 
 export interface SyncEventPayload {
   kind: string
+  msg?: string
   rel?: string
   bytes?: number
   err?: string
