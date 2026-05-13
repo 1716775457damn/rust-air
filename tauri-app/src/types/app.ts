@@ -10,6 +10,16 @@ export interface ReconnectInfo {
   max_attempts: number
 }
 
+export interface ArchiveStatus {
+  code:
+    | "ResumeRejectedSafetyRestart"
+    | "ParallelDisabledForResume"
+    | "UnpackStarted"
+    | "UnpackFinished"
+    | "UnpackFailed"
+  detail?: string | null
+}
+
 export interface TransferEvent {
   bytes_done: number
   total_bytes: number
@@ -19,6 +29,7 @@ export interface TransferEvent {
   resume_offset?: number
   reconnect_info?: ReconnectInfo
   error?: string
+  archive_status?: ArchiveStatus | null
 }
 
 export interface MatchLine {

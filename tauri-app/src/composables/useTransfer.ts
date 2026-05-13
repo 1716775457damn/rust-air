@@ -23,6 +23,8 @@ export function useTransfer() {
   const sendReconnecting = ref(false)
   const sendReconnectAttempt = ref(0)
   const sendReconnectMax = ref(5)
+  const sendArchiveNotice = ref("")
+  const recvArchiveNotice = ref("")
 
   const sendPct = computed(() => makePct(sendProgress.value))
   const sendSpeed = computed(() => makeSpeed(sendProgress.value))
@@ -97,6 +99,7 @@ export function useTransfer() {
   function onSendProgress(ev: TransferEvent) {
     sendProgress.value = ev
     sendPhase.value = "transferring"
+    sendArchiveNotice.value = ev.archive_status?.detail ?? ""
     if (ev.reconnect_info) {
       sendReconnecting.value = true
       sendReconnectAttempt.value = ev.reconnect_info.attempt
@@ -113,6 +116,9 @@ export function useTransfer() {
 
   function onSendDone() {
     sendPhase.value = "done"
+    if (!sendArchiveNotice.value && sendProgress.value.archive_status?.detail) {
+      sendArchiveNotice.value = sendProgress.value.archive_status.detail
+    }
     setTimeout(() => {
       if (sendPhase.value === "done") resetSend()
     }, 4000)
@@ -130,6 +136,7 @@ export function useTransfer() {
 
   function onRecvProgress(ev: TransferEvent) {
     recvProgress.value = ev
+    recvArchiveNotice.value = ev.archive_status?.detail ?? recvArchiveNotice.value
   }
 
   function onRecvDone(path: string) {
@@ -162,6 +169,8 @@ export function useTransfer() {
     sendReconnecting,
     sendReconnectAttempt,
     sendReconnectMax,
+    sendArchiveNotice,
+    recvArchiveNotice,
     sendPct,
     sendSpeed,
     sendEta,

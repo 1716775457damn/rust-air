@@ -69,6 +69,8 @@ const {
   sendReconnecting,
   sendReconnectAttempt,
   sendReconnectMax,
+  sendArchiveNotice,
+  recvArchiveNotice,
   sendPct,
   sendSpeed,
   sendEta,
@@ -631,6 +633,12 @@ function updateSyncConfigField(field: string, value: string | boolean) {
                 <span class="animate-pulse">🔄</span>
                 <span style="color:#fbbf24">重连中 (第 {{ sendReconnectAttempt }} 次 / 共 {{ sendReconnectMax }} 次)</span>
               </div>
+              <div v-if="sendArchiveNotice"
+                class="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg text-xs"
+                style="background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.2);color:var(--accent)">
+                <span>🧱</span>
+                <span>{{ sendArchiveNotice }}</span>
+              </div>
               <div class="flex items-center justify-between mb-2">
                 <span class="text-sm truncate" style="color:var(--text-secondary)">
                   发送中 → <span :style="`color:var(--accent)`">{{ sendPeer }}</span>
@@ -728,6 +736,12 @@ function updateSyncConfigField(field: string, value: string | boolean) {
                 style="color:var(--accent)">
                 <span>⏩</span>
                 <span>续传中 — 已跳过 {{ fmtBytes(recvProgress.resume_offset) }}</span>
+              </div>
+              <div v-if="recvArchiveNotice"
+                class="flex items-center gap-2 mb-2 text-xs"
+                style="color:var(--accent)">
+                <span>🧱</span>
+                <span>{{ recvArchiveNotice }}</span>
               </div>
               <div class="flex items-center justify-between mb-2">
                 <span class="text-sm" style="color:var(--text-secondary)">
