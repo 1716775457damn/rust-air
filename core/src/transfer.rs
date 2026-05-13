@@ -16,7 +16,7 @@
 use crate::{
     archive,
     crypto::{Decryptor, Encryptor},
-    proto::{Kind, ReconnectInfo, SessionManifest, TransferEvent, CHUNK, MAGIC, MAX_NAME_LEN},
+    proto::{ArchiveStatus, ArchiveStatusCode, Kind, ReconnectInfo, SessionManifest, TransferEvent, CHUNK, MAGIC, MAX_NAME_LEN},
 };
 use anyhow::Result;
 #[cfg(feature = "desktop")]
@@ -36,6 +36,9 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RETRY_DELAY_SECS: u64 = 2;
 const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const SPEED_SMOOTHING_FACTOR: f64 = 0.25;
+
+const ARCHIVE_RESUME_DISABLED_REASON: &str =
+    "archive resume disabled for safety; restarting directory transfer from zero";
 
 #[derive(Debug, Clone)]
 struct SpeedTracker {
@@ -109,6 +112,13 @@ async fn read_manifest(path: &Path) -> Option<SessionManifest> {
 /// Delete the manifest file at `path`, ignoring not-found errors.
 async fn remove_manifest(path: &Path) {
     let _ = tokio::fs::remove_file(path).await;
+}
+
+fn archive_status(code: ArchiveStatusCode, detail: impl Into<String>) -> ArchiveStatus {
+    ArchiveStatus {
+        code,
+        detail: Some(detail.into()),
+    }
 }
 
 // ── Receive outcome ───────────────────────────────────────────────────────────
@@ -196,7 +206,7 @@ pub async fn send_path_as_with_outcome(
     let total_size: u64;
     let dir_entries: Option<Vec<(WalkDirEntry, std::fs::Metadata)>>;
     if is_dir {
-        let (sz, entries) = archive::walk_dir(path);
+        let (sz, entries) = archive::walk_dir_checked(path)?;
         total_size = sz;
         dir_entries = Some(entries);
     } else {
@@ -210,7 +220,7 @@ pub async fn send_path_as_with_outcome(
 
     let mut resume_buf = [0u8; 8];
     rx.read_exact(&mut resume_buf).await?;
-    let resume_offset = u64::from_be_bytes(resume_buf);
+    let mut resume_offset = u64::from_be_bytes(resume_buf);
 
     let mut enc = Encryptor::new(&key, tx);
     let on_progress = Arc::new(on_progress);
@@ -222,7 +232,40 @@ pub async fn send_path_as_with_outcome(
         let entries = dir_entries
             .ok_or_else(|| anyhow::anyhow!("directory transfer missing precomputed entries"))?;
         let file_count = entries.iter().filter(|(e, _)| e.file_type().is_file()).count();
+        if resume_offset > 0 {
+            on_progress(TransferEvent {
+                bytes_done: 0,
+                total_bytes: total_size,
+                bytes_per_sec: 0,
+                done: false,
+                error: None,
+                resumed: false,
+                resume_offset: 0,
+                reconnect_info: None,
+                archive_status: Some(archive_status(
+                    ArchiveStatusCode::ResumeRejectedSafetyRestart,
+                    ARCHIVE_RESUME_DISABLED_REASON,
+                )),
+            });
+            resume_offset = 0;
+        }
         let use_parallel = file_count >= 10 && resume_offset == 0;
+        if !use_parallel && file_count >= 10 {
+            on_progress(TransferEvent {
+                bytes_done: 0,
+                total_bytes: total_size,
+                bytes_per_sec: 0,
+                done: false,
+                error: None,
+                resumed: false,
+                resume_offset: 0,
+                reconnect_info: None,
+                archive_status: Some(archive_status(
+                    ArchiveStatusCode::ParallelDisabledForResume,
+                    "parallel archive disabled because resume-safe directory restart was selected",
+                )),
+            });
+        }
         
         let mut reader: Box<dyn AsyncRead + Send + Unpin> = if use_parallel {
             Box::new(archive::stream_archive_parallel(path, entries)?)
@@ -299,21 +342,41 @@ pub async fn receive_to_disk(
     let mpath = manifest_path(dest, &name);
 
     // ── Resume decision: check .part + manifest ──────────────────────────
+    let mut archive_restart_reason: Option<String> = None;
     let already_have: u64 = if kind == Kind::File || kind == Kind::Archive {
         if part_path.exists() {
             if let Some(m) = read_manifest(&mpath).await {
                 if m.name == name && m.total_size == total_size && m.kind == kind {
-                    // Valid manifest matches — resume from chunk-aligned boundary.
-                    let file_len = tokio::fs::metadata(&part_path).await?.len();
-                    (file_len / CHUNK as u64) * CHUNK as u64
+                    if kind == Kind::Archive {
+                        archive_restart_reason = Some(ARCHIVE_RESUME_DISABLED_REASON.to_string());
+                        let _ = tokio::fs::remove_file(&part_path).await;
+                        remove_manifest(&mpath).await;
+                        0
+                    } else {
+                        // Valid manifest matches — resume from chunk-aligned boundary.
+                        let file_len = tokio::fs::metadata(&part_path).await?.len();
+                        (file_len / CHUNK as u64) * CHUNK as u64
+                    }
                 } else {
                     // Manifest mismatch — start fresh.
+                    if kind == Kind::Archive {
+                        archive_restart_reason = Some(
+                            "archive partial data did not match current manifest; restarting directory transfer from zero"
+                                .to_string(),
+                        );
+                    }
                     let _ = tokio::fs::remove_file(&part_path).await;
                     remove_manifest(&mpath).await;
                     0
                 }
             } else {
                 // No valid manifest — start fresh.
+                if kind == Kind::Archive {
+                    archive_restart_reason = Some(
+                        "archive partial data had no valid manifest; restarting directory transfer from zero"
+                            .to_string(),
+                    );
+                }
                 let _ = tokio::fs::remove_file(&part_path).await;
                 remove_manifest(&mpath).await;
                 0
@@ -349,6 +412,23 @@ pub async fn receive_to_disk(
 
     let on_progress = Arc::new(on_progress);
     let is_resumed = already_have > 0;
+
+    if kind == Kind::Archive && archive_restart_reason.is_some() {
+        on_progress(TransferEvent {
+            bytes_done: 0,
+            total_bytes: total_size,
+            bytes_per_sec: 0,
+            done: false,
+            error: None,
+            resumed: false,
+            resume_offset: 0,
+            reconnect_info: None,
+            archive_status: Some(archive_status(
+                ArchiveStatusCode::ResumeRejectedSafetyRestart,
+                archive_restart_reason.unwrap_or_else(|| ARCHIVE_RESUME_DISABLED_REASON.to_string()),
+            )),
+        });
+    }
 
     match kind {
         Kind::File => {
@@ -477,6 +557,7 @@ pub async fn send_path_with_retry(
                 attempt,
                 max_attempts: MAX_RECONNECT_ATTEMPTS,
             }),
+            archive_status: None,
         });
 
         // Wait with cancellation support.
@@ -509,6 +590,7 @@ pub async fn send_path_with_retry(
                         resumed: false,
                         resume_offset: 0,
                         reconnect_info: None,
+                        archive_status: None,
                     });
                     anyhow::bail!(
                         "all {MAX_RECONNECT_ATTEMPTS} retry attempts failed: {e}"
@@ -536,6 +618,7 @@ pub async fn send_path_with_retry(
                         resumed: false,
                         resume_offset: 0,
                         reconnect_info: None,
+                        archive_status: None,
                     });
                     anyhow::bail!(
                         "all {MAX_RECONNECT_ATTEMPTS} retry attempts failed: {e}"
@@ -801,14 +884,61 @@ async fn receive_archive_branch(
     // Decompress the complete .part file into the destination directory.
     let dest2 = dest.to_path_buf();
     let part2 = part_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    on_progress(TransferEvent {
+        bytes_done: done,
+        total_bytes: total_size,
+        bytes_per_sec: 0,
+        done: false,
+        error: None,
+        resumed: is_resumed,
+        resume_offset: already_have,
+        reconnect_info: None,
+        archive_status: Some(archive_status(
+            ArchiveStatusCode::UnpackStarted,
+            format!("starting archive unpack for {}", part_path.display()),
+        )),
+    });
+    let unpack_result = tokio::task::spawn_blocking(move || {
         let f = std::fs::File::open(&part2)?;
         let reader = std::io::BufReader::new(f);
         archive::unpack_archive_sync(reader, &dest2)
-    }).await??;
+    }).await.map_err(|e| anyhow::anyhow!("archive unpack task panicked: {e}"))?;
+
+    if let Err(e) = unpack_result {
+        on_progress(TransferEvent {
+            bytes_done: done,
+            total_bytes: total_size,
+            bytes_per_sec: 0,
+            done: false,
+            error: Some(e.to_string()),
+            resumed: is_resumed,
+            resume_offset: already_have,
+            reconnect_info: None,
+            archive_status: Some(archive_status(
+                ArchiveStatusCode::UnpackFailed,
+                format!("archive unpack failed for {}", part_path.display()),
+            )),
+        });
+        return Err(e);
+    }
 
     // Clean up the .part file after successful decompression.
     let _ = tokio::fs::remove_file(part_path).await;
+
+    on_progress(TransferEvent {
+        bytes_done: total_size,
+        total_bytes: total_size,
+        bytes_per_sec: 0,
+        done: false,
+        error: None,
+        resumed: is_resumed,
+        resume_offset: already_have,
+        reconnect_info: None,
+        archive_status: Some(archive_status(
+            ArchiveStatusCode::UnpackFinished,
+            format!("finished archive unpack into {}", dest.display()),
+        )),
+    });
 
     let now = Instant::now();
     emit_progress_resume(on_progress, total_size, total_size, true, is_resumed, already_have, &mut speed, now);
@@ -1146,6 +1276,7 @@ fn emit_progress(
         resumed: false,
         resume_offset: 0,
         reconnect_info: None,
+        archive_status: None,
     });
 }
 
@@ -1170,6 +1301,7 @@ fn emit_progress_resume(
         resumed,
         resume_offset,
         reconnect_info: None,
+        archive_status: None,
     });
 }
 

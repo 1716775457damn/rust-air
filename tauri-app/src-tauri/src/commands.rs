@@ -99,15 +99,18 @@ pub async fn start_listener(
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    let app2 = app.clone();
-                    let svc = sync_svc.clone();
-                    let hs = hist_state.clone();
-                    tokio::spawn(async move {
+                        let app2 = app.clone();
+                        let svc = sync_svc.clone();
+                        let hs = hist_state.clone();
+                        tokio::spawn(async move {
                         app2.emit("recv-peer-connected", peer.to_string()).ok();
                         let out = default_download_dir();
                         let app3 = app2.clone();
                         match transfer::receive_to_disk(stream, &out, move |ev| {
                             app3.emit("recv-progress", &ev).ok();
+                            if let Some(sync_ev) = crate::sync_commands::archive_status_to_sync_event(&ev, "incoming-transfer") {
+                                app3.emit("sync-event", sync_ev).ok();
+                            }
                         }).await {
                             Ok(ReceiveOutcome::File { path, name, .. }) => {
                                 if name.starts_with("sync:file:") {
@@ -338,8 +341,15 @@ async fn do_send(
     cancel_token: CancellationToken,
 ) -> anyhow::Result<()> {
     let app2 = app.clone();
+    let sync_rel = path.to_string_lossy().to_string();
     transfer::send_path_with_retry(&addr, &path, move |ev| {
         app2.emit("send-progress", &ev).ok();
+        if let Some(ss) = app2.try_state::<SyncState>() {
+            if let Some(sync_ev) = crate::sync_commands::archive_status_to_sync_event(&ev, &sync_rel) {
+                app2.emit("sync-event", sync_ev).ok();
+            }
+            let _ = ss;
+        }
     }, cancel_token).await
 }
 

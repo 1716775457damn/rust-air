@@ -430,7 +430,7 @@ pub fn stream_archive_with_entries(
 /// Returns an `AsyncRead` that streams a zstd-compressed tar of `path`.
 /// Directories are archived recursively; single files are wrapped in a tar.
 pub fn stream_archive(path: &Path) -> Result<impl AsyncRead + Send + Unpin + 'static> {
-    let (_, entries) = walk_dir(path);
+    let (_, entries) = walk_dir_checked(path)?;
     stream_archive_with_entries(path, entries)
 }
 
@@ -537,42 +537,39 @@ pub fn unpack_archive_sync(reader: impl std::io::Read, dest: &Path) -> Result<()
     Ok(())
 }
 
-/// Returns true if the filename matches a log file pattern (`*.log` or `*.log.*`).
-/// Only intended for files, not directories.
-fn is_log_file(name: &std::ffi::OsStr) -> bool {
-    let s = name.to_string_lossy();
-    s.ends_with(".log") || s.contains(".log.")
-}
-
 /// Walk `path` once, returning (total_bytes, entries_with_metadata).
-/// Caches metadata alongside each entry to avoid re-reading it in compress_entries.
-/// Excludes runtime-generated log files (`*.log`, `*.log.*`) to prevent transient/locked
-/// log files from causing transfer failures.
-pub fn walk_dir(path: &Path) -> (u64, Vec<(walkdir::DirEntry, std::fs::Metadata)>) {
-    let entries: Vec<_> = WalkDir::new(path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok().map(|m| (e, m)))
-        .filter(|(e, _)| {
-            // Keep directories unchanged; only filter files
-            if !e.file_type().is_file() {
-                return true;
-            }
-            // Exclude log files
-            !is_log_file(e.file_name())
-        })
-        .collect();
+/// Fails if traversal or metadata loading fails so callers don't silently send a
+/// partial directory snapshot.
+pub fn walk_dir_checked(path: &Path) -> Result<(u64, Vec<(walkdir::DirEntry, std::fs::Metadata)>)> {
+    let mut entries = Vec::new();
+    for entry in WalkDir::new(path).follow_links(false) {
+        let entry = entry.map_err(|e| anyhow::anyhow!("failed to walk {}: {e}", path.display()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| anyhow::anyhow!("failed to read metadata for {}: {e}", entry.path().display()))?;
+        entries.push((entry, metadata));
+    }
+    entries.sort_by(|(left, _), (right, _)| left.path().cmp(right.path()));
     let total = entries.iter()
         .filter(|(e, _)| e.file_type().is_file())
         .map(|(_, m)| m.len())
         .sum();
-    (total, entries)
+    Ok((total, entries))
+}
+
+/// Walk `path` once, returning (total_bytes, entries_with_metadata).
+/// Caches metadata alongside each entry to avoid re-reading it in compress_entries.
+/// Includes all files by default so directory transfers preserve the sender's
+/// actual contents. Any caller-specific exclusion policy must live above this
+/// generic archive layer.
+pub fn walk_dir(path: &Path) -> (u64, Vec<(walkdir::DirEntry, std::fs::Metadata)>) {
+    walk_dir_checked(path)
+        .unwrap_or_else(|e| panic!("walk_dir failed for {}: {e}", path.display()))
 }
 
 /// Walk `path` and sum all file sizes.
 pub fn dir_total_size(path: &Path) -> u64 {
-    walk_dir(path).0
+    walk_dir_checked(path).map(|(total, _)| total).unwrap_or(0)
 }
 
 fn compress_entries_to_writer(writer: impl std::io::Write, path: &Path, entries: Vec<(walkdir::DirEntry, std::fs::Metadata)>) -> Result<()> {

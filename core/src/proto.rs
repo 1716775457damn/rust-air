@@ -67,6 +67,23 @@ pub struct TransferEvent {
     pub resume_offset:   u64,
     /// Reconnection status (only present during reconnect attempts).
     pub reconnect_info:  Option<ReconnectInfo>,
+    /// Archive-specific reliability state, when applicable.
+    pub archive_status:  Option<ArchiveStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveStatusCode {
+    ResumeRejectedSafetyRestart,
+    ParallelDisabledForResume,
+    UnpackStarted,
+    UnpackFinished,
+    UnpackFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveStatus {
+    pub code: ArchiveStatusCode,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

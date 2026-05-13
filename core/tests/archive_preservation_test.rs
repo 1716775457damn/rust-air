@@ -303,3 +303,56 @@ async fn test_parallel_archive_many_small_files_roundtrip() {
     let _ = fs::remove_dir_all(&src);
     let _ = fs::remove_dir_all(&dest);
 }
+
+/// Test: parallel archive path preserves small files with log/json extensions.
+#[tokio::test]
+async fn test_parallel_archive_preserves_log_and_json_files() {
+    let src = test_dir("parallel_log_json_files");
+
+    let expected_files: Vec<(&str, Vec<u8>)> = vec![
+        ("app.log", b"log-line-1\nlog-line-2\n".to_vec()),
+        ("app.log.1", b"rotated-log\n".to_vec()),
+        ("config.json", br#"{"enabled":true,"name":"rust-air"}"#.to_vec()),
+        ("nested/settings.json", br#"{"theme":"dark","retries":3}"#.to_vec()),
+        ("nested/deeper/trace.log", b"trace-start\ntrace-end\n".to_vec()),
+        ("nested/empty.json", Vec::new()),
+    ];
+
+    for i in 0..16u32 {
+        let filler_name = format!("filler_{i:02}.txt");
+        let filler_content = format!("filler-file-{i}-{}", "x".repeat((i as usize % 32) + 8));
+        std::fs::write(src.join(filler_name), filler_content).unwrap();
+    }
+
+    for (rel_path, data) in &expected_files {
+        let full_path = src.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(full_path, data).unwrap();
+    }
+
+    let compressed = archive_parallel_to_bytes(&src).await;
+    assert!(!compressed.is_empty(), "parallel archive stream should produce bytes");
+
+    let dest = test_dir("parallel_log_json_files_out");
+    archive::unpack_archive_sync(Cursor::new(&compressed), &dest)
+        .expect("unpack_archive_sync should succeed for log/json preservation test");
+
+    let dir_name = src.file_name().unwrap().to_str().unwrap();
+    for (rel_path, expected_data) in &expected_files {
+        let unpacked_file = dest.join(dir_name).join(rel_path);
+        assert!(
+            unpacked_file.exists(),
+            "file {rel_path} should exist after parallel archive roundtrip"
+        );
+        let actual_data = fs::read(&unpacked_file).unwrap();
+        assert_eq!(
+            actual_data, *expected_data,
+            "file {rel_path} content mismatch after parallel archive roundtrip"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&src);
+    let _ = fs::remove_dir_all(&dest);
+}

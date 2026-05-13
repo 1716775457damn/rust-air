@@ -5,6 +5,7 @@ use rust_air_core::{
     default_excludes, fmt_bytes, full_sync, start_watcher,
     SyncAction, SyncConfig, SyncEvent, SyncManifestEntry, SyncStore,
 };
+use rust_air_core::proto::{ArchiveStatus, ArchiveStatusCode, TransferEvent};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -145,6 +146,32 @@ struct RemoteSyncFileError {
     request_id: String,
     rel: String,
     err: String,
+}
+
+pub fn archive_status_detail_to_sync_event(status: &ArchiveStatus, rel: &str) -> Option<SyncEvent> {
+    match status.code {
+        ArchiveStatusCode::ResumeRejectedSafetyRestart => Some(SyncEvent::Info {
+            msg: format!("⇆ 目录传输安全重启: {}", status.detail.clone().unwrap_or_else(|| rel.to_string())),
+        }),
+        ArchiveStatusCode::ParallelDisabledForResume => Some(SyncEvent::Info {
+            msg: format!("⇆ 已切换为保守目录传输: {}", status.detail.clone().unwrap_or_else(|| rel.to_string())),
+        }),
+        ArchiveStatusCode::UnpackStarted => Some(SyncEvent::Info {
+            msg: format!("⇠ 正在解包目录: {}", status.detail.clone().unwrap_or_else(|| rel.to_string())),
+        }),
+        ArchiveStatusCode::UnpackFinished => Some(SyncEvent::Info {
+            msg: format!("⇠ 目录解包完成: {}", status.detail.clone().unwrap_or_else(|| rel.to_string())),
+        }),
+        ArchiveStatusCode::UnpackFailed => Some(SyncEvent::Error {
+            rel: rel.to_string(),
+            err: status.detail.clone().unwrap_or_else(|| "目录解包失败".to_string()),
+        }),
+    }
+}
+
+pub fn archive_status_to_sync_event(ev: &TransferEvent, rel: &str) -> Option<SyncEvent> {
+    let status = ev.archive_status.as_ref()?;
+    archive_status_detail_to_sync_event(status, rel)
 }
 
 fn encode_sync_file_logical_name(request_id: &str, entry: &SyncManifestEntry) -> String {
@@ -693,6 +720,7 @@ fn should_apply_delete(path: &std::path::Path, tombstone: &SyncManifestEntry) ->
 mod tests {
     use super::*;
     use std::fs;
+    use rust_air_core::proto::{ArchiveStatus, ArchiveStatusCode};
 
     #[test]
     fn test_handle_received_sync_file_reconstructs_relative_path() {
@@ -816,6 +844,37 @@ mod tests {
 
         assert!(rel.contains("已跳过"));
         assert!(target.exists());
+    }
+
+    #[test]
+    fn test_archive_status_to_sync_event_maps_info_states() {
+        let status = ArchiveStatus {
+            code: ArchiveStatusCode::ResumeRejectedSafetyRestart,
+            detail: Some("archive resume disabled for safety".to_string()),
+        };
+
+        let mapped = archive_status_detail_to_sync_event(&status, "folder-a").expect("should map archive info state");
+        match mapped {
+            SyncEvent::Info { msg } => assert!(msg.contains("安全重启")),
+            other => panic!("expected info event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_archive_status_to_sync_event_maps_error_state() {
+        let status = ArchiveStatus {
+            code: ArchiveStatusCode::UnpackFailed,
+            detail: Some("archive unpack failed for incoming-transfer".to_string()),
+        };
+
+        let mapped = archive_status_detail_to_sync_event(&status, "folder-b").expect("should map archive error state");
+        match mapped {
+            SyncEvent::Error { rel, err } => {
+                assert_eq!(rel, "folder-b");
+                assert!(err.contains("archive unpack failed"));
+            }
+            other => panic!("expected error event, got {other:?}"),
+        }
     }
 }
 

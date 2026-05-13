@@ -9,12 +9,13 @@
 use proptest::prelude::*;
 use rand::RngCore;
 use rust_air_core::crypto::{Decryptor, Encryptor};
-use rust_air_core::proto::{Kind, SessionManifest, CHUNK};
+use rust_air_core::proto::{ArchiveStatus, ArchiveStatusCode, Kind, SessionManifest, TransferEvent, CHUNK};
 use rust_air_core::transfer::{receive_to_disk, reconnect_delay_secs, send_path};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
+use std::sync::{Arc, Mutex};
 
 /// Create a unique temp directory for this test run.
 fn test_dir(name: &str) -> PathBuf {
@@ -189,6 +190,60 @@ fn test_manifest_round_trip() {
         archive_manifest, deserialized2,
         "archive manifest round-trip must preserve equality"
     );
+}
+
+#[test]
+fn test_archive_status_round_trip() {
+    let status = ArchiveStatus {
+        code: ArchiveStatusCode::ResumeRejectedSafetyRestart,
+        detail: Some("archive resume disabled for safety".to_string()),
+    };
+    let json = serde_json::to_string(&status).unwrap();
+    let decoded: ArchiveStatus = serde_json::from_str(&json).unwrap();
+    assert_eq!(status, decoded, "archive status round-trip must preserve equality");
+}
+
+#[tokio::test]
+async fn test_directory_transfer_emits_archive_lifecycle_events() {
+    let src_dir = test_dir("archive_events_src");
+    let folder = src_dir.join("payload_dir");
+    fs::create_dir_all(folder.join("nested")).unwrap();
+    fs::write(folder.join("nested").join("config.json"), br#"{"ok":true}"#).unwrap();
+    for i in 0..12u32 {
+        fs::write(folder.join(format!("filler_{i:02}.txt")), format!("hello-{i}")).unwrap();
+    }
+
+    let dest_dir = test_dir("archive_events_dest");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_folder = folder.clone();
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        send_path(stream, &send_folder, |_| {}).await.unwrap();
+    });
+
+    let events: Arc<Mutex<Vec<TransferEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = events.clone();
+    let (stream, _) = listener.accept().await.unwrap();
+    let _outcome = receive_to_disk(stream, &dest_dir, move |ev| {
+        capture.lock().unwrap().push(ev);
+    }).await.unwrap();
+
+    send_task.await.unwrap();
+
+    let captured = events.lock().unwrap();
+    assert!(captured.iter().any(|ev| matches!(
+        ev.archive_status.as_ref().map(|s| s.code),
+        Some(ArchiveStatusCode::UnpackStarted)
+    )), "archive transfer should emit unpack started status");
+    assert!(captured.iter().any(|ev| matches!(
+        ev.archive_status.as_ref().map(|s| s.code),
+        Some(ArchiveStatusCode::UnpackFinished)
+    )), "archive transfer should emit unpack finished status");
+
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&dest_dir);
 }
 
 // ── Test 5: Resume offset chunk alignment (property-based) ────────────────────

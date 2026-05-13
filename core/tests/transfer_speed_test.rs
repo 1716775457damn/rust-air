@@ -7,9 +7,11 @@
 //! **Validates: Requirements 1.4, 2.3, 5.3, 7.1**
 
 use rand::RngCore;
+use rust_air_core::proto::ArchiveStatusCode;
 use rust_air_core::transfer::{receive_to_disk, send_path};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 /// Create a unique temp directory for this test run.
@@ -108,6 +110,96 @@ async fn test_file_transfer_4mb_loopback() {
     let received = fs::read(received_path.path()).unwrap();
     assert_eq!(original.len(), received.len(), "file sizes should match");
     assert_eq!(original, received, "file content should be byte-identical");
+
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&dest_dir);
+}
+
+/// End-to-end test: send a directory with many small log/json files and verify
+/// the full transfer pipeline preserves all expected files.
+#[tokio::test]
+async fn test_directory_transfer_preserves_small_log_and_json_files() {
+    let src_dir = test_dir("dir_src");
+    let folder = src_dir.join("payload_dir");
+    fs::create_dir_all(folder.join("nested").join("deeper")).unwrap();
+
+    let expected_files: Vec<(&str, Vec<u8>)> = vec![
+        ("app.log", b"log-line-1\nlog-line-2\n".to_vec()),
+        ("app.log.1", b"rotated-log\n".to_vec()),
+        ("config.json", br#"{"enabled":true,"name":"rust-air"}"#.to_vec()),
+        ("nested/settings.json", br#"{"theme":"dark","retries":3}"#.to_vec()),
+        ("nested/deeper/trace.log", b"trace-start\ntrace-end\n".to_vec()),
+        ("nested/empty.json", Vec::new()),
+    ];
+
+    for i in 0..16u32 {
+        let filler_name = format!("filler_{i:02}.txt");
+        let filler_content = format!("filler-file-{i}-{}", "x".repeat((i as usize % 32) + 8));
+        fs::write(folder.join(filler_name), filler_content).unwrap();
+    }
+
+    for (rel_path, data) in &expected_files {
+        let full_path = folder.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(full_path, data).unwrap();
+    }
+
+    let dest_dir = test_dir("dir_dest");
+    let stale_dir = dest_dir.join("payload_dir.part");
+    fs::write(&stale_dir, b"stale-partial-archive").unwrap();
+    let stale_manifest = dest_dir.join("payload_dir.manifest.json");
+    fs::write(
+        &stale_manifest,
+        serde_json::to_vec(&rust_air_core::proto::SessionManifest {
+            name: "payload_dir".to_string(),
+            total_size: 123,
+            kind: rust_air_core::proto::Kind::Archive,
+            sender_addr: String::new(),
+            created_at: 1,
+        }).unwrap(),
+    ).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let send_folder = folder.clone();
+    let send_task = tokio::spawn(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        send_path(stream, &send_folder, |_| {}).await.unwrap();
+    });
+
+    let events: Arc<Mutex<Vec<rust_air_core::proto::TransferEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture = events.clone();
+    let (stream, _) = listener.accept().await.unwrap();
+    let outcome = receive_to_disk(stream, &dest_dir, move |ev| {
+        capture.lock().unwrap().push(ev);
+    }).await.unwrap();
+
+    send_task.await.unwrap();
+
+    let captured = events.lock().unwrap();
+    assert!(captured.iter().any(|ev| matches!(
+        ev.archive_status.as_ref().map(|s| s.code),
+        Some(ArchiveStatusCode::ResumeRejectedSafetyRestart)
+    )), "directory transfer should reject stale archive resume and restart safely");
+
+    let received_root = outcome.path().join(folder.file_name().unwrap());
+    assert!(received_root.exists(), "received directory should exist");
+
+    for (rel_path, expected_data) in &expected_files {
+        let received_file = received_root.join(rel_path);
+        assert!(
+            received_file.exists(),
+            "file {rel_path} should exist after directory transfer"
+        );
+        let actual_data = fs::read(&received_file).unwrap();
+        assert_eq!(
+            actual_data, *expected_data,
+            "file {rel_path} content mismatch after directory transfer"
+        );
+    }
 
     let _ = fs::remove_dir_all(&src_dir);
     let _ = fs::remove_dir_all(&dest_dir);
