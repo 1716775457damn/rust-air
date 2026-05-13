@@ -15,6 +15,8 @@
 //! for configuration options.
 
 use anyhow::Result;
+use crate::proto::{ArchiveSnapshot, ARCHIVE_SNAPSHOT_ALGORITHM};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -570,6 +572,54 @@ pub fn walk_dir(path: &Path) -> (u64, Vec<(walkdir::DirEntry, std::fs::Metadata)
 /// Walk `path` and sum all file sizes.
 pub fn dir_total_size(path: &Path) -> u64 {
     walk_dir_checked(path).map(|(total, _)| total).unwrap_or(0)
+}
+
+pub fn build_archive_snapshot(
+    path: &Path,
+    entries: &[(walkdir::DirEntry, std::fs::Metadata)],
+) -> Result<ArchiveSnapshot> {
+    let mut hasher = Sha256::new();
+    let mut entry_count = 0u64;
+
+    hasher.update(ARCHIVE_SNAPSHOT_ALGORITHM.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(path.file_name().unwrap_or_default().to_string_lossy().as_bytes());
+    hasher.update(&[0]);
+
+    for (entry, meta) in entries {
+        let rel = entry.path().strip_prefix(path).unwrap_or(entry.path());
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let kind = if entry.file_type().is_dir() {
+            b"dir".as_slice()
+        } else if entry.file_type().is_file() {
+            b"file".as_slice()
+        } else {
+            b"other".as_slice()
+        };
+        let modified = if entry.file_type().is_file() {
+            meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        } else {
+            None
+        };
+        let modified_secs = modified.map(|d| d.as_secs()).unwrap_or(0);
+        let modified_nanos = modified.map(|d| d.subsec_nanos()).unwrap_or(0);
+        let size = if entry.file_type().is_file() { meta.len() } else { 0 };
+
+        hasher.update(rel.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(kind);
+        hasher.update(&[0]);
+        hasher.update(&size.to_be_bytes());
+        hasher.update(&modified_secs.to_be_bytes());
+        hasher.update(&modified_nanos.to_be_bytes());
+        entry_count += 1;
+    }
+
+    Ok(ArchiveSnapshot {
+        algorithm: ARCHIVE_SNAPSHOT_ALGORITHM.to_string(),
+        fingerprint: hex::encode(hasher.finalize()),
+        entry_count,
+    })
 }
 
 fn compress_entries_to_writer(writer: impl std::io::Write, path: &Path, entries: Vec<(walkdir::DirEntry, std::fs::Metadata)>) -> Result<()> {

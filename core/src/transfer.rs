@@ -16,7 +16,7 @@
 use crate::{
     archive,
     crypto::{Decryptor, Encryptor},
-    proto::{ArchiveStatus, ArchiveStatusCode, Kind, ReconnectInfo, SessionManifest, TransferEvent, CHUNK, MAGIC, MAX_NAME_LEN},
+    proto::{ArchiveSnapshot, ArchiveStatus, ArchiveStatusCode, Kind, ReconnectInfo, SessionManifest, TransferEvent, CHUNK, MAGIC, MAX_NAME_LEN},
 };
 use anyhow::Result;
 #[cfg(feature = "desktop")]
@@ -190,6 +190,26 @@ pub async fn send_path_as(
     send_path_as_with_outcome(stream, path, logical_name, on_progress).await.map(|_| ())
 }
 
+fn encode_archive_snapshot(snapshot: &ArchiveSnapshot) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(snapshot)?)
+}
+
+fn decode_archive_snapshot(data: &[u8]) -> Result<ArchiveSnapshot> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+fn archive_snapshots_match(
+    existing: Option<&ArchiveSnapshot>,
+    current: Option<&ArchiveSnapshot>,
+) -> bool {
+    match (existing, current) {
+        (Some(left), Some(right)) => {
+            left.algorithm == right.algorithm && left.fingerprint == right.fingerprint
+        }
+        _ => false,
+    }
+}
+
 pub async fn send_path_as_with_outcome(
     stream: TcpStream,
     path: &Path,
@@ -205,22 +225,25 @@ pub async fn send_path_as_with_outcome(
         .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().into_owned());
     let total_size: u64;
     let dir_entries: Option<Vec<(WalkDirEntry, std::fs::Metadata)>>;
+    let archive_snapshot: Option<ArchiveSnapshot>;
     if is_dir {
         let (sz, entries) = archive::walk_dir_checked(path)?;
         total_size = sz;
+        archive_snapshot = Some(archive::build_archive_snapshot(path, &entries)?);
         dir_entries = Some(entries);
     } else {
         total_size = meta.len();
+        archive_snapshot = None;
         dir_entries = None;
     }
 
     tune_socket(&stream);
     let (mut rx, mut tx) = stream.into_split();
-    send_header(&mut tx, &key, kind, &name, total_size).await?;
+    send_header(&mut tx, &key, kind, &name, total_size, archive_snapshot.as_ref()).await?;
 
     let mut resume_buf = [0u8; 8];
     rx.read_exact(&mut resume_buf).await?;
-    let mut resume_offset = u64::from_be_bytes(resume_buf);
+    let resume_offset = u64::from_be_bytes(resume_buf);
 
     let mut enc = Encryptor::new(&key, tx);
     let on_progress = Arc::new(on_progress);
@@ -232,23 +255,6 @@ pub async fn send_path_as_with_outcome(
         let entries = dir_entries
             .ok_or_else(|| anyhow::anyhow!("directory transfer missing precomputed entries"))?;
         let file_count = entries.iter().filter(|(e, _)| e.file_type().is_file()).count();
-        if resume_offset > 0 {
-            on_progress(TransferEvent {
-                bytes_done: 0,
-                total_bytes: total_size,
-                bytes_per_sec: 0,
-                done: false,
-                error: None,
-                resumed: false,
-                resume_offset: 0,
-                reconnect_info: None,
-                archive_status: Some(archive_status(
-                    ArchiveStatusCode::ResumeRejectedSafetyRestart,
-                    ARCHIVE_RESUME_DISABLED_REASON,
-                )),
-            });
-            resume_offset = 0;
-        }
         let use_parallel = file_count >= 10 && resume_offset == 0;
         if !use_parallel && file_count >= 10 {
             on_progress(TransferEvent {
@@ -257,12 +263,16 @@ pub async fn send_path_as_with_outcome(
                 bytes_per_sec: 0,
                 done: false,
                 error: None,
-                resumed: false,
-                resume_offset: 0,
+                resumed: resume_offset > 0,
+                resume_offset,
                 reconnect_info: None,
                 archive_status: Some(archive_status(
                     ArchiveStatusCode::ParallelDisabledForResume,
-                    "parallel archive disabled because resume-safe directory restart was selected",
+                    if resume_offset > 0 {
+                        "parallel archive disabled because matched directory resume uses the sequential archive path"
+                    } else {
+                        "parallel archive disabled because transfer is using the sequential archive path"
+                    },
                 )),
             });
         }
@@ -273,6 +283,7 @@ pub async fn send_path_as_with_outcome(
             Box::new(archive::stream_archive_with_entries(path, entries)?)
         };
         
+        let mut archive_hasher = Sha256::new();
         if resume_offset > 0 {
             // Archive resume: regenerate the archive stream but skip the first
             // resume_offset bytes (read and discard). The archive stream is not
@@ -289,12 +300,13 @@ pub async fn send_path_as_with_outcome(
                     }
                 }
                 if filled == 0 { break; }
+                archive_hasher.update(&skip_buf[..filled]);
                 remaining -= filled as u64;
             }
             // Set encryptor counter to align nonces with the original stream.
             enc.set_counter(resume_offset / CHUNK as u64);
         }
-        stream_encrypted_hash(reader, &mut enc, resume_offset, total_size, on_progress, Sha256::new()).await?
+        stream_encrypted_hash(reader, &mut enc, resume_offset, total_size, on_progress, archive_hasher).await?
     } else {
         let mut f = tokio::fs::File::open(path).await?;
         let mut full_hasher = Sha256::new();
@@ -336,7 +348,7 @@ pub async fn receive_to_disk(
 ) -> Result<ReceiveOutcome> {
     tune_socket(&stream);
     let (mut rx, mut tx) = stream.into_split();
-    let (key, kind, name, total_size) = recv_header(&mut rx).await?;
+    let (key, kind, name, total_size, archive_snapshot) = recv_header(&mut rx).await?;
 
     let part_path = dest.join(format!("{name}.part"));
     let mpath = manifest_path(dest, &name);
@@ -348,10 +360,21 @@ pub async fn receive_to_disk(
             if let Some(m) = read_manifest(&mpath).await {
                 if m.name == name && m.total_size == total_size && m.kind == kind {
                     if kind == Kind::Archive {
-                        archive_restart_reason = Some(ARCHIVE_RESUME_DISABLED_REASON.to_string());
-                        let _ = tokio::fs::remove_file(&part_path).await;
-                        remove_manifest(&mpath).await;
-                        0
+                        if archive_snapshots_match(m.archive_snapshot.as_ref(), archive_snapshot.as_ref()) {
+                            let file_len = tokio::fs::metadata(&part_path).await?.len();
+                            (file_len / CHUNK as u64) * CHUNK as u64
+                        } else {
+                            archive_restart_reason = Some(
+                                if m.archive_snapshot.is_none() {
+                                    "archive partial data had no snapshot fingerprint; restarting directory transfer from zero".to_string()
+                                } else {
+                                    "archive snapshot changed; restarting directory transfer from zero".to_string()
+                                }
+                            );
+                            let _ = tokio::fs::remove_file(&part_path).await;
+                            remove_manifest(&mpath).await;
+                            0
+                        }
                     } else {
                         // Valid manifest matches — resume from chunk-aligned boundary.
                         let file_len = tokio::fs::metadata(&part_path).await?.len();
@@ -404,6 +427,7 @@ pub async fn receive_to_disk(
             kind,
             sender_addr: String::new(),
             created_at: now,
+            archive_snapshot: archive_snapshot.clone(),
         };
         if let Err(e) = write_manifest(&mpath, &manifest).await {
             eprintln!("warn: failed to write manifest: {e}");
@@ -953,23 +977,32 @@ async fn send_header(
     kind: Kind,
     name: &str,
     total_size: u64,
+    archive_snapshot: Option<&ArchiveSnapshot>,
 ) -> Result<()> {
     let nb = name.as_bytes();
     anyhow::ensure!(nb.len() <= MAX_NAME_LEN, "filename too long ({} bytes)", nb.len());
-    let mut hdr = Vec::with_capacity(4 + 32 + 1 + 2 + nb.len() + 8);
+    let snapshot_bytes = if kind == Kind::Archive {
+        encode_archive_snapshot(archive_snapshot.ok_or_else(|| anyhow::anyhow!("missing archive snapshot for archive header"))?)?
+    } else {
+        Vec::new()
+    };
+    anyhow::ensure!(snapshot_bytes.len() <= u16::MAX as usize, "archive snapshot too large");
+    let mut hdr = Vec::with_capacity(4 + 32 + 1 + 2 + nb.len() + 8 + 2 + snapshot_bytes.len());
     hdr.extend_from_slice(MAGIC);
     hdr.extend_from_slice(key);
     hdr.push(kind as u8);
     hdr.extend_from_slice(&(nb.len() as u16).to_be_bytes());
     hdr.extend_from_slice(nb);
     hdr.extend_from_slice(&total_size.to_be_bytes());
+    hdr.extend_from_slice(&(snapshot_bytes.len() as u16).to_be_bytes());
+    hdr.extend_from_slice(&snapshot_bytes);
     tx.write_all(&hdr).await?;
     Ok(())
 }
 
 async fn recv_header(
     rx: &mut (impl AsyncReadExt + Unpin),
-) -> Result<([u8; 32], Kind, String, u64)> {
+) -> Result<([u8; 32], Kind, String, u64, Option<ArchiveSnapshot>)> {
     let mut magic = [0u8; 4];
     rx.read_exact(&mut magic).await?;
     anyhow::ensure!(&magic == MAGIC, "protocol magic mismatch — check versions");
@@ -1000,7 +1033,18 @@ async fn recv_header(
     rx.read_exact(&mut size_b).await?;
     let total_size = u64::from_be_bytes(size_b);
 
-    Ok((key, kind, name, total_size))
+    let mut snapshot_len_b = [0u8; 2];
+    rx.read_exact(&mut snapshot_len_b).await?;
+    let snapshot_len = u16::from_be_bytes(snapshot_len_b) as usize;
+    let archive_snapshot = if snapshot_len > 0 {
+        let mut snapshot_b = vec![0u8; snapshot_len];
+        rx.read_exact(&mut snapshot_b).await?;
+        Some(decode_archive_snapshot(&snapshot_b)?)
+    } else {
+        None
+    };
+
+    Ok((key, kind, name, total_size, archive_snapshot))
 }
 
 /// Stream `reader` through `enc`, computing SHA-256 on-the-fly.
@@ -1150,7 +1194,7 @@ pub async fn send_clipboard(
     let total_size = data.len() as u64;
 
     let (mut rx, mut tx) = stream.into_split();
-    send_header(&mut tx, &key, Kind::Clipboard, name, total_size).await?;
+    send_header(&mut tx, &key, Kind::Clipboard, name, total_size, None).await?;
 
     let mut resume_buf = [0u8; 8];
     rx.read_exact(&mut resume_buf).await?;
@@ -1190,7 +1234,7 @@ pub async fn send_clipboard_image(
     let total_size = png_data.len() as u64;
 
     let (mut rx, mut tx) = stream.into_split();
-    send_header(&mut tx, &key, Kind::Clipboard, name, total_size).await?;
+    send_header(&mut tx, &key, Kind::Clipboard, name, total_size, None).await?;
 
     let mut resume_buf = [0u8; 8];
     rx.read_exact(&mut resume_buf).await?;

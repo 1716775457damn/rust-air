@@ -19,6 +19,7 @@ pub const CHUNK: usize = 1024 * 1024; // 1 MB: better throughput on fast LANs
 pub const TCP_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MB: keep gigabit LAN pipe full
 pub const PIPELINE_DEPTH: usize = 4; // pipeline channel depth for concurrent stages
 pub const MAX_NAME_LEN: usize = 512;
+pub const ARCHIVE_SNAPSHOT_ALGORITHM: &str = "rust-air-archive-meta-v1";
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +87,13 @@ pub struct ArchiveStatus {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveSnapshot {
+    pub algorithm: String,
+    pub fingerprint: String,
+    pub entry_count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconnectInfo {
     /// Current reconnect attempt (1-based).
@@ -107,4 +115,6 @@ pub struct SessionManifest {
     pub sender_addr: String,
     /// Creation timestamp (Unix epoch seconds).
     pub created_at:  u64,
+    /// Optional archive snapshot metadata for safe directory resume validation.
+    pub archive_snapshot: Option<ArchiveSnapshot>,
 }
