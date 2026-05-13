@@ -9,7 +9,7 @@
 use proptest::prelude::*;
 use rand::RngCore;
 use rust_air_core::crypto::{Decryptor, Encryptor};
-use rust_air_core::proto::{ArchiveStatus, ArchiveStatusCode, Kind, SessionManifest, TransferEvent, CHUNK};
+use rust_air_core::proto::{ArchiveSnapshot, ArchiveStatus, ArchiveStatusCode, Kind, SessionManifest, TransferEvent, CHUNK};
 use rust_air_core::transfer::{receive_to_disk, reconnect_delay_secs, send_path};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -168,6 +168,7 @@ fn test_manifest_round_trip() {
         kind: Kind::File,
         sender_addr: "192.168.1.10:54321".to_string(),
         created_at: 1700000000,
+        archive_snapshot: None,
     };
 
     let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -182,6 +183,11 @@ fn test_manifest_round_trip() {
         kind: Kind::Archive,
         sender_addr: "10.0.0.5:12345".to_string(),
         created_at: 1700000001,
+        archive_snapshot: Some(ArchiveSnapshot {
+            algorithm: "rust-air-archive-meta-v1".to_string(),
+            fingerprint: "deadbeef".to_string(),
+            entry_count: 3,
+        }),
     };
 
     let json2 = serde_json::to_string(&archive_manifest).unwrap();
@@ -201,6 +207,34 @@ fn test_archive_status_round_trip() {
     let json = serde_json::to_string(&status).unwrap();
     let decoded: ArchiveStatus = serde_json::from_str(&json).unwrap();
     assert_eq!(status, decoded, "archive status round-trip must preserve equality");
+}
+
+#[test]
+fn test_archive_snapshot_round_trip() {
+    let snapshot = ArchiveSnapshot {
+        algorithm: "rust-air-archive-meta-v1".to_string(),
+        fingerprint: "0123456789abcdef".to_string(),
+        entry_count: 7,
+    };
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let decoded: ArchiveSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(snapshot, decoded, "archive snapshot round-trip must preserve equality");
+}
+
+#[test]
+fn test_archive_snapshot_is_stable_for_unchanged_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+    std::fs::write(dir.path().join("a.json"), br#"{"a":1}"#).unwrap();
+    std::fs::write(dir.path().join("nested").join("b.log"), b"hello\n").unwrap();
+
+    let (_size1, entries1) = rust_air_core::archive::walk_dir_checked(dir.path()).unwrap();
+    let snap1 = rust_air_core::archive::build_archive_snapshot(dir.path(), &entries1).unwrap();
+    let (_size2, entries2) = rust_air_core::archive::walk_dir_checked(dir.path()).unwrap();
+    let snap2 = rust_air_core::archive::build_archive_snapshot(dir.path(), &entries2).unwrap();
+
+    assert_eq!(snap1.algorithm, snap2.algorithm);
+    assert_eq!(snap1.fingerprint, snap2.fingerprint, "unchanged directory should produce stable snapshot fingerprint");
 }
 
 #[tokio::test]
